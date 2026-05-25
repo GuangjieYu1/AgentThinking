@@ -10,6 +10,14 @@ export const relationTypes = [
   "related_to",
 ] as const;
 export const relationStatuses = ["suggested", "accepted", "rejected", "manual"] as const;
+export const statementStatuses = ["pending", "approved", "rejected"] as const;
+export const statementPrecheckStatuses = [
+  "not_checked",
+  "supported",
+  "partially_supported",
+  "unsupported",
+  "failed",
+] as const;
 export const jobStages = [
   "queued",
   "parsing",
@@ -26,6 +34,8 @@ export const ocrModes = ["local", "cloud"] as const;
 export type AbstractNodeKind = (typeof abstractNodeKinds)[number];
 export type RelationType = (typeof relationTypes)[number];
 export type RelationStatus = (typeof relationStatuses)[number];
+export type StatementStatus = (typeof statementStatuses)[number];
+export type StatementPrecheckStatus = (typeof statementPrecheckStatuses)[number];
 export type JobStage = (typeof jobStages)[number];
 export type OcrMode = (typeof ocrModes)[number];
 
@@ -188,6 +198,39 @@ export interface PublishedAnalysis {
   publishedAt: string;
 }
 
+export interface StatementPrecheck {
+  status: StatementPrecheckStatus;
+  reason: string | null;
+  checkedAt: string | null;
+  contentUpdatedAt: string | null;
+}
+
+export interface AnalysisStatement {
+  id: string;
+  libraryId: string;
+  relationId: string;
+  text: string;
+  status: StatementStatus;
+  relationType: RelationType;
+  citations: Citation[];
+  invalidatedReason: string | null;
+  invalidatedAt: string | null;
+  precheck: StatementPrecheck;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AnalysisDraft {
+  libraryId: string;
+  statements: AnalysisStatement[];
+  summary: {
+    pending: number;
+    approved: number;
+    rejected: number;
+    invalidated: number;
+  };
+}
+
 export interface ModelTestResult {
   ok: boolean;
   provider: string;
@@ -224,6 +267,28 @@ export const createRelationSchema = z.object({
 export const updateRelationSchema = z.object({
   status: z.enum(["accepted", "rejected"]),
 });
+
+export const updateAnalysisStatementSchema = z.object({
+  text: z.string().trim().min(1).max(3000).optional(),
+  status: z.enum(statementStatuses).optional(),
+}).refine((body) => body.text !== undefined || body.status !== undefined, "没有可更新的内容");
+
+export const addStatementEvidenceSchema = z.object({
+  chunkId: z.string().min(1),
+});
+
+export const evidenceQuerySchema = z.object({
+  q: z.string().trim().max(1000).optional().default(""),
+  versionId: z.string().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(30).optional().default(15),
+});
+
+export const statementPrecheckSchema = z.object({
+  status: z.enum(["supported", "partially_supported", "unsupported"]),
+  reason: z.string().trim().min(1).max(1000),
+});
+
+export type StatementPrecheckOutput = z.infer<typeof statementPrecheckSchema>;
 
 export const searchSchema = z.object({
   query: z.string().trim().min(1).max(1000),

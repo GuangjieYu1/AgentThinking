@@ -59,9 +59,9 @@ function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[
       data: { label, entity: record },
       className: record.nodeType === "chunk" ? "flow-chunk" : `flow-${record.data.kind}`,
       style: {
-        width: record.nodeType === "chunk" ? 185 : 155,
+        width: record.nodeType === "chunk" ? 250 : 210,
         border: "none",
-        borderRadius: record.nodeType === "chunk" ? 8 : 24,
+        borderRadius: record.nodeType === "chunk" ? 10 : 28,
       },
     };
   });
@@ -78,9 +78,10 @@ function displayEdges(records: GraphEdge[]): VisualEdge[] {
       animated: status === "suggested",
       style: {
         stroke: record.edgeType === "evidence" ? "#56627c" : relationColor(status ?? "manual"),
+        strokeWidth: record.edgeType === "evidence" ? 1.5 : 2,
         ...(status === "suggested" || record.edgeType === "evidence" ? { strokeDasharray: "5 4" } : {}),
       },
-      labelStyle: { fill: "#93a4c1", fontSize: 10 },
+      labelStyle: { fill: "#b5c5dd", fontSize: 12, fontWeight: 600 },
     };
     if (record.edgeType === "relation") {
       edge.label = record.relation?.type ?? "relation";
@@ -221,7 +222,10 @@ export function GraphWorkspace({
               setSelectedRelation(edge.data?.entity.relation);
               setSelected(undefined);
             }}
+            minZoom={0.35}
+            maxZoom={2}
             fitView
+            fitViewOptions={{ padding: 0.16, minZoom: 0.82, maxZoom: 1.18 }}
           >
             <Background color="#28334c" gap={24} />
             <MiniMap nodeColor={(node) => node.className === "flow-chunk" ? "#56627c" : "#40bca2"} />

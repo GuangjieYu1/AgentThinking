@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import type { Citation, PublishedAnalysis, Relation } from "@agent-thinking/contracts";
+import type { AnalysisStatement, Citation, PublishedAnalysis } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 import { AgentDatabase } from "../db.js";
 import { safeFileName } from "../domain/files.js";
@@ -21,15 +21,10 @@ function citationText(citation: Citation): string {
   return `[${citation.documentName} - ${location}${heading}${anchor}](sources/${encodeURIComponent(storedName)})：${citation.excerpt.replace(/\s+/g, " ").trim()}`;
 }
 
-function relationLines(db: AgentDatabase, relations: Relation[]): string[] {
-  return relations.flatMap((relation) => {
-    const source = db.getAbstractNode(relation.sourceNodeId);
-    const target = db.getAbstractNode(relation.targetNodeId);
-    if (!source || !target) return [];
-    const marker = relation.createdBy === "user" && relation.citations.length === 0
-      ? "\n  - 用户添加，无来源引用"
-      : relation.citations.map((citation) => `\n  - ${citationText(citation)}`).join("");
-    return [`- **${source.title}** \`${relation.type}\` **${target.title}**：${relation.reason}${marker}`];
+function statementLines(statements: AnalysisStatement[]): string[] {
+  return statements.map((statement) => {
+    const citations = statement.citations.map((citation) => `\n  - ${citationText(citation)}`).join("");
+    return `- ${statement.text} \`${statement.relationType}\`${citations}`;
   });
 }
 
@@ -39,16 +34,24 @@ export class AnalysisPublisher {
   async publish(libraryId: string): Promise<PublishedAnalysis> {
     const library = this.db.getLibrary(libraryId);
     if (!library) throw new Error("知识库不存在");
-    const relations = this.db.listPublishRelations(libraryId);
+    const draft = this.db.generateAnalysisDraft(libraryId);
+    if (draft.summary.pending > 0) {
+      throw new Error(`仍有待审核分析陈述（${draft.summary.pending} 条），请完成审核后再发布`);
+    }
+    const statements = this.db.getApprovedStatements(libraryId);
     const sources = this.db.listVersionSources(libraryId);
     const versionIds = sources.map((source) => source.version.id);
+    const relations = statements.flatMap((statement) => {
+      const relation = this.db.getRelation(statement.relationId);
+      return relation ? [relation] : [];
+    });
     const relationNodes = new Map(
       relations.flatMap((relation) => [relation.sourceNodeId, relation.targetNodeId])
         .map((id) => [id, this.db.getAbstractNode(id)]),
     );
     const generatedAt = new Date().toISOString();
-    const regular = relations.filter((relation) => relation.type !== "contradicts");
-    const conflicts = relations.filter((relation) => relation.type === "contradicts");
+    const regular = statements.filter((statement) => statement.relationType !== "contradicts");
+    const conflicts = statements.filter((statement) => statement.relationType === "contradicts");
     const content = [
       "---",
       `library_id: ${quoteYaml(libraryId)}`,
@@ -66,18 +69,16 @@ export class AnalysisPublisher {
       ...([...relationNodes.values()].flatMap((node) => node ? [
         `## ${node.kind === "claim" ? "命题" : "概念"}：${node.title}`,
         "",
-        node.summary || "无摘要。",
-        "",
-        ...(node.citations.length ? node.citations.map((citation) => `- ${citationText(citation)}`) : ["- 无来源引用。"]),
+        "该节点已出现在审核通过的分析陈述中，引用见下文对应条目。",
         "",
       ] : [])),
       "# 已审核关系",
       "",
-      ...(regular.length ? relationLines(this.db, regular) : ["暂无已审核关系。"]),
+      ...(regular.length ? statementLines(regular) : ["暂无已审核关系。"]),
       "",
       "# 已确认冲突",
       "",
-      ...(conflicts.length ? relationLines(this.db, conflicts) : ["暂无已确认冲突。"]),
+      ...(conflicts.length ? statementLines(conflicts) : ["暂无已确认冲突。"]),
       "",
       "# 来源索引",
       "",

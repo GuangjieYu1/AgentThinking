@@ -1,5 +1,5 @@
-import type { Chunk, ExtractionOutput, ModelTestResult } from "@agent-thinking/contracts";
-import { extractionSchema } from "@agent-thinking/contracts";
+import type { Chunk, Citation, ExtractionOutput, ModelTestResult, StatementPrecheckOutput } from "@agent-thinking/contracts";
+import { extractionSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 
 export interface ModelProvider {
@@ -7,6 +7,7 @@ export interface ModelProvider {
   readonly configured: boolean;
   embed(texts: string[]): Promise<number[][]>;
   extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>): Promise<ExtractionOutput>;
+  precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput>;
   stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }>;
   test(): Promise<ModelTestResult>;
 }
@@ -71,6 +72,13 @@ export class FakeModelProvider implements ModelProvider {
       ],
     }));
     return { nodes, relations };
+  }
+
+  async precheckStatement(_text: string, citations: Citation[]): Promise<StatementPrecheckOutput> {
+    if (citations.length === 0) {
+      return { status: "unsupported", reason: "尚未关联原文证据，无法验证陈述。" };
+    }
+    return { status: "supported", reason: "演示模式：该陈述已附带可定位来源，请由审核者核对原文后裁决。" };
   }
 
   async *stream(prompt: string): AsyncGenerator<{ type: "content"; text: string }> {
@@ -170,6 +178,46 @@ export class OpenAICompatibleProvider implements ModelProvider {
     const raw = response.choices[0]?.message.content ?? "{}";
     const json = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ""));
     return extractionSchema.parse(json);
+  }
+
+  async precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput> {
+    if (citations.length === 0) {
+      return { status: "unsupported", reason: "尚未关联原文证据，无法验证陈述。" };
+    }
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const evidence = citations.map((citation) => ({
+      document: citation.documentName,
+      location: citation.pageNumber
+        ? `page ${citation.pageNumber}`
+        : `lines ${citation.startLine ?? "?"}-${citation.endLine ?? citation.startLine ?? "?"}`,
+      heading: citation.headingPath,
+      excerpt: citation.excerpt,
+    }));
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Determine whether the supplied source excerpts support the analysis statement. " +
+            'Return JSON only: {"status":"supported|partially_supported|unsupported","reason":"..."}. ' +
+            "Use supported only when the statement is directly justified by the excerpts. Be conservative.",
+        },
+        { role: "user", content: JSON.stringify({ statement: text, evidence }) },
+      ],
+      max_tokens: 800,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const raw = response.choices[0]?.message.content ?? "{}";
+    return statementPrecheckSchema.parse(JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, "")));
   }
 
   async *stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }> {

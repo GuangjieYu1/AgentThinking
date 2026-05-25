@@ -1,5 +1,7 @@
 import type {
   AbstractNode,
+  AnalysisDraft,
+  AnalysisStatement,
   Document,
   GraphResponse,
   IngestJob,
@@ -145,6 +147,26 @@ export const api = {
     }),
   deleteRelation: (relationId: string) =>
     request<void>(`/relations/${relationId}`, { method: "DELETE" }),
+  syncAnalysisDraft: (libraryId: string) =>
+    request<AnalysisDraft>(`/libraries/${libraryId}/analysis/draft`, { method: "POST" }),
+  analysisDraft: (libraryId: string) =>
+    request<AnalysisDraft>(`/libraries/${libraryId}/analysis/draft`),
+  evidence: (libraryId: string, q = "") =>
+    request<SearchResult[]>(`/libraries/${libraryId}/evidence?q=${encodeURIComponent(q)}`),
+  updateStatement: (statementId: string, values: { text?: string; status?: "pending" | "approved" | "rejected" }) =>
+    request<AnalysisStatement>(`/analysis/statements/${statementId}`, {
+      method: "PATCH",
+      body: JSON.stringify(values),
+    }),
+  addStatementEvidence: (statementId: string, chunkId: string) =>
+    request<AnalysisStatement>(`/analysis/statements/${statementId}/evidence`, {
+      method: "POST",
+      body: JSON.stringify({ chunkId }),
+    }),
+  deleteStatementEvidence: (statementId: string, chunkId: string) =>
+    request<AnalysisStatement>(`/analysis/statements/${statementId}/evidence/${chunkId}`, { method: "DELETE" }),
+  precheckStatement: (statementId: string) =>
+    request<AnalysisStatement>(`/analysis/statements/${statementId}/precheck`, { method: "POST" }),
   publishAnalysis: (libraryId: string) =>
     request<PublishedAnalysis>(`/libraries/${libraryId}/analysis/publish`, { method: "POST" }),
   analysis: (libraryId: string) => request<PublishedAnalysis>(`/libraries/${libraryId}/analysis`),

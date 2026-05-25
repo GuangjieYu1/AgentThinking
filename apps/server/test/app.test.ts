@@ -107,6 +107,23 @@ describe("HTTP application", () => {
       url: `/api/relations/${suggested!.id}`,
       payload: { status: "accepted" },
     });
+    const blockedPublish = await app.inject({ method: "POST", url: `/api/libraries/${library.id}/analysis/publish` });
+    expect(blockedPublish.statusCode).toBe(409);
+    const draft = (await app.inject({
+      method: "POST",
+      url: `/api/libraries/${library.id}/analysis/draft`,
+    })).json<{ statements: Array<{ id: string; citations: unknown[] }> }>();
+    expect(draft.statements[0]?.citations.length).toBeGreaterThan(0);
+    const checked = await app.inject({
+      method: "POST",
+      url: `/api/analysis/statements/${draft.statements[0]!.id}/precheck`,
+    });
+    expect(checked.body).toContain("supported");
+    await app.inject({
+      method: "PATCH",
+      url: `/api/analysis/statements/${draft.statements[0]!.id}`,
+      payload: { status: "approved" },
+    });
     const published = await app.inject({ method: "POST", url: `/api/libraries/${library.id}/analysis/publish` });
     expect(published.statusCode).toBe(201);
     expect(published.body).toContain("已审核关系");

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type { Citation, Document, IngestJob, Library, LibrarySettings, OcrMode, PublishedAnalysis, SourceStructure } from "@agent-thinking/contracts";
 import { api } from "./api";
+import { AnalysisWorkspace } from "./AnalysisWorkspace";
 import { GraphWorkspace } from "./GraphWorkspace";
 import { ModelTools } from "./ModelTools";
 
@@ -94,6 +95,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const [jobs, setJobs] = useState<IngestJob[]>([]);
   const [settings, setSettings] = useState<LibrarySettings>();
   const [refreshGraph, setRefreshGraph] = useState(0);
+  const [activeWorkspace, setActiveWorkspace] = useState<"graph" | "analysis">("graph");
   const [analysis, setAnalysis] = useState<PublishedAnalysis>();
   const [sourceView, setSourceView] = useState<{ structure: SourceStructure; text?: string; focus?: Citation }>();
   const activeJobs = useMemo(() => jobs.filter((job) => !["completed", "failed"].includes(job.stage)), [jobs]);
@@ -175,15 +177,6 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
     }
   };
 
-  const publish = async () => {
-    if (!window.confirm("发布报告只包含已接受的 AI 关系与人工关系。继续吗？")) return;
-    try {
-      setAnalysis(await api.publishAnalysis(library.id));
-    } catch (cause) {
-      onError((cause as Error).message);
-    }
-  };
-
   return (
     <div className="workspace">
       <header className="workspace-header">
@@ -220,7 +213,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
           </div>
           <h2>分析笔记</h2>
           <div className="analysis-actions">
-            <button onClick={() => void publish()}>发布分析笔记</button>
+            <button onClick={() => setActiveWorkspace("analysis")}>进入分析审核</button>
             {analysis && <>
               <a href={api.analysisDownloadUrl(library.id)}>下载 Markdown</a>
               <a href={api.exportUrl(library.id)}>导出归档</a>
@@ -244,7 +237,24 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
             ))}
           </div>
         </section>
-        <GraphWorkspace libraryId={library.id} refreshKey={refreshGraph} onError={onError} onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)} />
+        <div className="work-surface">
+          <nav className="workspace-tabs">
+            <button className={activeWorkspace === "graph" ? "selected" : ""} onClick={() => setActiveWorkspace("graph")}>关系图谱审核</button>
+            <button className={activeWorkspace === "analysis" ? "selected" : ""} onClick={() => setActiveWorkspace("analysis")}>分析笔记审核</button>
+          </nav>
+          {activeWorkspace === "graph" ? (
+            <GraphWorkspace libraryId={library.id} refreshKey={refreshGraph} onError={onError} onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)} />
+          ) : (
+            <AnalysisWorkspace
+              key={`${library.id}:${refreshGraph}`}
+              libraryId={library.id}
+              analysis={analysis}
+              onPublished={setAnalysis}
+              onError={onError}
+              onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)}
+            />
+          )}
+        </div>
       </div>
       {sourceView && <SourcePreview view={sourceView} onClose={() => setSourceView(undefined)} />}
     </div>

@@ -124,4 +124,38 @@ describe("knowledge database", () => {
     expect(db.getGraph(library.id, {}).edges).toHaveLength(0);
     db.close();
   });
+
+  it("requires review of accepted and manual analysis statements and resets changed evidence", async () => {
+    const db = await database();
+    const library = db.createLibrary("Analysis");
+    const version = db.createDocumentVersion(library.id, "source.txt", "text/plain", "hash", "source").version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 9, text: "evidence A" },
+      { ordinal: 1, headingPath: null, pageNumber: null, startChar: 10, endChar: 19, text: "evidence B" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [
+        { key: "a", kind: "concept", title: "A", summary: "", evidenceChunkIds: [chunks[0]!.id] },
+        { key: "b", kind: "claim", title: "B", summary: "", evidenceChunkIds: [chunks[1]!.id] },
+      ],
+      relations: [],
+    });
+    const nodes = db.getGraph(library.id, {}).nodes;
+    const manual = db.createRelation(library.id, {
+      sourceNodeId: nodes[0]!.id,
+      targetNodeId: nodes[1]!.id,
+      type: "supports",
+      reason: "manual relation",
+    });
+    const draft = db.generateAnalysisDraft(library.id);
+    expect(draft.statements.map((statement) => statement.relationId)).toContain(manual.id);
+    const statement = draft.statements[0]!;
+    expect(() => db.updateAnalysisStatement(statement.id, { status: "approved" })).toThrow(/至少一条原文证据/);
+    db.addStatementEvidence(statement.id, chunks[0]!.id);
+    expect(db.updateAnalysisStatement(statement.id, { status: "approved" }).status).toBe("approved");
+    const changed = db.addStatementEvidence(statement.id, chunks[1]!.id);
+    expect(changed.status).toBe("pending");
+    expect(changed.invalidatedReason).toContain("证据引用");
+    db.close();
+  });
 });

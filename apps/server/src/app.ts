@@ -8,12 +8,15 @@ import Fastify, { type FastifyInstance } from "fastify";
 import {
   createLibrarySchema,
   createRelationSchema,
+  addStatementEvidenceSchema,
+  evidenceQuerySchema,
   modelStreamSchema,
   relationStatuses,
   relationTypes,
   searchSchema,
   updateAbstractNodeSchema,
   updateLibrarySettingsSchema,
+  updateAnalysisStatementSchema,
   updateRelationSchema,
   type RelationStatus,
   type RelationType,
@@ -48,7 +51,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
 
   app.setErrorHandler((error, _request, reply) => {
     const message = error instanceof Error ? error.message : "请求处理失败";
-    const statusCode = message.includes("不存在") ? 404 : 400;
+    const statusCode = message.includes("不存在") ? 404 : message.includes("仍有待审核") ? 409 : 400;
     void reply.status(statusCode).send({ error: message });
   });
 
@@ -259,6 +262,50 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   app.delete<{ Params: { relationId: string } }>("/api/relations/:relationId", async (request, reply) => {
     if (!db.deleteRelation(request.params.relationId)) return reply.status(404).send({ error: "关系不存在" });
     return reply.status(204).send();
+  });
+  app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/draft", async (request) => {
+    requireLibrary(db, request.params.libraryId);
+    return db.generateAnalysisDraft(request.params.libraryId);
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/draft", async (request) => {
+    requireLibrary(db, request.params.libraryId);
+    return db.getAnalysisDraft(request.params.libraryId);
+  });
+  app.get<{ Params: { libraryId: string }; Querystring: { q?: string; versionId?: string; limit?: string } }>(
+    "/api/libraries/:libraryId/evidence",
+    async (request) => {
+      requireLibrary(db, request.params.libraryId);
+      const query = evidenceQuerySchema.parse(request.query);
+      return db.listEvidenceChunks(request.params.libraryId, query.q, query.versionId, query.limit);
+    },
+  );
+  app.patch<{ Params: { statementId: string } }>("/api/analysis/statements/:statementId", async (request) => {
+    const body = updateAnalysisStatementSchema.parse(request.body);
+    return db.updateAnalysisStatement(request.params.statementId, {
+      ...(body.text !== undefined ? { text: body.text } : {}),
+      ...(body.status !== undefined ? { status: body.status } : {}),
+    });
+  });
+  app.post<{ Params: { statementId: string } }>("/api/analysis/statements/:statementId/evidence", async (request) => {
+    const body = addStatementEvidenceSchema.parse(request.body);
+    return db.addStatementEvidence(request.params.statementId, body.chunkId);
+  });
+  app.delete<{ Params: { statementId: string; chunkId: string } }>(
+    "/api/analysis/statements/:statementId/evidence/:chunkId",
+    async (request) => db.deleteStatementEvidence(request.params.statementId, request.params.chunkId),
+  );
+  app.post<{ Params: { statementId: string } }>("/api/analysis/statements/:statementId/precheck", async (request) => {
+    const statement = db.getAnalysisStatement(request.params.statementId);
+    if (!statement) throw new Error("分析陈述不存在");
+    try {
+      return db.saveStatementPrecheck(
+        statement.id,
+        await model.precheckStatement(statement.text, statement.citations),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "AI 预检失败";
+      return db.failStatementPrecheck(statement.id, message);
+    }
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/publish", async (request, reply) => {
     requireLibrary(db, request.params.libraryId);

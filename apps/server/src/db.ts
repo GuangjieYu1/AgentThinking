@@ -5,6 +5,8 @@ import type { DatabaseSync as NativeDatabaseSync } from "node:sqlite";
 import type {
   AbstractNode,
   AbstractNodeKind,
+  AnalysisDraft,
+  AnalysisStatement,
   Citation,
   Chunk,
   Document,
@@ -22,6 +24,8 @@ import type {
   RelationStatus,
   RelationType,
   SearchResult,
+  StatementStatus,
+  StatementPrecheckOutput,
   SourceLink,
   SourceMetadata,
   SourceStructure,
@@ -227,13 +231,41 @@ export class AgentDatabase {
         included_version_ids_json TEXT NOT NULL,
         published_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS analysis_statements (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        relation_id TEXT NOT NULL UNIQUE REFERENCES relations(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
+        invalidated_reason TEXT,
+        invalidated_at TEXT,
+        precheck_status TEXT NOT NULL DEFAULT 'not_checked',
+        precheck_reason TEXT,
+        precheck_checked_at TEXT,
+        precheck_content_updated_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS analysis_statement_evidence (
+        statement_id TEXT NOT NULL REFERENCES analysis_statements(id) ON DELETE CASCADE,
+        chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+        PRIMARY KEY(statement_id, chunk_id)
+      );
       CREATE INDEX IF NOT EXISTS idx_source_links_version ON source_links(version_id);
+      CREATE INDEX IF NOT EXISTS idx_statements_library_status ON analysis_statements(library_id, status);
     `);
     this.addColumn("chunks", "start_line", "INTEGER");
     this.addColumn("chunks", "end_line", "INTEGER");
     this.addColumn("chunks", "block_id", "TEXT");
+    this.addColumn("analysis_statements", "invalidated_reason", "TEXT");
+    this.addColumn("analysis_statements", "invalidated_at", "TEXT");
+    this.addColumn("analysis_statements", "precheck_status", "TEXT NOT NULL DEFAULT 'not_checked'");
+    this.addColumn("analysis_statements", "precheck_reason", "TEXT");
+    this.addColumn("analysis_statements", "precheck_checked_at", "TEXT");
+    this.addColumn("analysis_statements", "precheck_content_updated_at", "TEXT");
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
+    this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
   }
 
   private addColumn(table: string, column: string, definition: string): void {
@@ -572,6 +604,7 @@ export class AgentDatabase {
   }
 
   replaceChunks(libraryId: string, versionId: string, pending: PendingChunk[]): Chunk[] {
+    this.invalidateStatementsForVersion(versionId);
     this.clearGeneratedForVersion(versionId);
     const existing = rows(this.sql.prepare("SELECT id FROM chunks WHERE version_id = ?"), versionId);
     const deleteFts = this.sql.prepare("DELETE FROM chunks_fts WHERE chunk_id = ?");
@@ -627,6 +660,21 @@ export class AgentDatabase {
     `).run();
   }
 
+  private invalidateStatementsForVersion(versionId: string): void {
+    const timestamp = now();
+    this.sql.prepare(`
+      UPDATE analysis_statements
+      SET status = 'pending', invalidated_reason = '来源版本已重新分析，请重新核对引用',
+        invalidated_at = ?, precheck_status = 'not_checked', precheck_reason = NULL,
+        precheck_checked_at = NULL, precheck_content_updated_at = NULL, updated_at = ?
+      WHERE id IN (
+        SELECT se.statement_id FROM analysis_statement_evidence se
+        JOIN chunks c ON c.id = se.chunk_id
+        WHERE c.version_id = ?
+      )
+    `).run(timestamp, timestamp, versionId);
+  }
+
   getChunk(id: string): Chunk | undefined {
     const result = row(this.sql.prepare("SELECT * FROM chunks WHERE id = ?"), id);
     return result ? chunkFrom(result) : undefined;
@@ -653,6 +701,25 @@ export class AgentDatabase {
       libraryId,
       limit,
     ).map((result) => ({ chunk: chunkFrom(result), score: -Number(result.rank) }));
+  }
+
+  listEvidenceChunks(libraryId: string, query: string, versionId: string | undefined, limit: number): SearchResult[] {
+    if (query.trim() && !versionId) return this.searchText(libraryId, query, limit);
+    const filters = ["library_id = ?"];
+    const params: Array<string | number> = [libraryId];
+    if (versionId) {
+      filters.push("version_id = ?");
+      params.push(versionId);
+    }
+    if (query.trim()) {
+      filters.push("(text LIKE ? OR heading_path LIKE ?)");
+      params.push(`%${query.trim()}%`, `%${query.trim()}%`);
+    }
+    params.push(limit);
+    return rows(
+      this.sql.prepare(`SELECT * FROM chunks WHERE ${filters.join(" AND ")} ORDER BY ordinal LIMIT ?`),
+      ...params,
+    ).map((entry) => ({ chunk: chunkFrom(entry), score: 1 }));
   }
 
   saveEmbedding(chunkId: string, dimensions: number, embedding: Uint8Array): void {
@@ -815,11 +882,15 @@ export class AgentDatabase {
   }
 
   updateRelationStatus(id: string, status: "accepted" | "rejected"): Relation {
+    const previous = this.getRelation(id);
+    if (!previous) throw new Error("关系不存在");
     this.sql.prepare("UPDATE relations SET status = ?, updated_at = ? WHERE id = ?")
       .run(status, now(), id);
+    if (previous.status !== status) {
+      this.invalidateStatementForRelation(id, status === "rejected" ? "上游关系已被拒绝" : "上游关系已重新接受");
+    }
     const relation = this.getRelation(id);
-    if (!relation) throw new Error("关系不存在");
-    return relation;
+    return relation as Relation;
   }
 
   deleteRelation(id: string): boolean {
@@ -974,6 +1045,188 @@ export class AgentDatabase {
     return rows(this.sql.prepare(`
       SELECT * FROM relations WHERE library_id = ? AND status IN ('accepted', 'manual') ORDER BY updated_at DESC
     `), libraryId).map((entry) => this.relationFrom(entry));
+  }
+
+  generateAnalysisDraft(libraryId: string): AnalysisDraft {
+    if (!this.getLibrary(libraryId)) throw new Error("知识库不存在");
+    const relations = rows(this.sql.prepare(`
+      SELECT * FROM relations WHERE library_id = ? AND status IN ('accepted', 'manual') ORDER BY updated_at DESC
+    `), libraryId).map((entry) => this.relationFrom(entry));
+    const existing = this.sql.prepare("SELECT id FROM analysis_statements WHERE relation_id = ?");
+    const insert = this.sql.prepare(`
+      INSERT INTO analysis_statements (id, library_id, relation_id, text, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?)
+    `);
+    const insertEvidence = this.sql.prepare(
+      "INSERT OR IGNORE INTO analysis_statement_evidence (statement_id, chunk_id) VALUES (?, ?)",
+    );
+    for (const relation of relations) {
+      if (row(existing, relation.id)) continue;
+      const source = this.getAbstractNode(relation.sourceNodeId);
+      const target = this.getAbstractNode(relation.targetNodeId);
+      if (!source || !target) continue;
+      const id = randomUUID();
+      const timestamp = now();
+      const text = `${source.title} ${relation.type} ${target.title}：${relation.reason}`;
+      insert.run(id, libraryId, relation.id, text, timestamp, timestamp);
+      for (const chunkId of relation.evidenceChunkIds) insertEvidence.run(id, chunkId);
+    }
+    return this.getAnalysisDraft(libraryId);
+  }
+
+  getAnalysisDraft(libraryId: string): AnalysisDraft {
+    if (!this.getLibrary(libraryId)) throw new Error("知识库不存在");
+    const statements = rows(this.sql.prepare(`
+      SELECT s.*, r.type AS relation_type
+      FROM analysis_statements s JOIN relations r ON r.id = s.relation_id
+      WHERE s.library_id = ? AND r.status IN ('accepted', 'manual')
+      ORDER BY CASE s.status WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, s.updated_at DESC
+    `), libraryId).map((entry) => this.statementFrom(entry));
+    return {
+      libraryId,
+      statements,
+      summary: {
+        pending: statements.filter((statement) => statement.status === "pending").length,
+        approved: statements.filter((statement) => statement.status === "approved").length,
+        rejected: statements.filter((statement) => statement.status === "rejected").length,
+        invalidated: statements.filter((statement) => statement.status === "pending" && statement.invalidatedAt !== null).length,
+      },
+    };
+  }
+
+  getApprovedStatements(libraryId: string): AnalysisStatement[] {
+    return rows(this.sql.prepare(`
+      SELECT s.*, r.type AS relation_type
+      FROM analysis_statements s JOIN relations r ON r.id = s.relation_id
+      WHERE s.library_id = ? AND s.status = 'approved' AND r.status IN ('accepted', 'manual')
+      ORDER BY s.updated_at DESC
+    `), libraryId).map((entry) => this.statementFrom(entry));
+  }
+
+  updateAnalysisStatement(
+    id: string,
+    values: { text?: string; status?: StatementStatus },
+  ): AnalysisStatement {
+    const existing = row(this.sql.prepare(`
+      SELECT s.*, r.type AS relation_type FROM analysis_statements s
+      JOIN relations r ON r.id = s.relation_id WHERE s.id = ?
+    `), id);
+    if (!existing) throw new Error("分析陈述不存在");
+    const nextText = values.text ?? String(existing.text);
+    const textChanged = values.text !== undefined && nextText !== String(existing.text);
+    const citations = this.statementFrom(existing).citations;
+    if (values.status === "approved" && citations.length === 0) throw new Error("批准陈述前必须关联至少一条原文证据");
+    const resetReview = textChanged;
+    const nextStatus = resetReview ? "pending" : (values.status ?? String(existing.status));
+    const timestamp = now();
+    this.sql.prepare(`
+      UPDATE analysis_statements
+      SET text = ?, status = ?, updated_at = ?,
+        invalidated_reason = CASE WHEN ? THEN '陈述文本已修改，请重新核对引用' ELSE invalidated_reason END,
+        invalidated_at = CASE WHEN ? THEN ? ELSE invalidated_at END,
+        precheck_status = CASE WHEN ? THEN 'not_checked' ELSE precheck_status END,
+        precheck_reason = CASE WHEN ? THEN NULL ELSE precheck_reason END,
+        precheck_checked_at = CASE WHEN ? THEN NULL ELSE precheck_checked_at END,
+        precheck_content_updated_at = CASE WHEN ? THEN NULL ELSE precheck_content_updated_at END
+      WHERE id = ?
+    `).run(
+      nextText, nextStatus, timestamp,
+      resetReview ? 1 : 0, resetReview ? 1 : 0, timestamp,
+      resetReview ? 1 : 0, resetReview ? 1 : 0, resetReview ? 1 : 0, resetReview ? 1 : 0,
+      id,
+    );
+    return this.getAnalysisStatement(id) as AnalysisStatement;
+  }
+
+  addStatementEvidence(statementId: string, chunkId: string): AnalysisStatement {
+    const statement = this.getAnalysisStatement(statementId);
+    if (!statement) throw new Error("分析陈述不存在");
+    const chunk = this.getChunk(chunkId);
+    if (!chunk || chunk.libraryId !== statement.libraryId) throw new Error("证据片段不属于当前知识库");
+    const inserted = this.sql.prepare(
+      "INSERT OR IGNORE INTO analysis_statement_evidence (statement_id, chunk_id) VALUES (?, ?)",
+    ).run(statementId, chunkId);
+    if (Number(inserted.changes) > 0) this.invalidateStatementForRelation(statement.relationId, "证据引用已修改，请重新审核陈述");
+    return this.getAnalysisStatement(statementId) as AnalysisStatement;
+  }
+
+  deleteStatementEvidence(statementId: string, chunkId: string): AnalysisStatement {
+    const statement = this.getAnalysisStatement(statementId);
+    if (!statement) throw new Error("分析陈述不存在");
+    const deleted = this.sql.prepare("DELETE FROM analysis_statement_evidence WHERE statement_id = ? AND chunk_id = ?")
+      .run(statementId, chunkId);
+    if (Number(deleted.changes) > 0) this.invalidateStatementForRelation(statement.relationId, "证据引用已修改，请重新审核陈述");
+    return this.getAnalysisStatement(statementId) as AnalysisStatement;
+  }
+
+  getAnalysisStatement(id: string): AnalysisStatement | undefined {
+    const result = row(this.sql.prepare(`
+      SELECT s.*, r.type AS relation_type FROM analysis_statements s
+      JOIN relations r ON r.id = s.relation_id WHERE s.id = ?
+    `), id);
+    return result ? this.statementFrom(result) : undefined;
+  }
+
+  private statementFrom(result: Row): AnalysisStatement {
+    const evidenceIds = rows(
+      this.sql.prepare("SELECT chunk_id FROM analysis_statement_evidence WHERE statement_id = ?"),
+      String(result.id),
+    ).map((entry) => String(entry.chunk_id));
+    return {
+      id: String(result.id),
+      libraryId: String(result.library_id),
+      relationId: String(result.relation_id),
+      text: String(result.text),
+      status: String(result.status) as StatementStatus,
+      relationType: String(result.relation_type) as RelationType,
+      citations: this.citationsForChunkIds(evidenceIds),
+      invalidatedReason: result.invalidated_reason === null ? null : String(result.invalidated_reason),
+      invalidatedAt: result.invalidated_at === null ? null : String(result.invalidated_at),
+      precheck: {
+        status: (result.precheck_status === null ? "not_checked" : String(result.precheck_status)) as AnalysisStatement["precheck"]["status"],
+        reason: result.precheck_reason === null ? null : String(result.precheck_reason),
+        checkedAt: result.precheck_checked_at === null ? null : String(result.precheck_checked_at),
+        contentUpdatedAt: result.precheck_content_updated_at === null ? null : String(result.precheck_content_updated_at),
+      },
+      createdAt: String(result.created_at),
+      updatedAt: String(result.updated_at),
+    };
+  }
+
+  saveStatementPrecheck(id: string, result: StatementPrecheckOutput): AnalysisStatement {
+    const statement = this.getAnalysisStatement(id);
+    if (!statement) throw new Error("分析陈述不存在");
+    const timestamp = now();
+    this.sql.prepare(`
+      UPDATE analysis_statements
+      SET precheck_status = ?, precheck_reason = ?, precheck_checked_at = ?,
+        precheck_content_updated_at = ?
+      WHERE id = ?
+    `).run(result.status, result.reason, timestamp, statement.updatedAt, id);
+    return this.getAnalysisStatement(id) as AnalysisStatement;
+  }
+
+  failStatementPrecheck(id: string, reason: string): AnalysisStatement {
+    const statement = this.getAnalysisStatement(id);
+    if (!statement) throw new Error("分析陈述不存在");
+    this.sql.prepare(`
+      UPDATE analysis_statements
+      SET precheck_status = 'failed', precheck_reason = ?, precheck_checked_at = ?,
+        precheck_content_updated_at = ?
+      WHERE id = ?
+    `).run(reason, now(), statement.updatedAt, id);
+    return this.getAnalysisStatement(id) as AnalysisStatement;
+  }
+
+  private invalidateStatementForRelation(relationId: string, reason: string): void {
+    const timestamp = now();
+    this.sql.prepare(`
+      UPDATE analysis_statements
+      SET status = 'pending', invalidated_reason = ?, invalidated_at = ?,
+        precheck_status = 'not_checked', precheck_reason = NULL,
+        precheck_checked_at = NULL, precheck_content_updated_at = NULL, updated_at = ?
+      WHERE relation_id = ?
+    `).run(reason, timestamp, timestamp, relationId);
   }
 
   getAbstractNode(id: string): AbstractNode | undefined {

@@ -82,4 +82,28 @@ describe("DeepSeek model configuration", () => {
     expect(body.stream).toBe(true);
     expect(body.thinking).toEqual({ type: "enabled" });
   });
+
+  it("prechecks an analysis statement against supplied citations", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ status: "supported", reason: "引用直接支持陈述。" }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const result = await provider.precheckStatement("材料支持结论。", [{
+      versionId: "version-1",
+      chunkId: "chunk-1",
+      documentName: "source.md",
+      mediaType: "text/markdown",
+      headingPath: "证据",
+      pageNumber: null,
+      startLine: 1,
+      endLine: 2,
+      blockId: null,
+      excerpt: "材料支持结论。",
+    }]);
+    expect(result.status).toBe("supported");
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as { messages: Array<{ content: string }> };
+    expect(body.messages[1]!.content).toContain("材料支持结论");
+  });
 });

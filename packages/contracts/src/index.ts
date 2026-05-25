@@ -66,9 +66,55 @@ export interface Chunk {
   ordinal: number;
   headingPath: string | null;
   pageNumber: number | null;
+  startLine: number | null;
+  endLine: number | null;
+  blockId: string | null;
   startChar: number;
   endChar: number;
   text: string;
+}
+
+export interface Citation {
+  versionId: string;
+  chunkId: string;
+  documentName: string;
+  mediaType: string;
+  headingPath: string | null;
+  pageNumber: number | null;
+  startLine: number | null;
+  endLine: number | null;
+  blockId: string | null;
+  excerpt: string;
+}
+
+export type SourceLinkType = "markdown" | "wiki" | "embed" | "block" | "logseq";
+
+export interface SourceLink {
+  id: string;
+  versionId: string;
+  type: SourceLinkType;
+  raw: string;
+  target: string;
+  label: string | null;
+  line: number;
+  resolvedDocumentId: string | null;
+}
+
+export interface SourceMetadata {
+  versionId: string;
+  documentId: string;
+  documentName: string;
+  mediaType: string;
+  title: string | null;
+  frontmatterRaw: string | null;
+  frontmatter: Record<string, string>;
+  parsedAt: string;
+}
+
+export interface SourceStructure {
+  metadata: SourceMetadata | null;
+  links: SourceLink[];
+  chunks: Chunk[];
 }
 
 export interface AbstractNode {
@@ -78,6 +124,7 @@ export interface AbstractNode {
   title: string;
   summary: string;
   source: "ai" | "user";
+  citations: Citation[];
   createdAt: string;
   updatedAt: string;
 }
@@ -93,6 +140,7 @@ export interface Relation {
   confidence: number | null;
   createdBy: "ai" | "user";
   evidenceChunkIds: string[];
+  citations: Citation[];
   createdAt: string;
   updatedAt: string;
 }
@@ -130,6 +178,14 @@ export interface GraphResponse {
 export interface SearchResult {
   chunk: Chunk;
   score: number;
+}
+
+export interface PublishedAnalysis {
+  libraryId: string;
+  path: string;
+  content: string;
+  includedVersionIds: string[];
+  publishedAt: string;
 }
 
 export interface ModelTestResult {

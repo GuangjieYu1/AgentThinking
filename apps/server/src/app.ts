@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
@@ -19,12 +19,13 @@ import {
   type RelationType,
 } from "@agent-thinking/contracts";
 import type { AppConfig } from "./config.js";
-import { hasConfiguredModels } from "./config.js";
+import { hasConfiguredModels, hasConfiguredOcr } from "./config.js";
 import { AgentDatabase } from "./db.js";
 import { contentHash, mediaTypeFor, safeFileName, validateFileName } from "./domain/files.js";
 import type { ModelProvider } from "./services/models.js";
 import { IngestionQueue } from "./services/ingestion.js";
 import { VectorStore } from "./services/vector-store.js";
+import { AnalysisPublisher } from "./services/analysis.js";
 
 export interface AppServices {
   config: AppConfig;
@@ -41,6 +42,7 @@ function requireLibrary(db: AgentDatabase, id: string): void {
 export async function createApp(services: AppServices): Promise<FastifyInstance> {
   const app = Fastify({ logger: true, bodyLimit: 4 * 1024 * 1024 });
   const { config, db, vectors, model, queue } = services;
+  const publisher = new AnalysisPublisher(db, config);
   await app.register(cors, { origin: true });
   await app.register(multipart, { limits: { files: 100, fileSize: 60 * 1024 * 1024 } });
 
@@ -54,6 +56,8 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     ok: true,
     provider: model.name,
     aiConfigured: hasConfiguredModels(config),
+    ocrProvider: config.ocrProvider,
+    ocrConfigured: hasConfiguredOcr(config),
     vectorEngine: vectors.usesSqliteVec ? "sqlite-vec" : "javascript-fallback",
   }));
 
@@ -106,8 +110,8 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   });
   app.patch<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/settings", async (request) => {
     const settings = updateLibrarySettingsSchema.parse(request.body);
-    if (settings.ocrMode === "cloud" && !config.visionModel) {
-      throw new Error("云端 OCR 需要在服务端配置 AI_VISION_MODEL");
+    if (settings.ocrMode === "cloud" && (config.ocrProvider !== "aliyun" || !hasConfiguredOcr(config))) {
+      throw new Error("阿里云 OCR 需要配置 OCR_PROVIDER=aliyun 及 ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET");
     }
     return db.updateSettings(request.params.libraryId, settings.ocrMode);
   });
@@ -144,6 +148,30 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     }
     if (imported.length === 0) throw new Error("请选择至少一个文件");
     return reply.status(202).send(imported);
+  });
+  app.get<{ Params: { versionId: string }; Querystring: { download?: string } }>(
+    "/api/versions/:versionId/source",
+    async (request, reply) => {
+      const source = db.getVersionSource(request.params.versionId);
+      if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+      const buffer = await readFile(source.version.storagePath);
+      reply.type(source.mediaType);
+      if (request.query.download === "true") {
+        reply.header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(source.documentName)}`);
+      }
+      return reply.send(buffer);
+    },
+  );
+  app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/structure", async (request) => {
+    return db.getSourceStructure(request.params.versionId);
+  });
+  app.post<{ Params: { versionId: string } }>("/api/versions/:versionId/reanalyze", async (request, reply) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+    db.updateVersionStatus(source.version.id, "queued");
+    const job = db.createJob(source.libraryId, source.version.id);
+    queue.enqueue(job.id);
+    return reply.status(202).send(job);
   });
 
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/jobs", async (request) => {
@@ -231,6 +259,30 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   app.delete<{ Params: { relationId: string } }>("/api/relations/:relationId", async (request, reply) => {
     if (!db.deleteRelation(request.params.relationId)) return reply.status(404).send({ error: "关系不存在" });
     return reply.status(204).send();
+  });
+  app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/publish", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId);
+    return reply.status(201).send(await publisher.publish(request.params.libraryId));
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId);
+    const analysis = db.getPublishedAnalysis(request.params.libraryId);
+    if (!analysis) return reply.status(404).send({ error: "尚未发布分析笔记" });
+    return analysis;
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/download", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId);
+    const analysis = db.getPublishedAnalysis(request.params.libraryId);
+    if (!analysis) return reply.status(404).send({ error: "尚未发布分析笔记" });
+    reply.type("text/markdown; charset=utf-8");
+    reply.header("Content-Disposition", 'attachment; filename="analysis.md"');
+    return reply.send(analysis.content);
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/export", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId);
+    reply.type("application/zip");
+    reply.header("Content-Disposition", 'attachment; filename="agent-thinking-export.zip"');
+    return reply.send(await publisher.exportArchive(request.params.libraryId));
   });
 
   const webDist = resolve(import.meta.dirname, "../../web/dist");

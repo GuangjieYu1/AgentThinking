@@ -57,7 +57,7 @@ describe("HTTP application", () => {
       'Content-Disposition: form-data; name="file"; filename="notes.md"',
       "Content-Type: text/markdown",
       "",
-      "# First\nA useful concept.\n\n# Second\nTherefore this claim follows.",
+      "---\ntitle: Research Notes\n---\n# First\nA useful concept with a [source](paper.pdf) and [[Second]]. ^first\n\n# Second\nTherefore this claim follows. ((claim-ref))",
       `--${boundary}--`,
       "",
     ].join("\r\n");
@@ -79,13 +79,61 @@ describe("HTTP application", () => {
       stage = jobs[0]?.stage ?? "";
     }
     expect(stage).toBe("completed");
+    const documents = (await app.inject({
+      method: "GET",
+      url: `/api/libraries/${library.id}/documents`,
+    })).json<Array<{ latestVersion: { id: string } }>>();
+    const versionId = documents[0]!.latestVersion.id;
+    const structure = (await app.inject({
+      method: "GET",
+      url: `/api/versions/${versionId}/structure`,
+    })).json<{ metadata: { title: string }; links: Array<{ type: string }>; chunks: Array<{ startLine: number }> }>();
+    expect(structure.metadata.title).toBe("Research Notes");
+    expect(structure.links.map((link) => link.type)).toEqual(["markdown", "wiki", "block", "logseq"]);
+    expect(structure.chunks[0]?.startLine).toBe(5);
+    const original = await app.inject({ method: "GET", url: `/api/versions/${versionId}/source` });
+    expect(original.body).toContain("title: Research Notes");
     const graph = (await app.inject({
       method: "GET",
       url: `/api/libraries/${library.id}/graph?includeChunks=true`,
-    })).json<{ nodes: unknown[]; edges: unknown[] }>();
+    })).json<{ nodes: Array<{ id: string; nodeType: string; data: { citations?: unknown[] } }>; edges: Array<{ relation?: { id: string; citations: unknown[] } }> }>();
     expect(graph.nodes.length).toBeGreaterThan(1);
     expect(graph.edges.length).toBeGreaterThan(0);
-    const abstractId = (graph.nodes as Array<{ id: string; nodeType: string }>).find((node) => node.nodeType === "abstract")!.id;
+    expect(graph.nodes.find((node) => node.nodeType === "abstract")?.data.citations?.length).toBeGreaterThan(0);
+    const suggested = graph.edges.find((edge) => edge.relation)?.relation;
+    expect(suggested?.citations.length).toBeGreaterThan(0);
+    await app.inject({
+      method: "PATCH",
+      url: `/api/relations/${suggested!.id}`,
+      payload: { status: "accepted" },
+    });
+    const published = await app.inject({ method: "POST", url: `/api/libraries/${library.id}/analysis/publish` });
+    expect(published.statusCode).toBe(201);
+    expect(published.body).toContain("已审核关系");
+    expect(published.body).toContain("notes.md - 第 5-5 行");
+    const downloaded = await app.inject({ method: "GET", url: `/api/libraries/${library.id}/analysis/download` });
+    expect(downloaded.body).toContain("report_format");
+    const archive = await app.inject({ method: "GET", url: `/api/libraries/${library.id}/export` });
+    expect(archive.statusCode).toBe(200);
+    expect(archive.rawPayload.includes(Buffer.from("analysis.md"))).toBe(true);
+    expect(archive.rawPayload.includes(Buffer.from("notes.md"))).toBe(true);
+    const reanalyze = await app.inject({ method: "POST", url: `/api/versions/${versionId}/reanalyze` });
+    expect(reanalyze.statusCode).toBe(202);
+    let reanalyzeStage = "queued";
+    for (let attempt = 0; attempt < 30 && reanalyzeStage !== "completed"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      reanalyzeStage = (await app.inject({
+        method: "GET",
+        url: `/api/libraries/${library.id}/jobs`,
+      })).json<Array<{ stage: string }>>()[0]?.stage ?? "";
+    }
+    expect(reanalyzeStage).toBe("completed");
+    expect((await app.inject({ method: "GET", url: `/api/libraries/${library.id}/analysis` })).statusCode).toBe(200);
+    const refreshedGraph = (await app.inject({
+      method: "GET",
+      url: `/api/libraries/${library.id}/graph`,
+    })).json<{ nodes: Array<{ id: string; nodeType: string }> }>();
+    const abstractId = refreshedGraph.nodes.find((node) => node.nodeType === "abstract")!.id;
     const deletedNode = await app.inject({ method: "DELETE", url: `/api/nodes/${abstractId}` });
     expect(deletedNode.statusCode).toBe(204);
     await app.close();

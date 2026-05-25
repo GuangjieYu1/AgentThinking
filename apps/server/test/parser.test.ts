@@ -23,20 +23,24 @@ vi.mock("tesseract.js", () => ({
   createWorker: async () => ({ recognize, terminate: async () => undefined }),
 }));
 
-function model(ocrText = "云端 OCR 内容"): ModelProvider {
+function model(): ModelProvider {
   return {
     name: "test",
     configured: true,
     embed: async () => [],
     extract: async () => ({ nodes: [], relations: [] }),
     stream: async function* () { yield { type: "content", text: "ok" }; },
-    ocrImage: async () => ocrText,
     test: async () => ({ ok: true, provider: "test", message: "ok" }),
   };
 }
 
 describe("PDF parsing and OCR", () => {
-  const config = getConfig({ dataDir: "./data/test", ocrCacheDir: "./data/test/ocr", provider: "fake" });
+  const config = getConfig({
+    dataDir: "./data/test",
+    ocrCacheDir: "./data/test/ocr",
+    provider: "fake",
+    ocrProvider: "aliyun",
+  });
 
   it("uses embedded PDF text without OCR when text is available", async () => {
     pageText = "This document includes enough embedded readable PDF text.";
@@ -69,6 +73,7 @@ describe("PDF parsing and OCR", () => {
       ocrMode: "cloud",
       config,
       model: model(),
+      cloudOcr: async () => "云端 OCR 内容",
       onOcrRequired: () => undefined,
     });
     expect(local[0]?.text).toBe("本地 OCR 内容");

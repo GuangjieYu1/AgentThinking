@@ -5,6 +5,7 @@ import { createWorker } from "tesseract.js";
 import type { SourceSection } from "../domain/chunker.js";
 import type { AppConfig } from "../config.js";
 import type { ModelProvider } from "./models.js";
+import { recognizeAliyunImage } from "./aliyun-ocr.js";
 
 export interface ParseOptions {
   buffer: Buffer;
@@ -12,6 +13,7 @@ export interface ParseOptions {
   ocrMode: OcrMode;
   config: AppConfig;
   model: ModelProvider;
+  cloudOcr?: (image: Buffer) => Promise<string>;
   onOcrRequired: () => void;
 }
 
@@ -45,8 +47,10 @@ async function parsePdf(options: ParseOptions): Promise<SourceSection[]> {
       const png = await renderPage(page);
       let text: string;
       if (options.ocrMode === "cloud") {
-        if (!options.model.ocrImage) throw new Error("配置的模型不支持云端 OCR");
-        text = await options.model.ocrImage(`data:image/png;base64,${png.toString("base64")}`);
+        if (options.config.ocrProvider !== "aliyun") throw new Error("云端 OCR 需要配置 OCR_PROVIDER=aliyun");
+        text = options.cloudOcr
+          ? await options.cloudOcr(png)
+          : await recognizeAliyunImage(png, options.config);
       } else {
         await mkdir(options.config.ocrCacheDir, { recursive: true });
         localWorker ??= await createWorker(["eng", "chi_sim"], undefined, {

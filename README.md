@@ -23,7 +23,7 @@ AI_THINKING_MODE=disabled
 AI_EMBEDDING_PROVIDER=local
 ```
 
-DeepSeek's official API documents chat completions but not an embeddings endpoint, so this configuration uses local hashed vectors for candidate retrieval and search. For higher-quality semantic retrieval, configure a separate OpenAI-compatible embeddings service with `AI_EMBEDDING_PROVIDER=api`, `AI_EMBEDDING_BASE_URL`, `AI_EMBEDDING_API_KEY`, and `AI_EMBEDDING_MODEL`.
+DeepSeek's official API documents chat completions but not embeddings or OCR endpoints, so this configuration uses local hashed vectors for candidate retrieval and a separate OCR provider for scanned pages. For higher-quality semantic retrieval, configure a separate OpenAI-compatible embeddings service with `AI_EMBEDDING_PROVIDER=api`, `AI_EMBEDDING_BASE_URL`, `AI_EMBEDDING_API_KEY`, and `AI_EMBEDDING_MODEL`.
 
 For an entirely offline demonstration without sending document text, set `AI_PROVIDER=fake`.
 
@@ -33,17 +33,47 @@ Run a production build with `npm run build && npm start`; the server then hosts 
 
 - Multiple local knowledge libraries with versioned document imports and SHA-256 deduplication.
 - Structured Markdown/TXT chunking and PDF text extraction; scanned PDF pages use local Tesseract OCR by default.
-- Optional cloud OCR per library when `AI_VISION_MODEL` is configured.
+- Optional Alibaba Cloud OCR per library for scanned PDF pages.
 - DeepSeek V4 JSON graph extraction plus local retrieval vectors by default; a separate OpenAI-compatible embeddings endpoint remains configurable.
 - SQLite persistence with FTS5 search support and a `sqlite-vec` backed vector store, with an in-process cosine fallback when the native extension cannot load.
 - Concept/claim overview graph, evidence chunk expansion, semantic search, suggested relationship review, manual edges, and editable abstract-node content.
+- Immutable uploaded sources with Markdown frontmatter/link/block-reference preservation and line/page-based evidence citations.
+- Manually published Markdown analysis reports plus ZIP exports containing the report and source-file copies.
 - Background ingestion jobs and browser updates over server-sent events.
 
 ## Privacy And Data
 
 Runtime files live under `data/` and are excluded from version control. API credentials are read only by the server from environment variables and are never returned in API responses or stored in SQLite.
 
-With the default DeepSeek configuration, extracted text is submitted to DeepSeek only for relationship extraction; local vectors are used for retrieval. Scanned page images stay local. Cloud OCR requires a separately supported vision-capable configuration rather than the default DeepSeek text API.
+Uploaded files remain unchanged under `data/files/`. After reviewing suggested relationships, publish an analysis note from the library panel; generated Markdown reports are stored under `data/analysis/` and can be downloaded with their cited source copies.
+
+With the default DeepSeek configuration, extracted text is submitted to DeepSeek only for relationship extraction; local vectors are used for retrieval. Scanned page images stay local in `local` OCR mode, and are submitted page by page to Alibaba Cloud OCR only when a library selects Alibaba Cloud OCR.
+
+## Alibaba Cloud OCR Setup
+
+DeepSeek remains responsible for concept and relationship extraction. Alibaba Cloud OCR is used only when a scanned PDF page has insufficient embedded text.
+
+1. Activate the Alibaba Cloud **OCR - Text Recognition** service and grant a RAM user permission to call OCR APIs. Avoid using the root account AccessKey.
+2. Create a RAM AccessKey, then add the following values to `.env`:
+
+```dotenv
+OCR_PROVIDER=aliyun
+ALIYUN_OCR_ENDPOINT=ocr-api.cn-hangzhou.aliyuncs.com
+ALIBABA_CLOUD_ACCESS_KEY_ID=your_ram_access_key_id
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=your_ram_access_key_secret
+# Set this only for STS temporary credentials:
+ALIBABA_CLOUD_SECURITY_TOKEN=
+```
+
+3. Restart the development server after changing `.env`:
+
+```bash
+npm run dev
+```
+
+4. In a knowledge library, select **阿里云 OCR** under **扫描 PDF OCR**, then import or reanalyze a scanned PDF. PDFs with sufficient embedded text do not call OCR.
+
+The integration uses Alibaba Cloud OCR `RecognizeGeneral` (`2021-07-07`) and sends each rendered scanned page as PNG binary content to `ocr-api.cn-hangzhou.aliyuncs.com`. Keep `OCR_PROVIDER=local` to use local Tesseract without transmitting scanned page images.
 
 ## Commands
 

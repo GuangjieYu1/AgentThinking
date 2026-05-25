@@ -7,7 +7,6 @@ export interface ModelProvider {
   readonly configured: boolean;
   embed(texts: string[]): Promise<number[][]>;
   extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>): Promise<ExtractionOutput>;
-  ocrImage?(dataUrl: string): Promise<string>;
   stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }>;
   test(): Promise<ModelTestResult>;
 }
@@ -74,10 +73,6 @@ export class FakeModelProvider implements ModelProvider {
     return { nodes, relations };
   }
 
-  async ocrImage(): Promise<string> {
-    return "";
-  }
-
   async *stream(prompt: string): AsyncGenerator<{ type: "content"; text: string }> {
     const response = `演示模型已收到请求：“${prompt.slice(0, 80)}”。配置 DeepSeek 密钥后，此窗口会显示真实的逐段输出。`;
     for (const part of response.match(/.{1,10}/gu) ?? []) {
@@ -141,7 +136,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
       id: chunk.id,
       source: chunk.headingPath ?? (chunk.pageNumber ? `PDF page ${chunk.pageNumber}` : ""),
       text: chunk.text.slice(0, 2400),
-      candidateIds: (relatedChunks.get(chunk.id) ?? []).map((candidate) => candidate.id),
+      candidates: (relatedChunks.get(chunk.id) ?? []).map((candidate) => ({
+        id: candidate.id,
+        source: candidate.headingPath ?? (candidate.pageNumber ? `PDF page ${candidate.pageNumber}` : ""),
+        text: candidate.text.slice(0, 1200),
+      })),
     }));
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
@@ -155,7 +154,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
             '{"nodes":[{"key":"n1","kind":"concept","title":"...","summary":"...","evidenceChunkIds":["..."]}],' +
             '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}]}. ' +
             "Node kind is concept or claim. Relation type must be supports, contradicts, explains, depends_on, example_of, or related_to. " +
-            "Every node and relation must cite evidenceChunkIds from the supplied ids; only create defensible relationships.",
+            "Candidate evidence may come from other documents and should be used to identify contradictions. " +
+            "Every node and relation must cite evidenceChunkIds from supplied evidence or candidate ids; only create defensible relationships.",
         },
         { role: "user", content: JSON.stringify({ evidence }) },
       ],
@@ -170,24 +170,6 @@ export class OpenAICompatibleProvider implements ModelProvider {
     const raw = response.choices[0]?.message.content ?? "{}";
     const json = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ""));
     return extractionSchema.parse(json);
-  }
-
-  async ocrImage(dataUrl: string): Promise<string> {
-    if (!this.config.visionModel) throw new Error("云端 OCR 需要配置 AI_VISION_MODEL");
-    const response = await this.request<{
-      choices: Array<{ message: { content: string } }>;
-    }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", {
-      model: this.config.visionModel,
-      temperature: 0,
-      messages: [{
-        role: "user",
-        content: [
-          { type: "text", text: "Transcribe all readable text on this page exactly. Return text only." },
-          { type: "image_url", image_url: { url: dataUrl } },
-        ],
-      }],
-    });
-    return response.choices[0]?.message.content ?? "";
   }
 
   async *stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }> {

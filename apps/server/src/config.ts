@@ -9,6 +9,7 @@ export interface AppConfig {
   port: number;
   dataDir: string;
   filesDir: string;
+  analysisDir: string;
   ocrCacheDir: string;
   provider: "deepseek" | "openai" | "fake";
   aiBaseUrl: string;
@@ -19,7 +20,11 @@ export interface AppConfig {
   embeddingBaseUrl: string;
   embeddingApiKey: string | undefined;
   embeddingModel: string | undefined;
-  visionModel: string | undefined;
+  ocrProvider: "local" | "aliyun";
+  aliyunOcrEndpoint: string;
+  aliyunAccessKeyId: string | undefined;
+  aliyunAccessKeySecret: string | undefined;
+  aliyunSecurityToken: string | undefined;
 }
 
 export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -37,6 +42,7 @@ export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     port: overrides.port ?? Number(process.env.PORT ?? 4310),
     dataDir,
     filesDir: overrides.filesDir ?? resolve(dataDir, "files"),
+    analysisDir: overrides.analysisDir ?? resolve(dataDir, "analysis"),
     ocrCacheDir: overrides.ocrCacheDir ?? resolve(dataDir, "ocr-cache"),
     provider,
     aiBaseUrl,
@@ -49,8 +55,17 @@ export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     embeddingBaseUrl: overrides.embeddingBaseUrl ?? process.env.AI_EMBEDDING_BASE_URL ?? aiBaseUrl,
     embeddingApiKey: overrides.embeddingApiKey ?? (process.env.AI_EMBEDDING_API_KEY || aiApiKey),
     embeddingModel: overrides.embeddingModel ?? process.env.AI_EMBEDDING_MODEL,
-    visionModel: overrides.visionModel ?? process.env.AI_VISION_MODEL,
+    ocrProvider: overrides.ocrProvider ?? (process.env.OCR_PROVIDER === "aliyun" ? "aliyun" : "local"),
+    aliyunOcrEndpoint: overrides.aliyunOcrEndpoint ?? process.env.ALIYUN_OCR_ENDPOINT ?? "ocr-api.cn-hangzhou.aliyuncs.com",
+    aliyunAccessKeyId: overrides.aliyunAccessKeyId ?? process.env.ALIBABA_CLOUD_ACCESS_KEY_ID,
+    aliyunAccessKeySecret: overrides.aliyunAccessKeySecret ?? process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET,
+    aliyunSecurityToken: overrides.aliyunSecurityToken ?? process.env.ALIBABA_CLOUD_SECURITY_TOKEN,
   };
+}
+
+export function hasConfiguredOcr(config: AppConfig): boolean {
+  return config.ocrProvider === "local" ||
+    Boolean(config.aliyunAccessKeyId && config.aliyunAccessKeySecret);
 }
 
 export function hasConfiguredModels(config: AppConfig): boolean {

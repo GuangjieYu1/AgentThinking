@@ -4,9 +4,16 @@ export interface SourceSection {
   text: string;
   headingPath?: string | null;
   pageNumber?: number | null;
+  startLine?: number | null;
+  endLine?: number | null;
+  blockId?: string | null;
 }
 
-export interface PendingChunk extends Omit<Chunk, "id" | "libraryId" | "versionId"> {}
+export interface PendingChunk extends Omit<Chunk, "id" | "libraryId" | "versionId" | "startLine" | "endLine" | "blockId"> {
+  startLine?: number | null;
+  endLine?: number | null;
+  blockId?: string | null;
+}
 
 export interface ChunkOptions {
   targetCharacters?: number;
@@ -48,6 +55,13 @@ export function chunkSections(
           ordinal,
           headingPath: section.headingPath ?? null,
           pageNumber: section.pageNumber ?? null,
+          startLine: section.startLine == null
+            ? null
+            : section.startLine + normalized.slice(0, start).split("\n").length - 1,
+          endLine: section.startLine == null
+            ? null
+            : section.startLine + normalized.slice(0, end).split("\n").length - 1,
+          blockId: section.blockId ?? null,
           startChar: start,
           endChar: end,
           text,
@@ -67,16 +81,30 @@ export function parseMarkdownSections(text: string): SourceSection[] {
   const sections: SourceSection[] = [];
   const headings: string[] = [];
   let buffer: string[] = [];
+  let bufferStartLine = 1;
 
   const flush = () => {
     const body = buffer.join("\n").trim();
-    if (body) sections.push({ text: body, headingPath: headings.join(" / ") || null });
+    if (body) {
+      const leadingBlankLines = buffer.findIndex((line) => line.trim() !== "");
+      const startLine = bufferStartLine + Math.max(leadingBlankLines, 0);
+      sections.push({
+        text: body,
+        headingPath: headings.join(" / ") || null,
+        startLine,
+        endLine: startLine + body.split("\n").length - 1,
+        blockId: /\^([A-Za-z0-9_-]+)\s*$/.exec(body)?.[1] ?? null,
+      });
+    }
     buffer = [];
   };
 
-  for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
     const heading = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
     if (!heading) {
+      if (buffer.length === 0) bufferStartLine = index + 1;
       buffer.push(line);
       continue;
     }
@@ -84,16 +112,28 @@ export function parseMarkdownSections(text: string): SourceSection[] {
     const depth = heading[1]?.length ?? 1;
     headings.splice(depth - 1);
     headings[depth - 1] = heading[2] ?? "";
+    bufferStartLine = index + 2;
   }
   flush();
   return sections;
 }
 
 export function parseTextSections(text: string): SourceSection[] {
-  return text
-    .replace(/\r\n?/g, "\n")
-    .split(/\n{2,}/)
-    .map((paragraph) => ({ text: paragraph.trim() }))
-    .filter((section) => section.text.length > 0);
+  const normalized = text.replace(/\r\n?/g, "\n");
+  const sections: SourceSection[] = [];
+  const paragraphPattern = /(?:^|\n{2,})([\s\S]*?)(?=\n{2,}|$)/g;
+  let match: RegExpExecArray | null;
+  while ((match = paragraphPattern.exec(normalized)) !== null) {
+    const raw = match[1] ?? "";
+    const body = raw.trim();
+    if (!body) continue;
+    const textStart = match.index + (match[0].length - raw.length) + raw.indexOf(body);
+    const startLine = normalized.slice(0, textStart).split("\n").length;
+    sections.push({
+      text: body,
+      startLine,
+      endLine: startLine + body.split("\n").length - 1,
+    });
+  }
+  return sections;
 }
-

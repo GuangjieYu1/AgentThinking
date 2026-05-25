@@ -5,6 +5,7 @@ import type { DatabaseSync as NativeDatabaseSync } from "node:sqlite";
 import type {
   AbstractNode,
   AbstractNodeKind,
+  Citation,
   Chunk,
   Document,
   DocumentVersion,
@@ -21,6 +22,10 @@ import type {
   RelationStatus,
   RelationType,
   SearchResult,
+  SourceLink,
+  SourceMetadata,
+  SourceStructure,
+  PublishedAnalysis,
 } from "@agent-thinking/contracts";
 import type { PendingChunk } from "./domain/chunker.js";
 
@@ -57,6 +62,9 @@ function chunkFrom(r: Row): Chunk {
     ordinal: Number(r.ordinal),
     headingPath: r.heading_path === null ? null : String(r.heading_path),
     pageNumber: r.page_number === null ? null : Number(r.page_number),
+    startLine: r.start_line === null ? null : Number(r.start_line),
+    endLine: r.end_line === null ? null : Number(r.end_line),
+    blockId: r.block_id === null ? null : String(r.block_id),
     startChar: Number(r.start_char),
     endChar: Number(r.end_char),
     text: String(r.text),
@@ -71,6 +79,7 @@ function nodeFrom(r: Row): AbstractNode {
     title: String(r.title),
     summary: String(r.summary),
     source: String(r.source) as "ai" | "user",
+    citations: [],
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
   };
@@ -92,6 +101,10 @@ export class AgentDatabase {
 
   private migrate(): void {
     this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS libraries (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -190,7 +203,44 @@ export class AgentDatabase {
       CREATE INDEX IF NOT EXISTS idx_nodes_library ON abstract_nodes(library_id);
       CREATE INDEX IF NOT EXISTS idx_relations_library_status ON relations(library_id, status);
       CREATE INDEX IF NOT EXISTS idx_jobs_library ON ingest_jobs(library_id, updated_at DESC);
+      CREATE TABLE IF NOT EXISTS source_metadata (
+        version_id TEXT PRIMARY KEY REFERENCES document_versions(id) ON DELETE CASCADE,
+        title TEXT,
+        frontmatter_raw TEXT,
+        frontmatter_json TEXT NOT NULL DEFAULT '{}',
+        parsed_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS source_links (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        type TEXT NOT NULL CHECK (type IN ('markdown','wiki','embed','block','logseq')),
+        raw TEXT NOT NULL,
+        target TEXT NOT NULL,
+        label TEXT,
+        line INTEGER NOT NULL,
+        resolved_document_id TEXT REFERENCES documents(id) ON DELETE SET NULL
+      );
+      CREATE TABLE IF NOT EXISTS published_analyses (
+        library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        content TEXT NOT NULL,
+        included_version_ids_json TEXT NOT NULL,
+        published_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_source_links_version ON source_links(version_id);
     `);
+    this.addColumn("chunks", "start_line", "INTEGER");
+    this.addColumn("chunks", "end_line", "INTEGER");
+    this.addColumn("chunks", "block_id", "TEXT");
+    this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
+    this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
+  }
+
+  private addColumn(table: string, column: string, definition: string): void {
+    const columns = rows(this.sql.prepare(`PRAGMA table_info(${table})`));
+    if (!columns.some((entry) => String(entry.name) === column)) {
+      this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
   }
 
   listLibraries(): Library[] {
@@ -299,10 +349,16 @@ export class AgentDatabase {
     return result ? this.versionFrom(result) : undefined;
   }
 
-  getVersionSource(id: string): { version: DocumentVersion; libraryId: string; mediaType: string } | undefined {
+  getVersionSource(id: string): {
+    version: DocumentVersion;
+    documentId: string;
+    documentName: string;
+    libraryId: string;
+    mediaType: string;
+  } | undefined {
     const result = row(
       this.sql.prepare(`
-        SELECT v.*, d.library_id, d.media_type
+        SELECT v.*, d.id AS source_document_id, d.name AS document_name, d.library_id, d.media_type
         FROM document_versions v JOIN documents d ON d.id = v.document_id
         WHERE v.id = ?
       `),
@@ -310,6 +366,8 @@ export class AgentDatabase {
     );
     return result ? {
       version: this.versionFrom(result),
+      documentId: String(result.source_document_id),
+      documentName: String(result.document_name),
       libraryId: String(result.library_id),
       mediaType: String(result.media_type),
     } : undefined;
@@ -352,6 +410,68 @@ export class AgentDatabase {
 
   updateVersionStatus(id: string, status: DocumentVersion["status"]): void {
     this.sql.prepare("UPDATE document_versions SET status = ? WHERE id = ?").run(status, id);
+  }
+
+  saveSourceStructure(
+    versionId: string,
+    values: { title: string | null; frontmatterRaw: string | null; frontmatter: Record<string, string>; links: Array<Omit<SourceLink, "versionId" | "resolvedDocumentId">> },
+  ): void {
+    const source = this.getVersionSource(versionId);
+    if (!source) throw new Error("导入版本不存在");
+    this.sql.prepare(`
+      INSERT INTO source_metadata (version_id, title, frontmatter_raw, frontmatter_json, parsed_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(version_id) DO UPDATE SET
+        title = excluded.title, frontmatter_raw = excluded.frontmatter_raw,
+        frontmatter_json = excluded.frontmatter_json, parsed_at = excluded.parsed_at
+    `).run(versionId, values.title, values.frontmatterRaw, JSON.stringify(values.frontmatter), now());
+    this.sql.prepare("DELETE FROM source_links WHERE version_id = ?").run(versionId);
+    const insert = this.sql.prepare(`
+      INSERT INTO source_links (id, version_id, type, raw, target, label, line, resolved_document_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const resolveTarget = this.sql.prepare(
+      "SELECT id FROM documents WHERE library_id = ? AND (name = ? OR name = ? OR name = ?) LIMIT 1",
+    );
+    for (const link of values.links) {
+      const plainTarget = link.target.split("#")[0] ?? link.target;
+      const resolved = row(resolveTarget, source.libraryId, plainTarget, `${plainTarget}.md`, `${plainTarget}.markdown`);
+      insert.run(link.id, versionId, link.type, link.raw, link.target, link.label, link.line, resolved?.id ?? null);
+    }
+  }
+
+  getSourceStructure(versionId: string): SourceStructure {
+    const source = this.getVersionSource(versionId);
+    if (!source) throw new Error("导入版本不存在");
+    const metadataRow = row(this.sql.prepare("SELECT * FROM source_metadata WHERE version_id = ?"), versionId);
+    const metadata: SourceMetadata | null = metadataRow ? {
+      versionId,
+      documentId: source.documentId,
+      documentName: source.documentName,
+      mediaType: source.mediaType,
+      title: metadataRow.title === null ? null : String(metadataRow.title),
+      frontmatterRaw: metadataRow.frontmatter_raw === null ? null : String(metadataRow.frontmatter_raw),
+      frontmatter: JSON.parse(String(metadataRow.frontmatter_json)) as Record<string, string>,
+      parsedAt: String(metadataRow.parsed_at),
+    } : null;
+    const links: SourceLink[] = rows(
+      this.sql.prepare("SELECT * FROM source_links WHERE version_id = ? ORDER BY line, rowid"),
+      versionId,
+    ).map((entry) => ({
+      id: String(entry.id),
+      versionId,
+      type: String(entry.type) as SourceLink["type"],
+      raw: String(entry.raw),
+      target: String(entry.target),
+      label: entry.label === null ? null : String(entry.label),
+      line: Number(entry.line),
+      resolvedDocumentId: entry.resolved_document_id === null ? null : String(entry.resolved_document_id),
+    }));
+    const chunks = rows(
+      this.sql.prepare("SELECT * FROM chunks WHERE version_id = ? ORDER BY ordinal"),
+      versionId,
+    ).map(chunkFrom);
+    return { metadata, links, chunks };
   }
 
   createJob(libraryId: string, versionId: string): IngestJob {
@@ -459,17 +579,26 @@ export class AgentDatabase {
     this.sql.prepare("DELETE FROM chunks WHERE version_id = ?").run(versionId);
     const insert = this.sql.prepare(`
       INSERT INTO chunks
-        (id, library_id, version_id, ordinal, heading_path, page_number, start_char, end_char, text)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, library_id, version_id, ordinal, heading_path, page_number, start_line, end_line, block_id, start_char, end_char, text)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertFts = this.sql.prepare(
       "INSERT INTO chunks_fts (chunk_id, text, heading_path) VALUES (?, ?, ?)",
     );
     const result: Chunk[] = [];
     for (const item of pending) {
-      const chunk: Chunk = { id: randomUUID(), libraryId, versionId, ...item };
+      const chunk: Chunk = {
+        id: randomUUID(),
+        libraryId,
+        versionId,
+        ...item,
+        startLine: item.startLine ?? null,
+        endLine: item.endLine ?? null,
+        blockId: item.blockId ?? null,
+      };
       insert.run(
         chunk.id, libraryId, versionId, chunk.ordinal, chunk.headingPath, chunk.pageNumber,
+        chunk.startLine ?? null, chunk.endLine ?? null, chunk.blockId ?? null,
         chunk.startChar, chunk.endChar, chunk.text,
       );
       insertFts.run(chunk.id, chunk.text, chunk.headingPath ?? "");
@@ -531,6 +660,42 @@ export class AgentDatabase {
       INSERT INTO chunk_embeddings (chunk_id, dimensions, embedding) VALUES (?, ?, ?)
       ON CONFLICT(chunk_id) DO UPDATE SET dimensions = excluded.dimensions, embedding = excluded.embedding
     `).run(chunkId, dimensions, embedding);
+  }
+
+  private citationsForChunkIds(ids: string[]): Citation[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const records = rows(this.sql.prepare(`
+      SELECT c.*, d.name AS document_name, d.media_type
+      FROM chunks c
+      JOIN document_versions v ON v.id = c.version_id
+      JOIN documents d ON d.id = v.document_id
+      WHERE c.id IN (${placeholders})
+    `), ...ids);
+    const byId = new Map(records.map((result) => {
+      const chunk = chunkFrom(result);
+      return [chunk.id, {
+        versionId: chunk.versionId,
+        chunkId: chunk.id,
+        documentName: String(result.document_name),
+        mediaType: String(result.media_type),
+        headingPath: chunk.headingPath,
+        pageNumber: chunk.pageNumber,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        blockId: chunk.blockId,
+        excerpt: chunk.text.slice(0, 280),
+      } satisfies Citation];
+    }));
+    return ids.flatMap((id) => byId.has(id) ? [byId.get(id)!] : []);
+  }
+
+  private withNodeCitations(node: AbstractNode): AbstractNode {
+    const evidenceIds = rows(
+      this.sql.prepare("SELECT chunk_id FROM abstract_node_evidence WHERE node_id = ?"),
+      node.id,
+    ).map((item) => String(item.chunk_id));
+    return { ...node, citations: this.citationsForChunkIds(evidenceIds) };
   }
 
   listEmbeddings(libraryId: string, dimensions: number): Array<{ chunk: Chunk; embedding: Uint8Array }> {
@@ -601,7 +766,7 @@ export class AgentDatabase {
     this.sql.prepare(
       "UPDATE abstract_nodes SET title = ?, summary = ?, updated_at = ? WHERE id = ?",
     ).run(title, summary, now(), id);
-    return nodeFrom(row(this.sql.prepare("SELECT * FROM abstract_nodes WHERE id = ?"), id) as Row);
+    return this.withNodeCitations(nodeFrom(row(this.sql.prepare("SELECT * FROM abstract_nodes WHERE id = ?"), id) as Row));
   }
 
   deleteAbstractNode(id: string): boolean {
@@ -677,6 +842,7 @@ export class AgentDatabase {
       confidence: result.confidence === null ? null : Number(result.confidence),
       createdBy: String(result.created_by) as "ai" | "user",
       evidenceChunkIds: evidence,
+      citations: this.citationsForChunkIds(evidence),
       createdAt: String(result.created_at),
       updatedAt: String(result.updated_at),
     };
@@ -754,7 +920,7 @@ export class AgentDatabase {
     const graphNodes: GraphNode[] = nodeRows.map((result) => ({
       id: String(result.id),
       nodeType: "abstract",
-      data: nodeFrom(result),
+      data: this.withNodeCitations(nodeFrom(result)),
     }));
     const graphEdges: GraphEdge[] = relationSlice.map((result) => ({
       id: String(result.id),
@@ -791,5 +957,48 @@ export class AgentDatabase {
       }
     }
     return { nodes: graphNodes, edges: graphEdges, truncated };
+  }
+
+  listVersionSources(libraryId: string): Array<ReturnType<AgentDatabase["getVersionSource"]> & {}> {
+    const ids = rows(this.sql.prepare(`
+      SELECT v.id FROM document_versions v JOIN documents d ON d.id = v.document_id
+      WHERE d.library_id = ? AND v.status = 'completed' ORDER BY d.name, v.created_at DESC
+    `), libraryId).map((item) => String(item.id));
+    return ids.flatMap((id) => {
+      const source = this.getVersionSource(id);
+      return source ? [source] : [];
+    });
+  }
+
+  listPublishRelations(libraryId: string): Relation[] {
+    return rows(this.sql.prepare(`
+      SELECT * FROM relations WHERE library_id = ? AND status IN ('accepted', 'manual') ORDER BY updated_at DESC
+    `), libraryId).map((entry) => this.relationFrom(entry));
+  }
+
+  getAbstractNode(id: string): AbstractNode | undefined {
+    const result = row(this.sql.prepare("SELECT * FROM abstract_nodes WHERE id = ?"), id);
+    return result ? this.withNodeCitations(nodeFrom(result)) : undefined;
+  }
+
+  savePublishedAnalysis(value: PublishedAnalysis): PublishedAnalysis {
+    this.sql.prepare(`
+      INSERT INTO published_analyses (library_id, path, content, included_version_ids_json, published_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(library_id) DO UPDATE SET path = excluded.path, content = excluded.content,
+        included_version_ids_json = excluded.included_version_ids_json, published_at = excluded.published_at
+    `).run(value.libraryId, value.path, value.content, JSON.stringify(value.includedVersionIds), value.publishedAt);
+    return value;
+  }
+
+  getPublishedAnalysis(libraryId: string): PublishedAnalysis | undefined {
+    const result = row(this.sql.prepare("SELECT * FROM published_analyses WHERE library_id = ?"), libraryId);
+    return result ? {
+      libraryId,
+      path: String(result.path),
+      content: String(result.content),
+      includedVersionIds: JSON.parse(String(result.included_version_ids_json)) as string[],
+      publishedAt: String(result.published_at),
+    } : undefined;
   }
 }

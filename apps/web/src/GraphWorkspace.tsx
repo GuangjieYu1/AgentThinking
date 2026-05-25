@@ -16,6 +16,7 @@ import {
   relationStatuses,
   relationTypes,
   type AbstractNode,
+  type Citation,
   type GraphEdge,
   type GraphNode,
   type Relation,
@@ -95,10 +96,12 @@ export function GraphWorkspace({
   libraryId,
   refreshKey,
   onError,
+  onOpenCitation,
 }: {
   libraryId: string;
   refreshKey: number;
   onError: (message: string) => void;
+  onOpenCitation: (citation: Citation) => void;
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<VisualNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<VisualEdge>([]);
@@ -251,6 +254,7 @@ export function GraphWorkspace({
           {selected && (
             <SelectedNode
               node={selected}
+              onOpenCitation={onOpenCitation}
               onSaved={() => void loadGraph(selected.id, true)}
               onDeleted={() => {
                 setSelected(undefined);
@@ -264,6 +268,7 @@ export function GraphWorkspace({
               <h3>{selectedRelation.type}</h3>
               <p>{titles.get(selectedRelation.sourceNodeId)} → {titles.get(selectedRelation.targetNodeId)}</p>
               <p>{selectedRelation.reason}</p>
+              <CitationList citations={selectedRelation.citations} onOpenCitation={onOpenCitation} />
               <div className="actions">
                 {selectedRelation.status === "suggested" && <>
                   <button onClick={() => void review(selectedRelation, "accepted")}>接受</button>
@@ -305,11 +310,13 @@ function SelectedNode({
   onSaved,
   onDeleted,
   onError,
+  onOpenCitation,
 }: {
   node: GraphNode;
   onSaved: () => void;
   onDeleted: () => void;
   onError: (message: string) => void;
+  onOpenCitation: (citation: Citation) => void;
 }) {
   const abstract = node.nodeType === "abstract" ? node.data : undefined;
   const [title, setTitle] = useState(abstract?.title ?? "");
@@ -326,6 +333,18 @@ function SelectedNode({
         <h3>原文证据</h3>
         <small>{node.data.headingPath ?? (node.data.pageNumber ? `PDF 第 ${node.data.pageNumber} 页` : "文本片段")}</small>
         <p>{node.data.text}</p>
+        <CitationList citations={[{
+          versionId: node.data.versionId,
+          chunkId: node.data.id,
+          documentName: "原文",
+          mediaType: node.data.pageNumber ? "application/pdf" : "text/plain",
+          headingPath: node.data.headingPath,
+          pageNumber: node.data.pageNumber,
+          startLine: node.data.startLine,
+          endLine: node.data.endLine,
+          blockId: node.data.blockId,
+          excerpt: node.data.text.slice(0, 280),
+        }]} onOpenCitation={onOpenCitation} />
       </div>
     );
   }
@@ -338,6 +357,7 @@ function SelectedNode({
       <h3>{node.data.kind === "claim" ? "命题" : "概念"}</h3>
       <input value={title} onChange={(event) => setTitle(event.target.value)} />
       <textarea value={summary} onChange={(event) => setSummary(event.target.value)} rows={4} />
+      <CitationList citations={node.data.citations} onOpenCitation={onOpenCitation} />
       <div className="node-actions">
         <button type="submit">保存节点</button>
         <button
@@ -352,5 +372,19 @@ function SelectedNode({
         </button>
       </div>
     </form>
+  );
+}
+
+function CitationList({ citations, onOpenCitation }: { citations: Citation[]; onOpenCitation: (citation: Citation) => void }) {
+  if (citations.length === 0) return <p className="muted">无来源引用。</p>;
+  return (
+    <div className="citations">
+      {citations.map((citation) => (
+        <button type="button" className="citation" key={citation.chunkId} onClick={() => onOpenCitation(citation)}>
+          {citation.documentName}
+          {citation.pageNumber ? ` / 第 ${citation.pageNumber} 页` : citation.startLine ? ` / L${citation.startLine}-${citation.endLine}` : ""}
+        </button>
+      ))}
+    </div>
   );
 }

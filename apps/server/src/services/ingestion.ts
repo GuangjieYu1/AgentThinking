@@ -3,7 +3,8 @@ import { readFile } from "node:fs/promises";
 import type { IngestJob } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 import { AgentDatabase } from "../db.js";
-import { chunkSections, parseMarkdownSections, parseTextSections } from "../domain/chunker.js";
+import { chunkSections, parseTextSections } from "../domain/chunker.js";
+import { parseMarkdownStructure } from "../domain/source-structure.js";
 import type { ModelProvider } from "./models.js";
 import { parseDocument } from "./parser.js";
 import { VectorStore } from "./vector-store.js";
@@ -87,9 +88,24 @@ export class IngestionQueue extends EventEmitter {
         },
       });
       if (source.mediaType === "text/markdown") {
-        sections = parseMarkdownSections(sections.map((section) => section.text).join("\n"));
+        const structure = parseMarkdownStructure(buffer.toString("utf8"));
+        sections = structure.sections;
+        this.db.saveSourceStructure(source.version.id, structure);
       } else if (source.mediaType === "text/plain") {
         sections = parseTextSections(sections.map((section) => section.text).join("\n\n"));
+        this.db.saveSourceStructure(source.version.id, {
+          title: null,
+          frontmatterRaw: null,
+          frontmatter: {},
+          links: [],
+        });
+      } else {
+        this.db.saveSourceStructure(source.version.id, {
+          title: null,
+          frontmatterRaw: null,
+          frontmatter: {},
+          links: [],
+        });
       }
 
       this.setStage(jobId, "chunking", 0.34);
@@ -130,4 +146,3 @@ export class IngestionQueue extends EventEmitter {
     }
   }
 }
-

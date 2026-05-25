@@ -111,6 +111,11 @@ button:hover, .upload:hover { background: #1b3d43; }
 .job p { font-size: 12px; color: #e193a8; margin: 5px 0; }
 .job-actions, .node-actions { display: flex; gap: 7px; margin-top: 6px; }
 .job-actions button { padding: 6px 10px; font-size: 12px; }
+.document-actions, .analysis-actions { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
+.document-actions button, .document-actions a, .analysis-actions a { font-size: 12px; padding: 6px 9px; }
+.analysis-actions a, .document-actions a { border: 1px solid #294159; border-radius: 7px; color: #b5c8df; text-decoration: none; }
+.analysis-preview { margin-top: 10px; color: #a8b7d0; }
+.analysis-preview pre { max-height: 210px; overflow: auto; white-space: pre-wrap; font-size: 11px; }
 .graph-panel { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 .graph-toolbar { height: 55px; border-bottom: 1px solid #1d2940; display: flex; align-items: center; gap: 9px; padding: 9px 13px; }
 .graph-toolbar form { display: flex; gap: 7px; flex: 1; max-width: 370px; }
@@ -136,6 +141,16 @@ button:hover, .upload:hover { background: #1b3d43; }
 .node-detail textarea { resize: vertical; }
 .node-actions button { flex: 1; }
 .relation-detail p { color: #a8b7d0; line-height: 1.45; }
+.citations { display: grid; gap: 5px; margin: 8px 0; }
+.citation { text-align: left; padding: 6px 8px; font-size: 12px; color: #8bd9c7; }
+.source-overlay { position: fixed; inset: 0; z-index: 30; background: rgba(4, 9, 18, .74); display: flex; justify-content: center; align-items: center; }
+.source-preview { width: min(980px, 92vw); height: min(760px, 88vh); padding: 18px; overflow: auto; }
+.source-preview header { display: flex; justify-content: space-between; align-items: center; position: sticky; top: -18px; background: #101a2a; padding: 8px 0; }
+.source-title { color: #8bd9c7; }
+.source-preview pre, .source-chunks { background: #0b1321; border-radius: 8px; padding: 12px; white-space: pre-wrap; }
+.source-text span { display: block; }
+.source-text b { display: inline-block; color: #60748e; font-weight: normal; width: 44px; user-select: none; }
+.source-text .focused, .source-chunks .focused { background: #293d39; color: #ddfff5; }
 .actions { display: flex; gap: 7px; }
 .danger { color: #ec8da6; background: #311b29; border-color: #593043; }
 .ghost { color: #91a0b9; background: transparent; border-color: #27334b; }

@@ -12,6 +12,8 @@ import type {
   SearchResult,
   ModelStreamEvent,
   ModelTestResult,
+  PublishedAnalysis,
+  SourceStructure,
 } from "@agent-thinking/contracts";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -32,7 +34,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  health: () => request<{ provider: string; aiConfigured: boolean; vectorEngine: string }>("/health"),
+  health: () => request<{
+    provider: string;
+    aiConfigured: boolean;
+    vectorEngine: string;
+    ocrProvider: "local" | "aliyun";
+    ocrConfigured: boolean;
+  }>("/health"),
   testModel: () => request<ModelTestResult>("/model/test", {
     method: "POST",
     body: JSON.stringify({}),
@@ -80,6 +88,14 @@ export const api = {
       body: JSON.stringify({ ocrMode }),
     }),
   documents: (id: string) => request<Document[]>(`/libraries/${id}/documents`),
+  sourceUrl: (versionId: string, download = false) => `/api/versions/${versionId}/source${download ? "?download=true" : ""}`,
+  sourceText: async (versionId: string) => {
+    const response = await fetch(`/api/versions/${versionId}/source`);
+    if (!response.ok) throw new Error("读取原文件失败");
+    return response.text();
+  },
+  structure: (versionId: string) => request<SourceStructure>(`/versions/${versionId}/structure`),
+  reanalyze: (versionId: string) => request<IngestJob>(`/versions/${versionId}/reanalyze`, { method: "POST" }),
   jobs: (id: string) => request<IngestJob[]>(`/libraries/${id}/jobs`),
   retry: (id: string) => request<IngestJob>(`/jobs/${id}/retry`, { method: "POST" }),
   deleteJob: (id: string) => request<void>(`/jobs/${id}`, { method: "DELETE" }),
@@ -129,4 +145,9 @@ export const api = {
     }),
   deleteRelation: (relationId: string) =>
     request<void>(`/relations/${relationId}`, { method: "DELETE" }),
+  publishAnalysis: (libraryId: string) =>
+    request<PublishedAnalysis>(`/libraries/${libraryId}/analysis/publish`, { method: "POST" }),
+  analysis: (libraryId: string) => request<PublishedAnalysis>(`/libraries/${libraryId}/analysis`),
+  analysisDownloadUrl: (libraryId: string) => `/api/libraries/${libraryId}/analysis/download`,
+  exportUrl: (libraryId: string) => `/api/libraries/${libraryId}/export`,
 };

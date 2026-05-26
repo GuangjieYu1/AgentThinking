@@ -792,6 +792,15 @@ export class AgentDatabase {
     const evidence = this.sql.prepare(
       "INSERT OR IGNORE INTO abstract_node_evidence (node_id, chunk_id) VALUES (?, ?)",
     );
+    const findSuggestedRelation = this.sql.prepare(`
+      SELECT id FROM relations
+      WHERE library_id = ? AND source_node_id = ? AND target_node_id = ?
+        AND type = ? AND status = 'suggested' AND created_by = 'ai'
+      LIMIT 1
+    `);
+    const insertRelationEvidence = this.sql.prepare(
+      "INSERT OR IGNORE INTO relation_evidence (relation_id, chunk_id) VALUES (?, ?)",
+    );
     for (const extracted of extraction.nodes) {
       const existing = row(findNode, libraryId, extracted.kind, extracted.title);
       const nodeId = existing ? String(existing.id) : randomUUID();
@@ -809,19 +818,17 @@ export class AgentDatabase {
       const sourceNodeId = keyToId.get(extracted.sourceKey);
       const targetNodeId = keyToId.get(extracted.targetKey);
       if (!sourceNodeId || !targetNodeId || sourceNodeId === targetNodeId) continue;
-      const relation = this.createRelation(libraryId, {
-        sourceNodeId,
-        targetNodeId,
-        type: extracted.type,
-        reason: extracted.reason,
-        status: "suggested",
-        confidence: extracted.confidence,
-        createdBy: "ai",
-      });
-      const insertEvidence = this.sql.prepare(
-        "INSERT OR IGNORE INTO relation_evidence (relation_id, chunk_id) VALUES (?, ?)",
-      );
-      for (const chunkId of extracted.evidenceChunkIds) insertEvidence.run(relation.id, chunkId);
+      const existing = row(findSuggestedRelation, libraryId, sourceNodeId, targetNodeId, extracted.type);
+      const relationId = existing ? String(existing.id) : this.createRelation(libraryId, {
+          sourceNodeId,
+          targetNodeId,
+          type: extracted.type,
+          reason: extracted.reason,
+          status: "suggested",
+          confidence: extracted.confidence,
+          createdBy: "ai",
+        }).id;
+      for (const chunkId of extracted.evidenceChunkIds) insertRelationEvidence.run(relationId, chunkId);
     }
   }
 

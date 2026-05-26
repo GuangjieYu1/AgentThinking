@@ -1,9 +1,10 @@
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
-import type { IngestJob } from "@agent-thinking/contracts";
+import type { Chunk, IngestJob } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 import { AgentDatabase } from "../db.js";
 import { chunkSections, parseTextSections } from "../domain/chunker.js";
+import { isWordMediaType } from "../domain/files.js";
 import { parseMarkdownStructure } from "../domain/source-structure.js";
 import type { ModelProvider } from "./models.js";
 import { parseDocument } from "./parser.js";
@@ -91,7 +92,7 @@ export class IngestionQueue extends EventEmitter {
         const structure = parseMarkdownStructure(buffer.toString("utf8"));
         sections = structure.sections;
         this.db.saveSourceStructure(source.version.id, structure);
-      } else if (source.mediaType === "text/plain") {
+      } else if (source.mediaType === "text/plain" || isWordMediaType(source.mediaType)) {
         sections = parseTextSections(sections.map((section) => section.text).join("\n\n"));
         this.db.saveSourceStructure(source.version.id, {
           title: null,
@@ -121,18 +122,50 @@ export class IngestionQueue extends EventEmitter {
       }
 
       this.setStage(jobId, "extracting", 0.7);
+      const currentVersionChunkIds = new Set(chunks.map((chunk) => chunk.id));
+      const affectedExistingChunks = new Map<string, { chunk: Chunk; newContext: Map<string, Chunk> }>();
       for (let start = 0; start < chunks.length; start += 20) {
         const batch = chunks.slice(start, start + 20);
         const related = new Map<string, typeof chunks>();
         for (const chunk of batch) {
           const embedding = await this.model.embed([chunk.text]);
+          const localCandidates = this.vectors.search(source.libraryId, embedding[0] ?? [], 4, new Set([chunk.id]))
+            .map((result) => result.chunk);
+          const crossDocumentCandidates = this.vectors.search(
+            source.libraryId,
+            embedding[0] ?? [],
+            4,
+            currentVersionChunkIds,
+          ).map((result) => result.chunk)
+            .filter((candidate) => candidate.versionId !== source.version.id);
+          const candidates = [...new Map(
+            [...localCandidates, ...crossDocumentCandidates].map((candidate) => [candidate.id, candidate]),
+          ).values()];
           related.set(
             chunk.id,
-            this.vectors.search(source.libraryId, embedding[0] ?? [], 4, new Set([chunk.id]))
-              .map((result) => result.chunk),
+            candidates,
           );
+          for (const candidate of crossDocumentCandidates) {
+            const affected = affectedExistingChunks.get(candidate.id) ?? {
+              chunk: candidate,
+              newContext: new Map<string, Chunk>(),
+            };
+            affected.newContext.set(chunk.id, chunk);
+            affectedExistingChunks.set(candidate.id, affected);
+          }
         }
         const extraction = await this.model.extract(batch, related);
+        this.db.saveExtraction(source.libraryId, extraction);
+      }
+
+      // Existing chunks need a reciprocal look at new material so import order does not
+      // determine whether a cross-document relationship can be proposed.
+      const affected = [...affectedExistingChunks.values()];
+      for (let start = 0; start < affected.length; start += 20) {
+        const batch = affected.slice(start, start + 20);
+        const anchors = batch.map((entry) => entry.chunk);
+        const related = new Map(batch.map((entry) => [entry.chunk.id, [...entry.newContext.values()]]));
+        const extraction = await this.model.extract(anchors, related);
         this.db.saveExtraction(source.libraryId, extraction);
       }
 

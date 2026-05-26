@@ -13,9 +13,11 @@ describe("document preparation", () => {
 
   it("accepts MVP formats and creates stable content hashes", () => {
     expect(() => validateFileName("report.pdf")).not.toThrow();
-    expect(() => validateFileName("notes.docx")).toThrow(/仅支持/);
+    expect(() => validateFileName("notes.doc")).not.toThrow();
+    expect(() => validateFileName("notes.docx")).not.toThrow();
     expect(mediaTypeFor("readme.md")).toBe("text/markdown");
+    expect(mediaTypeFor("legacy.doc")).toBe("application/msword");
+    expect(mediaTypeFor("report.docx")).toContain("wordprocessingml");
     expect(contentHash(Buffer.from("same"))).toBe(contentHash(Buffer.from("same")));
   });
 });
-

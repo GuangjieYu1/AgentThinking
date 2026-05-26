@@ -1,11 +1,35 @@
 import { mkdir } from "node:fs/promises";
+import { createRequire } from "node:module";
 import type { OcrMode } from "@agent-thinking/contracts";
 import { createCanvas } from "@napi-rs/canvas";
 import { createWorker } from "tesseract.js";
 import type { SourceSection } from "../domain/chunker.js";
+import { isWordMediaType } from "../domain/files.js";
 import type { AppConfig } from "../config.js";
 import type { ModelProvider } from "./models.js";
 import { recognizeAliyunImage } from "./aliyun-ocr.js";
+
+interface ExtractedWordDocument {
+  getBody(): string;
+}
+
+type WordExtractorInstance = {
+  extract(source: Buffer): Promise<ExtractedWordDocument>;
+};
+
+type MimeDocument = {
+  html?: string | false;
+  text?: string;
+};
+
+const require = createRequire(import.meta.url);
+const WordExtractor = require("word-extractor") as new () => WordExtractorInstance;
+const { simpleParser } = require("mailparser") as {
+  simpleParser(source: Buffer): Promise<MimeDocument>;
+};
+const { convert: htmlToText } = require("html-to-text") as {
+  convert(html: string, options?: { wordwrap?: false }): string;
+};
 
 export interface ParseOptions {
   buffer: Buffer;
@@ -21,7 +45,39 @@ export async function parseDocument(options: ParseOptions): Promise<SourceSectio
   if (options.mediaType === "text/markdown" || options.mediaType === "text/plain") {
     return [{ text: options.buffer.toString("utf8") }];
   }
+  if (isWordMediaType(options.mediaType)) return parseWord(options.buffer);
   return parsePdf(options);
+}
+
+async function parseWord(buffer: Buffer): Promise<SourceSection[]> {
+  if (looksLikeMimeHtml(buffer)) {
+    const parsed = await simpleParser(buffer);
+    return extractedTextSection(parsed.text ??
+      (typeof parsed.html === "string" ? htmlToText(parsed.html, { wordwrap: false }) : ""));
+  }
+  if (looksLikeHtml(buffer)) {
+    return extractedTextSection(htmlToText(buffer.toString("utf8"), { wordwrap: false }));
+  }
+  const extracted = await new WordExtractor().extract(buffer);
+  return extractedTextSection(extracted.getBody());
+}
+
+function extractedTextSection(value: string): SourceSection[] {
+  const text = value.replace(/\r\n?/g, "\n").trim();
+  if (!text) throw new Error("Word 文档中没有可处理的文本内容");
+  return [{ text }];
+}
+
+function looksLikeMimeHtml(buffer: Buffer): boolean {
+  const header = buffer.subarray(0, 1024).toString("latin1").toLowerCase();
+  return header.includes("mime-version:") &&
+    header.includes("content-type: multipart/") &&
+    header.includes("boundary=");
+}
+
+function looksLikeHtml(buffer: Buffer): boolean {
+  const opening = buffer.subarray(0, 1024).toString("utf8").trimStart().toLowerCase();
+  return opening.startsWith("<!doctype html") || opening.startsWith("<html");
 }
 
 async function parsePdf(options: ParseOptions): Promise<SourceSection[]> {

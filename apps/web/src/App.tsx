@@ -4,6 +4,7 @@ import { api } from "./api";
 import { AnalysisWorkspace } from "./AnalysisWorkspace";
 import { GraphWorkspace } from "./GraphWorkspace";
 import { ModelTools } from "./ModelTools";
+import { TimelineWorkspace } from "./TimelineWorkspace";
 
 export function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
@@ -95,7 +96,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const [jobs, setJobs] = useState<IngestJob[]>([]);
   const [settings, setSettings] = useState<LibrarySettings>();
   const [refreshGraph, setRefreshGraph] = useState(0);
-  const [activeWorkspace, setActiveWorkspace] = useState<"graph" | "analysis">("graph");
+  const [activeWorkspace, setActiveWorkspace] = useState<"graph" | "timeline" | "analysis">("graph");
   const [analysis, setAnalysis] = useState<PublishedAnalysis>();
   const [sourceView, setSourceView] = useState<{ structure: SourceStructure; text?: string; focus?: Citation }>();
   const activeJobs = useMemo(() => jobs.filter((job) => !["completed", "failed"].includes(job.stage)), [jobs]);
@@ -160,7 +161,9 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const openSource = async (versionId: string, mediaType: string, focus?: Citation) => {
     try {
       const structure = await api.structure(versionId);
-      const text = mediaType !== "application/pdf" ? await api.sourceText(versionId) : undefined;
+      const text = mediaType === "text/markdown" || mediaType === "text/plain"
+        ? await api.sourceText(versionId)
+        : undefined;
       setSourceView({ structure, ...(text !== undefined ? { text } : {}), ...(focus ? { focus } : {}) });
     } catch (cause) {
       onError((cause as Error).message);
@@ -185,8 +188,8 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
           <p>{documents.length} 个文档 / {activeJobs.length} 个处理中任务</p>
         </div>
         <label className="upload">
-          导入 Markdown / TXT / PDF
-          <input type="file" multiple accept=".md,.markdown,.txt,.pdf" onChange={(event) => void upload(event.target.files)} />
+          导入 Markdown / TXT / PDF / Word
+          <input type="file" multiple accept=".md,.markdown,.txt,.pdf,.doc,.docx" onChange={(event) => void upload(event.target.files)} />
         </label>
       </header>
       <div className="panels">
@@ -240,10 +243,18 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
         <div className="work-surface">
           <nav className="workspace-tabs">
             <button className={activeWorkspace === "graph" ? "selected" : ""} onClick={() => setActiveWorkspace("graph")}>关系图谱审核</button>
+            <button className={activeWorkspace === "timeline" ? "selected" : ""} onClick={() => setActiveWorkspace("timeline")}>时间脉络</button>
             <button className={activeWorkspace === "analysis" ? "selected" : ""} onClick={() => setActiveWorkspace("analysis")}>分析笔记审核</button>
           </nav>
           {activeWorkspace === "graph" ? (
             <GraphWorkspace libraryId={library.id} refreshKey={refreshGraph} onError={onError} onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)} />
+          ) : activeWorkspace === "timeline" ? (
+            <TimelineWorkspace
+              libraryId={library.id}
+              refreshKey={refreshGraph}
+              onError={onError}
+              onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)}
+            />
           ) : (
             <AnalysisWorkspace
               key={`${library.id}:${refreshGraph}`}
@@ -271,10 +282,10 @@ function SourcePreview({ view, onClose }: { view: { structure: SourceStructure; 
         {metadata?.title && <p className="source-title">解析标题：{metadata.title}</p>}
         {metadata?.frontmatterRaw && <><h3>Frontmatter</h3><pre>{metadata.frontmatterRaw}</pre></>}
         {links.length > 0 && <><h3>链接与块引用</h3><ul>{links.map((link) => <li key={link.id}>L{link.line} / {link.type}: {link.raw}</li>)}</ul></>}
-        {(metadata?.mediaType ?? view.focus?.mediaType) === "application/pdf" ? (
+        {view.text === undefined ? (
           <div className="source-chunks">{chunks.map((chunk) => (
             <p className={view.focus?.chunkId === chunk.id ? "focused" : ""} key={chunk.id}>
-              第 {chunk.pageNumber} 页：{chunk.text}
+              {chunk.pageNumber ? `第 ${chunk.pageNumber} 页` : `片段 ${chunk.ordinal + 1}`}：{chunk.text}
             </p>
           ))}</div>
         ) : (

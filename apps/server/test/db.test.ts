@@ -57,6 +57,36 @@ describe("knowledge database", () => {
     db.close();
   });
 
+  it("merges evidence when AI suggests the same pending relation again", async () => {
+    const db = await database();
+    const library = db.createLibrary("Merged suggestions");
+    const version = db.createDocumentVersion(library.id, "a.txt", "text/plain", "hash", "a").version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 5, text: "first" },
+      { ordinal: 1, headingPath: null, pageNumber: null, startChar: 6, endChar: 12, text: "second" },
+    ]);
+    const extraction = (evidenceChunkIds: string[]) => ({
+      nodes: [
+        { key: "a", kind: "concept" as const, title: "A", summary: "", evidenceChunkIds: [chunks[0]!.id] },
+        { key: "b", kind: "claim" as const, title: "B", summary: "", evidenceChunkIds: [chunks[1]!.id] },
+      ],
+      relations: [{
+        sourceKey: "a",
+        targetKey: "b",
+        type: "supports" as const,
+        reason: "same pending relationship",
+        confidence: 0.8,
+        evidenceChunkIds,
+      }],
+    });
+    db.saveExtraction(library.id, extraction([chunks[0]!.id]));
+    db.saveExtraction(library.id, extraction([chunks[1]!.id]));
+    const relations = db.getGraph(library.id, {}).edges.map((edge) => edge.relation).filter(Boolean);
+    expect(relations).toHaveLength(1);
+    expect(relations[0]?.evidenceChunkIds).toEqual(expect.arrayContaining(chunks.map((chunk) => chunk.id)));
+    db.close();
+  });
+
   it("prevents relations between different libraries", async () => {
     const db = await database();
     const left = db.createLibrary("Left");

@@ -11,9 +11,12 @@
     "@napi-rs/canvas": "^0.1.80",
     "dotenv": "^16.6.1",
     "fastify": "^5.6.1",
+    "html-to-text": "^10.0.0",
+    "mailparser": "^3.9.8",
     "pdfjs-dist": "^5.4.296",
     "sqlite-vec": "0.1.7-alpha.2",
     "tesseract.js": "^6.0.1",
+    "word-extractor": "^1.0.4",
     "zod": "^3.25.76"
   },
   "devDependencies": {

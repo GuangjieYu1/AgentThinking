@@ -11,7 +11,7 @@ import {
   type Edge,
   type Node,
 } from "@xyflow/react";
-import { forceCenter, forceLink, forceManyBody, forceSimulation, type SimulationNodeDatum } from "d3-force";
+import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, type SimulationNodeDatum } from "d3-force";
 import {
   relationStatuses,
   relationTypes,
@@ -41,13 +41,24 @@ function relationColor(status: RelationStatus): string {
 
 function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[] {
   const positions: PositionedNode[] = records.map((record) => ({ id: record.id }));
-  const links = graphEdges.map((edge) => ({ source: edge.source, target: edge.target }));
+  const links = graphEdges.map((edge) => ({
+    source: edge.source,
+    target: edge.target,
+    kind: edge.edgeType,
+  }));
+  const byId = new Map(records.map((record) => [record.id, record]));
   const simulation = forceSimulation(positions)
-    .force("charge", forceManyBody().strength(-360))
-    .force("link", forceLink(links).id((record) => (record as PositionedNode).id).distance(125))
+    .force("charge", forceManyBody().strength(-980).distanceMax(620))
+    .force("collide", forceCollide<PositionedNode>().radius((position) =>
+      byId.get(position.id)?.nodeType === "chunk" ? 168 : 142,
+    ).strength(1).iterations(2))
+    .force("link", forceLink<PositionedNode, { source: string; target: string; kind: GraphEdge["edgeType"] }>(links)
+      .id((record) => record.id)
+      .distance((link) => link.kind === "evidence" ? 245 : 285)
+      .strength((link) => link.kind === "evidence" ? 0.42 : 0.7))
     .force("center", forceCenter(370, 280))
     .stop();
-  for (let index = 0; index < 140; index += 1) simulation.tick();
+  for (let index = 0; index < 240; index += 1) simulation.tick();
   return records.map((record) => {
     const point = positions.find((position) => position.id === record.id);
     const label = record.nodeType === "abstract"

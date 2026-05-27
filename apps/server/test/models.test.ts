@@ -47,6 +47,7 @@ describe("DeepSeek model configuration", () => {
       startChar: 0,
       endChar: 4,
       text: "概念证据",
+      aspects: [],
     };
     await provider.extract([chunk], new Map());
     expect(fetchMock).toHaveBeenCalledOnce();

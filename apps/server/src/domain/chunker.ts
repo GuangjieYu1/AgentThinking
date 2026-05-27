@@ -9,7 +9,7 @@ export interface SourceSection {
   blockId?: string | null;
 }
 
-export interface PendingChunk extends Omit<Chunk, "id" | "libraryId" | "versionId" | "startLine" | "endLine" | "blockId"> {
+export interface PendingChunk extends Omit<Chunk, "id" | "libraryId" | "versionId" | "startLine" | "endLine" | "blockId" | "aspects"> {
   startLine?: number | null;
   endLine?: number | null;
   blockId?: string | null;

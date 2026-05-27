@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   Background,
+  ControlButton,
   Controls,
   MarkerType,
   MiniMap,
+  Position,
   ReactFlow,
   useEdgesState,
   useNodesState,
   type Connection,
   type Edge,
   type Node,
+  type ReactFlowInstance,
 } from "@xyflow/react";
 import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, type SimulationNodeDatum } from "d3-force";
 import {
@@ -19,6 +22,7 @@ import {
   type Citation,
   type GraphEdge,
   type GraphNode,
+  type GraphView,
   type Relation,
   type RelationStatus,
   type RelationType,
@@ -28,6 +32,11 @@ import { api } from "./api";
 
 type VisualNode = Node<{ label: string; entity: GraphNode }>;
 type VisualEdge = Edge<{ entity: GraphEdge }>;
+type LayoutMode = "layered" | "network" | "tree";
+interface LayoutLink {
+  source: string;
+  target: string;
+}
 interface PositionedNode extends SimulationNodeDatum {
   id: string;
 }
@@ -39,7 +48,157 @@ function relationColor(status: RelationStatus): string {
   return "#64748b";
 }
 
-function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[] {
+function nodeSortKey(record: GraphNode): string {
+  if (record.nodeType === "abstract") return `${record.data.level}:${record.data.title}:${record.id}`;
+  return `3:${record.data.ordinal}:${record.id}`;
+}
+
+function createLayerMap(records: GraphNode[], links: LayoutLink[]): Map<string, number> {
+  const layerById = new Map(records.map((record) => [record.id, 0]));
+  const remaining = new Set(layerById.keys());
+  const outgoing = new Map<string, LayoutLink[]>();
+  const indegree = new Map(records.map((record) => [record.id, 0]));
+
+  for (const link of links) {
+    if (!layerById.has(link.source) || !layerById.has(link.target) || link.source === link.target) continue;
+    const adjacent = outgoing.get(link.source) ?? [];
+    adjacent.push(link);
+    outgoing.set(link.source, adjacent);
+    indegree.set(link.target, (indegree.get(link.target) ?? 0) + 1);
+  }
+
+  while (remaining.size > 0) {
+    let candidates = [...remaining].filter((id) => (indegree.get(id) ?? 0) === 0);
+    if (candidates.length === 0) {
+      candidates = [[...remaining].sort((left, right) =>
+        (outgoing.get(right)?.length ?? 0) - (outgoing.get(left)?.length ?? 0) || left.localeCompare(right),
+      )[0]!];
+    }
+    candidates.sort();
+    for (const id of candidates) {
+      if (!remaining.delete(id)) continue;
+      for (const link of outgoing.get(id) ?? []) {
+        if (remaining.has(link.target)) {
+          layerById.set(link.target, Math.max(layerById.get(link.target) ?? 0, (layerById.get(id) ?? 0) + 1));
+          indegree.set(link.target, (indegree.get(link.target) ?? 0) - 1);
+        }
+      }
+    }
+  }
+
+  return layerById;
+}
+
+function orderLayers(records: GraphNode[], links: LayoutLink[], layerById: Map<string, number>): GraphNode[][] {
+  const layers: GraphNode[][] = [];
+  for (const record of records) {
+    const layer = layerById.get(record.id) ?? 0;
+    (layers[layer] ??= []).push(record);
+  }
+  layers.forEach((layer) => layer.sort((left, right) => nodeSortKey(left).localeCompare(nodeSortKey(right), "zh-CN")));
+
+  const neighborRanks = (nodes: GraphNode[], reference: Map<string, number>, direction: "incoming" | "outgoing") => {
+    const previousRank = new Map(nodes.map((node, index) => [node.id, index]));
+    nodes.sort((left, right) => {
+      const barycenter = (id: string) => {
+        const neighbors = links.flatMap((link) =>
+          direction === "incoming" && link.target === id && reference.has(link.source) ? [reference.get(link.source)!]
+            : direction === "outgoing" && link.source === id && reference.has(link.target) ? [reference.get(link.target)!]
+              : [],
+        );
+        return neighbors.length > 0
+          ? neighbors.reduce((sum, value) => sum + value, 0) / neighbors.length
+          : (previousRank.get(id) ?? 0);
+      };
+      return barycenter(left.id) - barycenter(right.id) || (previousRank.get(left.id) ?? 0) - (previousRank.get(right.id) ?? 0);
+    });
+  };
+
+  for (let iteration = 0; iteration < 5; iteration += 1) {
+    for (let layer = 1; layer < layers.length; layer += 1) {
+      orderLayersByReference(layers[layer]!, layers[layer - 1]!, neighborRanks, "incoming");
+    }
+    for (let layer = layers.length - 2; layer >= 0; layer -= 1) {
+      orderLayersByReference(layers[layer]!, layers[layer + 1]!, neighborRanks, "outgoing");
+    }
+  }
+  return layers;
+}
+
+function orderLayersByReference(
+  current: GraphNode[],
+  referenceNodes: GraphNode[],
+  sortNodes: (nodes: GraphNode[], reference: Map<string, number>, direction: "incoming" | "outgoing") => void,
+  direction: "incoming" | "outgoing",
+): void {
+  sortNodes(current, new Map(referenceNodes.map((node, index) => [node.id, index])), direction);
+}
+
+function visualNodes(
+  records: GraphNode[],
+  positions: Map<string, { x: number; y: number }>,
+  direction?: "horizontal" | "vertical",
+): VisualNode[] {
+  return records.map((record) => {
+    const point = positions.get(record.id);
+    const label = record.nodeType === "abstract"
+      ? record.data.title
+      : `${record.data.pageNumber ? `P${record.data.pageNumber} ` : ""}${record.data.text.slice(0, 36)}`;
+    return {
+      id: record.id,
+      position: { x: point?.x ?? 0, y: point?.y ?? 0 },
+      ...(direction === "horizontal" ? { sourcePosition: Position.Right, targetPosition: Position.Left } : {}),
+      ...(direction === "vertical" ? { sourcePosition: Position.Bottom, targetPosition: Position.Top } : {}),
+      data: { label, entity: record },
+      className: record.nodeType === "chunk" ? "flow-chunk" : record.data.level === 2 ? "flow-theme" : `flow-${record.data.kind}`,
+      style: {
+        width: record.nodeType === "chunk" ? 250 : record.data.level === 2 ? 245 : 210,
+        border: "none",
+        borderRadius: record.nodeType === "chunk" ? 10 : record.data.level === 2 ? 15 : 28,
+      },
+    };
+  });
+}
+
+function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[] {
+  const links: LayoutLink[] = graphEdges.map((edge) => ({
+    source: edge.source,
+    target: edge.target,
+  }));
+  const layers = orderLayers(records, links, createLayerMap(records, links));
+  const positions = new Map<string, { x: number; y: number }>();
+  layers.forEach((layer, layerIndex) => {
+    const rowGap = layer.some((record) => record.nodeType === "chunk") ? 148 : 168;
+    layer.forEach((record, rowIndex) => {
+      positions.set(record.id, {
+        x: layerIndex * 330,
+        y: 280 + (rowIndex - ((layer.length - 1) / 2)) * rowGap,
+      });
+    });
+  });
+  return visualNodes(records, positions, "horizontal");
+}
+
+function treeLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[] {
+  const links: LayoutLink[] = graphEdges.map((edge) => ({
+    source: edge.source,
+    target: edge.target,
+  }));
+  const layers = orderLayers(records, links, createLayerMap(records, links));
+  const positions = new Map<string, { x: number; y: number }>();
+  layers.forEach((layer, layerIndex) => {
+    const columnGap = layer.some((record) => record.nodeType === "chunk") ? 300 : 270;
+    layer.forEach((record, columnIndex) => {
+      positions.set(record.id, {
+        x: 380 + (columnIndex - ((layer.length - 1) / 2)) * columnGap,
+        y: layerIndex * 180,
+      });
+    });
+  });
+  return visualNodes(records, positions, "vertical");
+}
+
+function networkLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[] {
   const positions: PositionedNode[] = records.map((record) => ({ id: record.id }));
   const links = graphEdges.map((edge) => ({
     source: edge.source,
@@ -48,57 +207,52 @@ function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[
   }));
   const byId = new Map(records.map((record) => [record.id, record]));
   const simulation = forceSimulation(positions)
-    .force("charge", forceManyBody().strength(-980).distanceMax(620))
-    .force("collide", forceCollide<PositionedNode>().radius((position) =>
-      byId.get(position.id)?.nodeType === "chunk" ? 168 : 142,
-    ).strength(1).iterations(2))
+    .force("charge", forceManyBody().strength(-1180).distanceMax(980))
+    .force("collide", forceCollide<PositionedNode>().radius((position) => {
+      const record = byId.get(position.id);
+      return record?.nodeType === "chunk" ? 168 : record?.nodeType === "abstract" && record.data.level === 2 ? 175 : 148;
+    }).strength(1).iterations(3))
     .force("link", forceLink<PositionedNode, { source: string; target: string; kind: GraphEdge["edgeType"] }>(links)
       .id((record) => record.id)
-      .distance((link) => link.kind === "evidence" ? 245 : 285)
-      .strength((link) => link.kind === "evidence" ? 0.42 : 0.7))
-    .force("center", forceCenter(370, 280))
+      .distance((link) => link.kind === "evidence" ? 245 : link.kind === "membership" ? 255 : 310)
+      .strength((link) => link.kind === "evidence" ? 0.34 : link.kind === "membership" ? 0.42 : 0.65))
+    .force("center", forceCenter(420, 340))
     .stop();
-  for (let index = 0; index < 240; index += 1) simulation.tick();
-  return records.map((record) => {
-    const point = positions.find((position) => position.id === record.id);
-    const label = record.nodeType === "abstract"
-      ? record.data.title
-      : `${record.data.pageNumber ? `P${record.data.pageNumber} ` : ""}${record.data.text.slice(0, 36)}`;
-    return {
-      id: record.id,
-      position: { x: point?.x ?? 0, y: point?.y ?? 0 },
-      data: { label, entity: record },
-      className: record.nodeType === "chunk" ? "flow-chunk" : `flow-${record.data.kind}`,
-      style: {
-        width: record.nodeType === "chunk" ? 250 : 210,
-        border: "none",
-        borderRadius: record.nodeType === "chunk" ? 10 : 28,
-      },
-    };
-  });
+  for (let index = 0; index < 300; index += 1) simulation.tick();
+  return visualNodes(records, new Map(positions.map((position) => [position.id, {
+    x: position.x ?? 0,
+    y: position.y ?? 0,
+  }])));
 }
 
-function displayEdges(records: GraphEdge[]): VisualEdge[] {
+function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[], layout: LayoutMode): VisualNode[] {
+  if (layout === "network") return networkLayout(records, graphEdges);
+  return layout === "tree" ? treeLayout(records, graphEdges) : layeredLayout(records, graphEdges);
+}
+
+function displayEdges(records: GraphEdge[], layout: LayoutMode): VisualEdge[] {
   return records.map((record) => {
     const status = record.relation?.status;
     const edge: VisualEdge = {
       id: record.id,
       source: record.source,
       target: record.target,
+      type: layout === "network" ? "default" : "smoothstep",
       data: { entity: record },
       animated: status === "suggested",
       style: {
-        stroke: record.edgeType === "evidence" ? "#56627c" : relationColor(status ?? "manual"),
-        strokeWidth: record.edgeType === "evidence" ? 1.5 : 2,
-        ...(status === "suggested" || record.edgeType === "evidence" ? { strokeDasharray: "5 4" } : {}),
+        stroke: record.edgeType === "evidence" ? "#56627c" : record.edgeType === "membership" ? "#557d85" : relationColor(status ?? "manual"),
+        strokeWidth: record.aggregate ? 2.8 : record.edgeType === "evidence" ? 1.5 : 2,
+        ...(status === "suggested" || record.edgeType !== "relation" ? { strokeDasharray: "5 4" } : {}),
       },
       labelStyle: { fill: "#b5c5dd", fontSize: 12, fontWeight: 600 },
     };
-    if (record.edgeType === "relation") {
+    if (record.aggregate) {
+      edge.label = `${record.aggregate.type} (${record.aggregate.count})`;
+      edge.markerEnd = { type: MarkerType.ArrowClosed };
+    } else if (record.edgeType === "relation") {
       edge.label = record.relation?.type ?? "relation";
       edge.markerEnd = { type: MarkerType.ArrowClosed };
-    } else {
-      edge.label = "evidence";
     }
     return edge;
   });
@@ -117,9 +271,15 @@ export function GraphWorkspace({
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<VisualNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<VisualEdge>([]);
+  const [flowInstance, setFlowInstance] = useState<ReactFlowInstance<VisualNode, VisualEdge>>();
   const [records, setRecords] = useState<GraphNode[]>([]);
+  const [edgeRecords, setEdgeRecords] = useState<GraphEdge[]>([]);
   const [selected, setSelected] = useState<GraphNode>();
   const [selectedRelation, setSelectedRelation] = useState<Relation>();
+  const [selectedAggregate, setSelectedAggregate] = useState<GraphEdge["aggregate"]>();
+  const [view, setView] = useState<GraphView>("detail");
+  const [layout, setLayout] = useState<LayoutMode>("layered");
+  const [focusedNodeId, setFocusedNodeId] = useState<string>();
   const [status, setStatus] = useState<RelationStatus | "">("");
   const [type, setType] = useState<RelationType | "">("");
   const [manualType, setManualType] = useState<RelationType>("related_to");
@@ -127,28 +287,36 @@ export function GraphWorkspace({
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
 
-  const loadGraph = async (centerId?: string, includeChunks = false) => {
+  const loadGraph = async (centerId?: string, includeChunks = false, requestedView = view) => {
     try {
       const graph = await api.graph(libraryId, {
         ...(centerId ? { centerId } : {}),
         includeChunks,
         ...(status ? { status } : {}),
         ...(type ? { type } : {}),
+        view: requestedView,
       });
       setRecords(graph.nodes);
-      setNodes(layoutNodes(graph.nodes, graph.edges));
-      setEdges(displayEdges(graph.edges));
+      setEdgeRecords(graph.edges);
+      setNodes(layoutNodes(graph.nodes, graph.edges, layout));
+      setEdges(displayEdges(graph.edges, layout));
     } catch (cause) {
       onError((cause as Error).message);
     }
   };
 
   useEffect(() => {
+    if (!flowInstance || records.length === 0) return;
+    window.requestAnimationFrame(() => void flowInstance.fitView({ padding: 0.16, minZoom: 0.35, maxZoom: 1.18 }));
+  }, [flowInstance, records, layout]);
+
+  useEffect(() => {
     setSelected(undefined);
     setSelectedRelation(undefined);
+    setSelectedAggregate(undefined);
     setResults([]);
-    void loadGraph();
-  }, [libraryId, refreshKey, status, type]);
+    void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view);
+  }, [libraryId, refreshKey, status, type, view, focusedNodeId]);
 
   const suggested = useMemo(
     () => edges.flatMap((edge) => edge.data?.entity.relation?.status === "suggested" ? [edge.data.entity.relation] : []),
@@ -172,7 +340,7 @@ export function GraphWorkspace({
   const review = async (relation: Relation, nextStatus: "accepted" | "rejected") => {
     try {
       await api.reviewRelation(relation.id, nextStatus);
-      await loadGraph(selected?.id, selected?.nodeType === "abstract");
+      await loadGraph(selected?.id, selected?.nodeType === "abstract", "detail");
     } catch (cause) {
       onError((cause as Error).message);
     }
@@ -199,6 +367,12 @@ export function GraphWorkspace({
     }
   };
 
+  const changeLayout = (nextLayout: LayoutMode) => {
+    setLayout(nextLayout);
+    setNodes(layoutNodes(records, edgeRecords, nextLayout));
+    setEdges(displayEdges(edgeRecords, nextLayout));
+  };
+
   return (
     <section className="graph-panel card">
       <div className="graph-toolbar">
@@ -210,27 +384,39 @@ export function GraphWorkspace({
           <option value="">可见关系</option>
           {relationStatuses.map((item) => <option key={item} value={item}>{item}</option>)}
         </select>
-        <select value={type} onChange={(event) => setType(event.target.value as RelationType | "")}>
+          <select value={type} onChange={(event) => setType(event.target.value as RelationType | "")}>
           <option value="">所有类型</option>
           {relationTypes.map((item) => <option key={item} value={item}>{item}</option>)}
-        </select>
-        <button onClick={() => void loadGraph()}>概览</button>
+          </select>
+        <div className="graph-depth" aria-label="图谱层级">
+          <button className={view === "overview" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("overview"); }}>概览</button>
+          <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
+        </div>
       </div>
       <div className="graph-body">
         <div className="canvas">
           <ReactFlow
             nodes={nodes}
             edges={edges}
+            onInit={setFlowInstance}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
+            nodesConnectable={view === "detail"}
             onConnect={(connection) => void onConnect(connection)}
             onNodeClick={(_event, node) => {
               setSelected(node.data.entity);
               setSelectedRelation(undefined);
-              if (node.data.entity.nodeType === "abstract") void loadGraph(node.id, true);
+              setSelectedAggregate(undefined);
+              if (node.data.entity.nodeType === "abstract" && node.data.entity.data.level === 2) {
+                setFocusedNodeId(node.id);
+                setView("detail");
+              } else if (node.data.entity.nodeType === "abstract" && view === "detail") {
+                setFocusedNodeId(node.id);
+              }
             }}
             onEdgeClick={(_event, edge) => {
               setSelectedRelation(edge.data?.entity.relation);
+              setSelectedAggregate(edge.data?.entity.aggregate);
               setSelected(undefined);
             }}
             minZoom={0.35}
@@ -239,19 +425,27 @@ export function GraphWorkspace({
             fitViewOptions={{ padding: 0.16, minZoom: 0.82, maxZoom: 1.18 }}
           >
             <Background color="#28334c" gap={24} />
-            <MiniMap nodeColor={(node) => node.className === "flow-chunk" ? "#56627c" : "#40bca2"} />
+            <MiniMap nodeColor={(node) => node.className === "flow-chunk" ? "#56627c" : node.className === "flow-theme" ? "#cb9b54" : "#40bca2"} />
+            <Controls className="layout-controls" position="bottom-left" showZoom={false} showFitView={false} showInteractive={false}>
+              <ControlButton className={layout === "layered" ? "layout-active" : ""} onClick={() => changeLayout("layered")} title="分层布局" aria-label="分层布局">层</ControlButton>
+              <ControlButton className={layout === "network" ? "layout-active" : ""} onClick={() => changeLayout("network")} title="网状布局" aria-label="网状布局">网</ControlButton>
+              <ControlButton className={layout === "tree" ? "layout-active" : ""} onClick={() => changeLayout("tree")} title="树形布局" aria-label="树形布局">树</ControlButton>
+            </Controls>
             <Controls />
           </ReactFlow>
         </div>
         <aside className="inspector">
-          <div className="manual-edge">
+          {view === "detail" ? <div className="manual-edge">
             <h3>连边工具</h3>
             <select value={manualType} onChange={(event) => setManualType(event.target.value as RelationType)}>
               {relationTypes.map((item) => <option key={item} value={item}>{item}</option>)}
             </select>
             <input value={manualReason} onChange={(event) => setManualReason(event.target.value)} />
             <small>从一个抽象节点拖到另一个节点以创建关系。</small>
-          </div>
+          </div> : <div className="overview-hint">
+            <h3>主题概览</h3>
+            <p>主题节点折叠了底层概念；聚合边括号内为底层关系数量。点击主题进入可审核细节。</p>
+          </div>}
           {results.length > 0 && (
             <div className="search-results">
               <h3>搜索结果</h3>
@@ -293,6 +487,13 @@ export function GraphWorkspace({
               </div>
             </div>
           )}
+          {selectedAggregate && (
+            <div className="relation-detail">
+              <h3>聚合关系：{selectedAggregate.type}</h3>
+              <p>该主题连线汇总了 {selectedAggregate.count} 条底层关系。</p>
+              <p className="muted">切换到细节视图查看证据并执行审核。</p>
+            </div>
+          )}
           <div className="suggestions">
             <div className="suggestion-header">
               <h3>待审核关系</h3>
@@ -312,7 +513,7 @@ export function GraphWorkspace({
                 </div>
               </div>
             ))}
-            {suggested.length === 0 && <p className="muted">当前局部图没有待审核关系。</p>}
+            {suggested.length === 0 && <p className="muted">{view === "overview" ? "概览不直接审核关系，请进入主题细节。" : "当前局部图没有待审核关系。"}</p>}
           </div>
         </aside>
       </div>
@@ -369,7 +570,9 @@ function SelectedNode({
       event.preventDefault();
       void api.updateNode(node.id, title, summary).then(onSaved).catch((cause: Error) => onError(cause.message));
     }}>
-      <h3>{node.data.kind === "claim" ? "命题" : "概念"}</h3>
+      <h3>{node.data.level === 2 ? "主题抽象" : node.data.kind === "claim" ? "命题" : "概念"}</h3>
+      {node.data.level === 2 && <small>包含 {node.data.memberCount} 个细节节点，点击图中主题可展开。</small>}
+      {node.data.aspects.length > 0 && <div className="aspect-tags">{node.data.aspects.map((aspect) => <span key={aspect}>{aspect}</span>)}</div>}
       <input value={title} onChange={(event) => setTitle(event.target.value)} />
       <textarea value={summary} onChange={(event) => setSummary(event.target.value)} rows={4} />
       <CitationList citations={node.data.citations} onOpenCitation={onOpenCitation} />

@@ -214,7 +214,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
 
   app.get<{
     Params: { libraryId: string };
-    Querystring: { centerId?: string; includeChunks?: string; status?: string; type?: string; limit?: string };
+    Querystring: { centerId?: string; includeChunks?: string; status?: string; type?: string; limit?: string; view?: string };
   }>("/api/libraries/:libraryId/graph", async (request) => {
     requireLibrary(db, request.params.libraryId);
     const status = relationStatuses.includes(request.query.status as RelationStatus)
@@ -229,6 +229,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       ...(status ? { status } : {}),
       ...(type ? { type } : {}),
       limit: Number(request.query.limit ?? 150),
+      view: request.query.view === "overview" ? "overview" : "detail",
     });
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/search", async (request) => {

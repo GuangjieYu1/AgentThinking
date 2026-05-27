@@ -4,6 +4,7 @@ import type {
   AnalysisStatement,
   Document,
   GraphResponse,
+  GraphView,
   IngestJob,
   Library,
   LibrarySettings,
@@ -111,13 +112,14 @@ export const api = {
   },
   graph: (
     id: string,
-    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType } = {},
+    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; view?: GraphView } = {},
   ) => {
     const query = new URLSearchParams();
     if (options.centerId) query.set("centerId", options.centerId);
     if (options.includeChunks) query.set("includeChunks", "true");
     if (options.status) query.set("status", options.status);
     if (options.type) query.set("type", options.type);
+    if (options.view) query.set("view", options.view);
     return request<GraphResponse>(`/libraries/${id}/graph?${query}`);
   },
   search: (id: string, query: string) =>

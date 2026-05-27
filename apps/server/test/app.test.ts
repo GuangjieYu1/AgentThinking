@@ -102,6 +102,11 @@ describe("HTTP application", () => {
     expect(graph.nodes.find((node) => node.nodeType === "abstract")?.data.citations?.length).toBeGreaterThan(0);
     const suggested = graph.edges.find((edge) => edge.relation)?.relation;
     expect(suggested?.citations.length).toBeGreaterThan(0);
+    const overview = (await app.inject({
+      method: "GET",
+      url: `/api/libraries/${library.id}/graph?view=overview`,
+    })).json<{ nodes: Array<{ nodeType: string; data: { level?: number; memberCount?: number } }> }>();
+    expect(overview.nodes.some((node) => node.nodeType === "abstract" && node.data.level === 2 && (node.data.memberCount ?? 0) > 0)).toBe(true);
     await app.inject({
       method: "PATCH",
       url: `/api/relations/${suggested!.id}`,

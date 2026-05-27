@@ -87,6 +87,42 @@ describe("knowledge database", () => {
     db.close();
   });
 
+  it("stores theme abstractions and aggregates their child relations in overview mode", async () => {
+    const db = await database();
+    const library = db.createLibrary("Themes");
+    const version = db.createDocumentVersion(library.id, "themes.txt", "text/plain", "themes", "themes").version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 8, text: "airport system" },
+      { ordinal: 1, headingPath: null, pageNumber: null, startChar: 9, endChar: 18, text: "flight action" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [
+        { key: "system", kind: "concept", title: "航班系统", summary: "", evidenceChunkIds: [chunks[0]!.id], aspects: ["system"] },
+        { key: "operation", kind: "concept", title: "实时更新", summary: "", evidenceChunkIds: [chunks[1]!.id], aspects: ["operation"] },
+      ],
+      relations: [{
+        sourceKey: "system",
+        targetKey: "operation",
+        type: "supports",
+        reason: "system supports operation",
+        confidence: 0.8,
+        evidenceChunkIds: chunks.map((chunk) => chunk.id),
+      }],
+      themes: [
+        { title: "基础设施", summary: "系统主题", memberKeys: ["system"], evidenceChunkIds: [chunks[0]!.id], aspects: ["system"] },
+        { title: "运行流程", summary: "操作主题", memberKeys: ["operation"], evidenceChunkIds: [chunks[1]!.id], aspects: ["operation"] },
+      ],
+    });
+    const overview = db.getGraph(library.id, { view: "overview" });
+    expect(overview.nodes.filter((node) => node.nodeType === "abstract").map((node) => node.data.level)).toEqual([2, 2]);
+    expect(overview.edges[0]?.aggregate).toMatchObject({ type: "supports", count: 1 });
+    const theme = overview.nodes.find((node) => node.nodeType === "abstract" && node.data.title === "基础设施");
+    expect(theme?.nodeType === "abstract" && theme.data.aspects).toContain("system");
+    const expanded = db.getGraph(library.id, { centerId: theme!.id });
+    expect(expanded.edges.some((edge) => edge.edgeType === "membership")).toBe(true);
+    db.close();
+  });
+
   it("prevents relations between different libraries", async () => {
     const db = await database();
     const left = db.createLibrary("Left");

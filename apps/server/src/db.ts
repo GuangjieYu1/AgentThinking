@@ -5,6 +5,7 @@ import type { DatabaseSync as NativeDatabaseSync } from "node:sqlite";
 import type {
   AbstractNode,
   AbstractNodeKind,
+  AspectKind,
   AnalysisDraft,
   AnalysisStatement,
   Citation,
@@ -72,6 +73,7 @@ function chunkFrom(r: Row): Chunk {
     startChar: Number(r.start_char),
     endChar: Number(r.end_char),
     text: String(r.text),
+    aspects: parseAspects(r.aspects_json),
   };
 }
 
@@ -82,11 +84,23 @@ function nodeFrom(r: Row): AbstractNode {
     kind: String(r.kind) as AbstractNodeKind,
     title: String(r.title),
     summary: String(r.summary),
+    level: Number(r.level ?? 1) === 2 ? 2 : 1,
+    aspects: parseAspects(r.aspects_json),
+    memberCount: Number(r.member_count ?? 0),
     source: String(r.source) as "ai" | "user",
     citations: [],
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
   };
+}
+
+function parseAspects(value: Row[string] | undefined): AspectKind[] {
+  if (typeof value !== "string") return [];
+  try {
+    return JSON.parse(value) as AspectKind[];
+  } catch {
+    return [];
+  }
 }
 
 export class AgentDatabase {
@@ -251,12 +265,26 @@ export class AgentDatabase {
         chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
         PRIMARY KEY(statement_id, chunk_id)
       );
+      CREATE TABLE IF NOT EXISTS abstraction_memberships (
+        parent_node_id TEXT NOT NULL REFERENCES abstract_nodes(id) ON DELETE CASCADE,
+        child_node_id TEXT NOT NULL REFERENCES abstract_nodes(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('suggested','manual')),
+        reason TEXT NOT NULL,
+        created_by TEXT NOT NULL CHECK (created_by IN ('ai','user')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(parent_node_id, child_node_id)
+      );
       CREATE INDEX IF NOT EXISTS idx_source_links_version ON source_links(version_id);
       CREATE INDEX IF NOT EXISTS idx_statements_library_status ON analysis_statements(library_id, status);
+      CREATE INDEX IF NOT EXISTS idx_abstraction_child ON abstraction_memberships(child_node_id);
     `);
     this.addColumn("chunks", "start_line", "INTEGER");
     this.addColumn("chunks", "end_line", "INTEGER");
     this.addColumn("chunks", "block_id", "TEXT");
+    this.addColumn("chunks", "aspects_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumn("abstract_nodes", "level", "INTEGER NOT NULL DEFAULT 1");
+    this.addColumn("abstract_nodes", "aspects_json", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("analysis_statements", "invalidated_reason", "TEXT");
     this.addColumn("analysis_statements", "invalidated_at", "TEXT");
     this.addColumn("analysis_statements", "precheck_status", "TEXT NOT NULL DEFAULT 'not_checked'");
@@ -266,6 +294,7 @@ export class AgentDatabase {
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
+    this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (4, ?)").run(now());
   }
 
   private addColumn(table: string, column: string, definition: string): void {
@@ -612,8 +641,8 @@ export class AgentDatabase {
     this.sql.prepare("DELETE FROM chunks WHERE version_id = ?").run(versionId);
     const insert = this.sql.prepare(`
       INSERT INTO chunks
-        (id, library_id, version_id, ordinal, heading_path, page_number, start_line, end_line, block_id, start_char, end_char, text)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, library_id, version_id, ordinal, heading_path, page_number, start_line, end_line, block_id, start_char, end_char, text, aspects_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertFts = this.sql.prepare(
       "INSERT INTO chunks_fts (chunk_id, text, heading_path) VALUES (?, ?, ?)",
@@ -628,11 +657,12 @@ export class AgentDatabase {
         startLine: item.startLine ?? null,
         endLine: item.endLine ?? null,
         blockId: item.blockId ?? null,
+        aspects: [],
       };
       insert.run(
         chunk.id, libraryId, versionId, chunk.ordinal, chunk.headingPath, chunk.pageNumber,
         chunk.startLine ?? null, chunk.endLine ?? null, chunk.blockId ?? null,
-        chunk.startChar, chunk.endChar, chunk.text,
+        chunk.startChar, chunk.endChar, chunk.text, JSON.stringify(chunk.aspects),
       );
       insertFts.run(chunk.id, chunk.text, chunk.headingPath ?? "");
       result.push(chunk);
@@ -783,12 +813,15 @@ export class AgentDatabase {
   saveExtraction(libraryId: string, extraction: ExtractionOutput): void {
     const keyToId = new Map<string, string>();
     const findNode = this.sql.prepare(
-      "SELECT * FROM abstract_nodes WHERE library_id = ? AND kind = ? AND title = ? COLLATE NOCASE LIMIT 1",
+      "SELECT * FROM abstract_nodes WHERE library_id = ? AND kind = ? AND level = ? AND title = ? COLLATE NOCASE LIMIT 1",
     );
     const insertNode = this.sql.prepare(`
-      INSERT INTO abstract_nodes (id, library_id, kind, title, summary, source, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 'ai', ?, ?)
+      INSERT INTO abstract_nodes (id, library_id, kind, title, summary, level, aspects_json, source, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?)
     `);
+    const updateNodeAspects = this.sql.prepare(
+      "UPDATE abstract_nodes SET aspects_json = ?, updated_at = ? WHERE id = ?",
+    );
     const evidence = this.sql.prepare(
       "INSERT OR IGNORE INTO abstract_node_evidence (node_id, chunk_id) VALUES (?, ?)",
     );
@@ -802,13 +835,17 @@ export class AgentDatabase {
       "INSERT OR IGNORE INTO relation_evidence (relation_id, chunk_id) VALUES (?, ?)",
     );
     for (const extracted of extraction.nodes) {
-      const existing = row(findNode, libraryId, extracted.kind, extracted.title);
+      const existing = row(findNode, libraryId, extracted.kind, 1, extracted.title);
       const nodeId = existing ? String(existing.id) : randomUUID();
       if (!existing) {
         const timestamp = now();
         insertNode.run(
-          nodeId, libraryId, extracted.kind, extracted.title, extracted.summary, timestamp, timestamp,
+          nodeId, libraryId, extracted.kind, extracted.title, extracted.summary, 1,
+          JSON.stringify(extracted.aspects ?? []), timestamp, timestamp,
         );
+      } else if (extracted.aspects?.length) {
+        const aspects = [...new Set([...parseAspects(existing.aspects_json), ...extracted.aspects])];
+        updateNodeAspects.run(JSON.stringify(aspects), now(), nodeId);
       }
       keyToId.set(extracted.key, nodeId);
       for (const chunkId of extracted.evidenceChunkIds) evidence.run(nodeId, chunkId);
@@ -830,6 +867,42 @@ export class AgentDatabase {
         }).id;
       for (const chunkId of extracted.evidenceChunkIds) insertRelationEvidence.run(relationId, chunkId);
     }
+
+    const insertMembership = this.sql.prepare(`
+      INSERT OR IGNORE INTO abstraction_memberships
+        (parent_node_id, child_node_id, status, reason, created_by, created_at, updated_at)
+      VALUES (?, ?, 'suggested', ?, 'ai', ?, ?)
+    `);
+    for (const theme of extraction.themes ?? []) {
+      const memberIds = theme.memberKeys.flatMap((key) => {
+        const nodeId = keyToId.get(key);
+        return nodeId ? [nodeId] : [];
+      });
+      if (memberIds.length === 0) continue;
+      const existing = row(findNode, libraryId, "concept", 2, theme.title);
+      const themeId = existing ? String(existing.id) : randomUUID();
+      if (!existing) {
+        const timestamp = now();
+        insertNode.run(
+          themeId, libraryId, "concept", theme.title, theme.summary, 2,
+          JSON.stringify(theme.aspects ?? []), timestamp, timestamp,
+        );
+      } else if (theme.aspects?.length) {
+        const aspects = [...new Set([...parseAspects(existing.aspects_json), ...theme.aspects])];
+        updateNodeAspects.run(JSON.stringify(aspects), now(), themeId);
+      }
+      const themeEvidence = new Set(theme.evidenceChunkIds);
+      for (const extracted of extraction.nodes) {
+        if (theme.memberKeys.includes(extracted.key)) {
+          for (const chunkId of extracted.evidenceChunkIds) themeEvidence.add(chunkId);
+        }
+      }
+      for (const chunkId of themeEvidence) evidence.run(themeId, chunkId);
+      const timestamp = now();
+      for (const memberId of memberIds) {
+        insertMembership.run(themeId, memberId, `AI 归纳为主题：${theme.title}`, timestamp, timestamp);
+      }
+    }
   }
 
   updateAbstractNode(id: string, values: { title?: string; summary?: string }): AbstractNode {
@@ -840,7 +913,12 @@ export class AgentDatabase {
     this.sql.prepare(
       "UPDATE abstract_nodes SET title = ?, summary = ?, updated_at = ? WHERE id = ?",
     ).run(title, summary, now(), id);
-    return this.withNodeCitations(nodeFrom(row(this.sql.prepare("SELECT * FROM abstract_nodes WHERE id = ?"), id) as Row));
+    const updated = row(this.sql.prepare(`
+      SELECT n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+      FROM abstract_nodes n
+      WHERE n.id = ?
+    `), id);
+    return this.withNodeCitations(nodeFrom(updated as Row));
   }
 
   deleteAbstractNode(id: string): boolean {
@@ -928,20 +1006,30 @@ export class AgentDatabase {
 
   getGraph(
     libraryId: string,
-    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; limit?: number },
+    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; limit?: number; view?: "detail" | "overview" },
   ): GraphResponse {
+    if (options.view === "overview") return this.getOverviewGraph(libraryId, options);
     const limit = Math.min(Math.max(options.limit ?? 150, 1), 400);
     const filters = ["library_id = ?"];
     const params: unknown[] = [libraryId];
     let centerNodeIds: string[] = [];
+    let centerThemeId: string | undefined;
     if (options.centerId) {
       const abstractCenter = row(
-        this.sql.prepare("SELECT id FROM abstract_nodes WHERE id = ? AND library_id = ?"),
+        this.sql.prepare("SELECT id, level FROM abstract_nodes WHERE id = ? AND library_id = ?"),
         options.centerId,
         libraryId,
       );
       if (abstractCenter) {
-        centerNodeIds = [options.centerId];
+        if (Number(abstractCenter.level ?? 1) === 2) {
+          centerThemeId = options.centerId;
+          centerNodeIds = rows(
+            this.sql.prepare("SELECT child_node_id FROM abstraction_memberships WHERE parent_node_id = ?"),
+            options.centerId,
+          ).map((result) => String(result.child_node_id));
+        } else {
+          centerNodeIds = [options.centerId];
+        }
       } else {
         centerNodeIds = rows(
           this.sql.prepare(`
@@ -982,16 +1070,20 @@ export class AgentDatabase {
       nodeIds.add(String(relation.target_node_id));
     }
     for (const centerNodeId of centerNodeIds) nodeIds.add(centerNodeId);
+    if (centerThemeId) nodeIds.add(centerThemeId);
     if (!options.centerId && nodeIds.size < limit) {
       for (const result of rows(
-        this.sql.prepare("SELECT id FROM abstract_nodes WHERE library_id = ? ORDER BY updated_at DESC LIMIT ?"),
+        this.sql.prepare("SELECT id FROM abstract_nodes WHERE library_id = ? AND level = 1 ORDER BY updated_at DESC LIMIT ?"),
         libraryId,
         limit - nodeIds.size,
       )) nodeIds.add(String(result.id));
     }
     const nodeRows = nodeIds.size
       ? rows(
-          this.sql.prepare(`SELECT * FROM abstract_nodes WHERE id IN (${[...nodeIds].map(() => "?").join(",")})`),
+          this.sql.prepare(`
+            SELECT n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+            FROM abstract_nodes n WHERE n.id IN (${[...nodeIds].map(() => "?").join(",")})
+          `),
           ...nodeIds,
         )
       : [];
@@ -1007,6 +1099,16 @@ export class AgentDatabase {
       edgeType: "relation",
       relation: this.relationFrom(result),
     }));
+    if (centerThemeId) {
+      for (const childId of centerNodeIds) {
+        graphEdges.push({
+          id: `membership:${centerThemeId}:${childId}`,
+          source: centerThemeId,
+          target: childId,
+          edgeType: "membership",
+        });
+      }
+    }
 
     if (options.includeChunks && nodeIds.size > 0) {
       const placeholders = [...nodeIds].map(() => "?").join(",");
@@ -1035,6 +1137,89 @@ export class AgentDatabase {
       }
     }
     return { nodes: graphNodes, edges: graphEdges, truncated };
+  }
+
+  private getOverviewGraph(
+    libraryId: string,
+    options: { status?: RelationStatus; type?: RelationType; limit?: number },
+  ): GraphResponse {
+    const limit = Math.min(Math.max(options.limit ?? 150, 1), 400);
+    const filters = ["library_id = ?"];
+    const params: unknown[] = [libraryId];
+    if (options.status) {
+      filters.push("status = ?");
+      params.push(options.status);
+    } else {
+      filters.push("status != 'rejected'");
+    }
+    if (options.type) {
+      filters.push("type = ?");
+      params.push(options.type);
+    }
+    const relationRows = rows(
+      this.sql.prepare(`SELECT * FROM relations WHERE ${filters.join(" AND ")} ORDER BY updated_at DESC LIMIT ?`),
+      ...params,
+      limit + 1,
+    );
+    const truncated = relationRows.length > limit;
+    const relationSlice = relationRows.slice(0, limit);
+    const parentByChild = new Map(
+      rows(this.sql.prepare(`
+        SELECT child_node_id, parent_node_id FROM abstraction_memberships
+        JOIN abstract_nodes n ON n.id = parent_node_id
+        WHERE n.library_id = ? ORDER BY n.updated_at DESC
+      `), libraryId).map((entry) => [String(entry.child_node_id), String(entry.parent_node_id)]),
+    );
+    const nodeIds = new Set<string>(
+      rows(this.sql.prepare("SELECT id FROM abstract_nodes WHERE library_id = ? AND level = 2"), libraryId)
+        .map((entry) => String(entry.id)),
+    );
+    const aggregates = new Map<string, GraphEdge>();
+    for (const result of relationSlice) {
+      const originalSource = String(result.source_node_id);
+      const originalTarget = String(result.target_node_id);
+      const source = parentByChild.get(originalSource) ?? originalSource;
+      const target = parentByChild.get(originalTarget) ?? originalTarget;
+      nodeIds.add(source);
+      nodeIds.add(target);
+      if (source === target) continue;
+      const type = String(result.type) as RelationType;
+      const key = `${source}:${target}:${type}`;
+      const current = aggregates.get(key);
+      if (current?.aggregate) {
+        current.aggregate.count += 1;
+        current.aggregate.relationIds.push(String(result.id));
+      } else {
+        aggregates.set(key, {
+          id: `aggregate:${key}`,
+          source,
+          target,
+          edgeType: "relation",
+          aggregate: { type, count: 1, relationIds: [String(result.id)] },
+        });
+      }
+    }
+    if (nodeIds.size === 0) {
+      for (const result of rows(
+        this.sql.prepare("SELECT id FROM abstract_nodes WHERE library_id = ? AND level = 1 ORDER BY updated_at DESC LIMIT ?"),
+        libraryId,
+        limit,
+      )) nodeIds.add(String(result.id));
+    }
+    const graphNodes: GraphNode[] = nodeIds.size
+      ? rows(
+          this.sql.prepare(`
+            SELECT n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+            FROM abstract_nodes n WHERE n.id IN (${[...nodeIds].map(() => "?").join(",")})
+          `),
+          ...nodeIds,
+        ).map((result) => ({
+          id: String(result.id),
+          nodeType: "abstract",
+          data: this.withNodeCitations(nodeFrom(result)),
+        }))
+      : [];
+    return { nodes: graphNodes, edges: [...aggregates.values()], truncated };
   }
 
   listVersionSources(libraryId: string): Array<ReturnType<AgentDatabase["getVersionSource"]> & {}> {

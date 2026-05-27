@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const abstractNodeKinds = ["concept", "claim"] as const;
+export const aspectKinds = ["person", "operation", "system", "story", "claim", "conflict", "time", "other"] as const;
 export const relationTypes = [
   "supports",
   "contradicts",
@@ -32,6 +33,9 @@ export const jobStages = [
 export const ocrModes = ["local", "cloud"] as const;
 
 export type AbstractNodeKind = (typeof abstractNodeKinds)[number];
+export type AspectKind = (typeof aspectKinds)[number];
+export type AbstractionLevel = 1 | 2;
+export type GraphView = "detail" | "overview";
 export type RelationType = (typeof relationTypes)[number];
 export type RelationStatus = (typeof relationStatuses)[number];
 export type StatementStatus = (typeof statementStatuses)[number];
@@ -82,6 +86,7 @@ export interface Chunk {
   startChar: number;
   endChar: number;
   text: string;
+  aspects: AspectKind[];
 }
 
 export interface Citation {
@@ -133,10 +138,21 @@ export interface AbstractNode {
   kind: AbstractNodeKind;
   title: string;
   summary: string;
+  level: AbstractionLevel;
+  aspects: AspectKind[];
+  memberCount: number;
   source: "ai" | "user";
   citations: Citation[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface AbstractionMembership {
+  parentNodeId: string;
+  childNodeId: string;
+  status: "suggested" | "manual";
+  reason: string;
+  createdBy: "ai" | "user";
 }
 
 export interface Relation {
@@ -175,8 +191,13 @@ export interface GraphEdge {
   id: string;
   source: string;
   target: string;
-  edgeType: "relation" | "evidence";
+  edgeType: "relation" | "evidence" | "membership";
   relation?: Relation;
+  aggregate?: {
+    type: RelationType;
+    count: number;
+    relationIds: string[];
+  };
 }
 
 export interface GraphResponse {
@@ -307,6 +328,7 @@ export const extractionSchema = z.object({
       title: z.string().trim().min(1).max(180),
       summary: z.string().trim().max(2000),
       evidenceChunkIds: z.array(z.string()).default([]),
+      aspects: z.array(z.enum(aspectKinds)).optional(),
     }),
   ),
   relations: z.array(
@@ -319,6 +341,15 @@ export const extractionSchema = z.object({
       evidenceChunkIds: z.array(z.string()).default([]),
     }),
   ),
+  themes: z.array(
+    z.object({
+      title: z.string().trim().min(1).max(180),
+      summary: z.string().trim().max(2000),
+      memberKeys: z.array(z.string()).min(1),
+      evidenceChunkIds: z.array(z.string()).default([]),
+      aspects: z.array(z.enum(aspectKinds)).optional(),
+    }),
+  ).optional(),
 });
 
 export type ExtractionOutput = z.infer<typeof extractionSchema>;

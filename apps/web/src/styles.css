@@ -227,15 +227,19 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .graph-toolbar { height: 55px; border-bottom: 1px solid #1d2940; display: flex; align-items: center; gap: 9px; padding: 9px 13px; }
 .graph-toolbar form { display: flex; gap: 7px; flex: 1; max-width: 370px; }
 .graph-toolbar form input { flex: 1; }
+.graph-depth { display: flex; gap: 4px; padding: 3px; background: #0d1728; border: 1px solid #25334c; border-radius: 9px; }
+.graph-depth button { padding: 6px 10px; border: 0; background: transparent; color: #8d9db7; }
+.graph-depth button.selected { background: #1b393a; color: #82e4ca; }
 .graph-body { min-height: 0; flex: 1; display: grid; grid-template-columns: 1fr 296px; }
 .canvas { min-width: 0; background: #0b1426; }
 .inspector { border-left: 1px solid #1c283e; padding: 13px; overflow-y: auto; display: grid; align-content: start; gap: 14px; }
 .inspector h3 { font-size: 13px; margin: 0 0 9px; color: #aab8d1; }
-.manual-edge, .node-detail, .relation-detail, .suggestions, .search-results {
+.manual-edge, .overview-hint, .node-detail, .relation-detail, .suggestions, .search-results {
   border: 1px solid #1d2940; background: #111b30; border-radius: 9px; padding: 11px;
 }
 .manual-edge { display: grid; gap: 7px; }
 .manual-edge h3 { margin-bottom: 1px; }
+.overview-hint p { margin: 0; color: #93a4be; font-size: 12px; line-height: 1.55; }
 .manual-edge small, .muted { color: #74839c; }
 .search-results button {
   display: flex; justify-content: space-between; gap: 7px; width: 100%; text-align: left;
@@ -246,6 +250,8 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .node-detail p { color: #c7d4e7; margin: 2px 0; line-height: 1.55; max-height: 210px; overflow-y: auto; }
 .node-detail small { color: #7788a4; }
 .node-detail textarea { resize: vertical; }
+.aspect-tags { display: flex; gap: 5px; flex-wrap: wrap; }
+.aspect-tags span { padding: 3px 7px; border-radius: 12px; background: #21354a; color: #7edac3; font-size: 11px; }
 .node-actions button { flex: 1; }
 .relation-detail p { color: #a8b7d0; line-height: 1.45; }
 .citations { display: grid; gap: 5px; margin: 8px 0; }
@@ -270,16 +276,27 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .suggestion span { color: #9aaac4; font-size: 12px; line-height: 1.4; }
 .suggestion div { display: flex; gap: 6px; }
 .suggestion button { padding: 5px 9px; font-size: 12px; }
-.flow-concept, .flow-claim, .flow-chunk {
+.flow-concept, .flow-claim, .flow-theme, .flow-chunk {
   color: #e4edf7 !important; font-size: 14px !important; line-height: 1.4 !important;
   padding: 12px 14px !important;
   box-shadow: 0 3px 18px #0004;
 }
 .flow-concept { background: #143934 !important; color: #82e4ca !important; }
 .flow-claim { background: #263154 !important; color: #9bbdff !important; }
+.flow-theme { background: #3a3022 !important; color: #efc981 !important; border: 1px solid #705834 !important; }
 .flow-chunk { background: #1d2639 !important; color: #c3cee0 !important; }
 .react-flow__handle { background: #61d2b6; width: 9px; height: 9px; }
 .react-flow__controls button { background: #182337; fill: #d1dded; border-color: #26334a; }
+.react-flow__controls.layout-controls { bottom: 112px; }
+.react-flow__controls.layout-controls button {
+  color: #94a5bf;
+  font-size: 12px;
+  font-weight: 700;
+}
+.react-flow__controls.layout-controls button.layout-active {
+  background: #1b393a;
+  color: #82e4ca;
+}
 .modal-backdrop {
   position: fixed;
   z-index: 30;

@@ -58,6 +58,7 @@ export class FakeModelProvider implements ModelProvider {
         title: chunk.headingPath || opening.slice(0, 44),
         summary: chunk.text.slice(0, 160),
         evidenceChunkIds: [chunk.id],
+        aspects: [],
       };
     });
     const relations = nodes.slice(1).map((node, index) => ({
@@ -71,7 +72,14 @@ export class FakeModelProvider implements ModelProvider {
         ...node.evidenceChunkIds,
       ],
     }));
-    return { nodes, relations };
+    const themes = nodes.length > 1 ? [{
+      title: "材料主题概览",
+      summary: "演示模型归纳的上层主题，用于概览与展开查看。",
+      memberKeys: nodes.map((node) => node.key),
+      evidenceChunkIds: nodes.flatMap((node) => node.evidenceChunkIds),
+      aspects: [],
+    }] : [];
+    return { nodes, relations, themes };
   }
 
   async precheckStatement(_text: string, citations: Citation[]): Promise<StatementPrecheckOutput> {
@@ -159,9 +167,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
           role: "system",
           content:
             "You extract a compact knowledge graph from evidence chunks. Return JSON with this shape: " +
-            '{"nodes":[{"key":"n1","kind":"concept","title":"...","summary":"...","evidenceChunkIds":["..."]}],' +
-            '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}]}. ' +
+            '{"nodes":[{"key":"n1","kind":"concept","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["system"]}],' +
+            '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
+            '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
             "Node kind is concept or claim. Relation type must be supports, contradicts, explains, depends_on, example_of, or related_to. " +
+            "Aspects are optional labels chosen from person, operation, system, story, claim, conflict, time, other. " +
+            "Create a small number of themes only when multiple nodes share a defensible higher-level subject; themes organize navigation and must cite evidence. " +
             "Candidate evidence may come from other documents and should be used to identify contradictions. " +
             "Every node and relation must cite evidenceChunkIds from supplied evidence or candidate ids; only create defensible relationships.",
         },

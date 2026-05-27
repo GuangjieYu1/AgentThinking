@@ -1,4 +1,4 @@
-import type { Chunk, Citation, ExtractionOutput, ModelTestResult, StatementPrecheckOutput } from "@agent-thinking/contracts";
+import type { AspectKind, Chunk, Citation, ExtractionOutput, ModelTestResult, StatementPrecheckOutput } from "@agent-thinking/contracts";
 import { extractionSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 
@@ -40,6 +40,15 @@ function hashedEmbedding(text: string, dimensions = 384): number[] {
   return normalizedVector(vector);
 }
 
+function demoAspects(text: string, kind: "concept" | "claim"): AspectKind[] {
+  if (kind === "claim") return ["claim"];
+  if (/人|用户|研究者|author|person|team/i.test(text)) return ["person"];
+  if (/系统|模型|平台|数据集|system|model|dataset|schema|programming/i.test(text)) return ["system"];
+  if (/步骤|操作|更新|流程|方法|operation|process|update/i.test(text)) return ["operation"];
+  if (/时间|阶段|日期|年|time|date|phase/i.test(text)) return ["time"];
+  return ["other"];
+}
+
 export class FakeModelProvider implements ModelProvider {
   readonly name = "fake";
   readonly configured = true;
@@ -52,13 +61,14 @@ export class FakeModelProvider implements ModelProvider {
     const selected = chunks.slice(0, 10);
     const nodes = selected.map((chunk, index) => {
       const opening = chunk.text.split(/[。\n.!?]/, 1)[0]?.trim() || `片段 ${index + 1}`;
+      const kind = /因此|所以|therefore|conclusion|should|必须/i.test(chunk.text) ? "claim" as const : "concept" as const;
       return {
         key: `n${index}`,
-        kind: /因此|所以|conclusion|should|必须/i.test(chunk.text) ? "claim" as const : "concept" as const,
+        kind,
         title: chunk.headingPath || opening.slice(0, 44),
         summary: chunk.text.slice(0, 160),
         evidenceChunkIds: [chunk.id],
-        aspects: [],
+        aspects: demoAspects(chunk.text, kind),
       };
     });
     const relations = nodes.slice(1).map((node, index) => ({
@@ -77,7 +87,7 @@ export class FakeModelProvider implements ModelProvider {
       summary: "演示模型归纳的上层主题，用于概览与展开查看。",
       memberKeys: nodes.map((node) => node.key),
       evidenceChunkIds: nodes.flatMap((node) => node.evidenceChunkIds),
-      aspects: [],
+      aspects: [...new Set(nodes.flatMap((node) => node.aspects))],
     }] : [];
     return { nodes, relations, themes };
   }

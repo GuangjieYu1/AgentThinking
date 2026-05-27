@@ -16,6 +16,7 @@ import type {
   GraphEdge,
   GraphNode,
   GraphResponse,
+  FocusRole,
   IngestJob,
   JobStage,
   Library,
@@ -78,6 +79,9 @@ function chunkFrom(r: Row): Chunk {
 }
 
 function nodeFrom(r: Row): AbstractNode {
+  const manualAspects = r.manual_aspects_json === null || r.manual_aspects_json === undefined
+    ? null
+    : parseAspects(r.manual_aspects_json);
   return {
     id: String(r.id),
     libraryId: String(r.library_id),
@@ -85,7 +89,8 @@ function nodeFrom(r: Row): AbstractNode {
     title: String(r.title),
     summary: String(r.summary),
     level: Number(r.level ?? 1) === 2 ? 2 : 1,
-    aspects: parseAspects(r.aspects_json),
+    aspects: manualAspects ?? parseAspects(r.aspects_json),
+    aspectSource: manualAspects === null ? "ai" : "manual",
     memberCount: Number(r.member_count ?? 0),
     source: String(r.source) as "ai" | "user",
     citations: [],
@@ -285,6 +290,7 @@ export class AgentDatabase {
     this.addColumn("chunks", "aspects_json", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("abstract_nodes", "level", "INTEGER NOT NULL DEFAULT 1");
     this.addColumn("abstract_nodes", "aspects_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumn("abstract_nodes", "manual_aspects_json", "TEXT");
     this.addColumn("analysis_statements", "invalidated_reason", "TEXT");
     this.addColumn("analysis_statements", "invalidated_at", "TEXT");
     this.addColumn("analysis_statements", "precheck_status", "TEXT NOT NULL DEFAULT 'not_checked'");
@@ -295,6 +301,7 @@ export class AgentDatabase {
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (4, ?)").run(now());
+    this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (5, ?)").run(now());
   }
 
   private addColumn(table: string, column: string, definition: string): void {
@@ -686,6 +693,7 @@ export class AgentDatabase {
     this.sql.prepare(`
       DELETE FROM abstract_nodes
       WHERE source = 'ai'
+        AND manual_aspects_json IS NULL
         AND NOT EXISTS (SELECT 1 FROM abstract_node_evidence e WHERE e.node_id = abstract_nodes.id)
     `).run();
   }
@@ -921,6 +929,22 @@ export class AgentDatabase {
     return this.withNodeCitations(nodeFrom(updated as Row));
   }
 
+  updateNodeAspects(id: string, aspects: AspectKind[]): AbstractNode {
+    const existing = row(this.sql.prepare("SELECT id FROM abstract_nodes WHERE id = ?"), id);
+    if (!existing) throw new Error("抽象节点不存在");
+    this.sql.prepare("UPDATE abstract_nodes SET manual_aspects_json = ?, updated_at = ? WHERE id = ?")
+      .run(JSON.stringify([...new Set(aspects)]), now(), id);
+    return this.getAbstractNode(id) as AbstractNode;
+  }
+
+  resetNodeAspects(id: string): AbstractNode {
+    const existing = row(this.sql.prepare("SELECT id FROM abstract_nodes WHERE id = ?"), id);
+    if (!existing) throw new Error("抽象节点不存在");
+    this.sql.prepare("UPDATE abstract_nodes SET manual_aspects_json = NULL, updated_at = ? WHERE id = ?")
+      .run(now(), id);
+    return this.getAbstractNode(id) as AbstractNode;
+  }
+
   deleteAbstractNode(id: string): boolean {
     return Number(this.sql.prepare("DELETE FROM abstract_nodes WHERE id = ?").run(id).changes) > 0;
   }
@@ -1006,9 +1030,12 @@ export class AgentDatabase {
 
   getGraph(
     libraryId: string,
-    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; limit?: number; view?: "detail" | "overview" },
+    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; limit?: number; view?: "detail" | "overview"; aspect?: AspectKind },
   ): GraphResponse {
-    if (options.view === "overview") return this.getOverviewGraph(libraryId, options);
+    if (options.view === "overview") {
+      const graph = this.getOverviewGraph(libraryId, options);
+      return options.aspect ? this.focusGraph(graph, options.aspect) : graph;
+    }
     const limit = Math.min(Math.max(options.limit ?? 150, 1), 400);
     const filters = ["library_id = ?"];
     const params: unknown[] = [libraryId];
@@ -1136,7 +1163,8 @@ export class AgentDatabase {
         });
       }
     }
-    return { nodes: graphNodes, edges: graphEdges, truncated };
+    const graph = { nodes: graphNodes, edges: graphEdges, truncated };
+    return options.aspect ? this.focusGraph(graph, options.aspect) : graph;
   }
 
   private getOverviewGraph(
@@ -1220,6 +1248,46 @@ export class AgentDatabase {
         }))
       : [];
     return { nodes: graphNodes, edges: [...aggregates.values()], truncated };
+  }
+
+  private focusGraph(graph: GraphResponse, aspect: AspectKind): GraphResponse {
+    const abstractNodes = graph.nodes.filter((node) => node.nodeType === "abstract");
+    const anyLabeled = abstractNodes.some((node) => node.data.aspects.length > 0);
+    const matches = new Set(
+      abstractNodes.filter((node) => node.data.aspects.includes(aspect)).map((node) => node.id),
+    );
+    const retainedEdges = graph.edges.filter((edge) => matches.has(edge.source) || matches.has(edge.target));
+    const adjacentMatches = new Map<string, Set<string>>();
+    for (const edge of retainedEdges) {
+      if (matches.has(edge.source) && !matches.has(edge.target)) {
+        const linked = adjacentMatches.get(edge.target) ?? new Set<string>();
+        linked.add(edge.source);
+        adjacentMatches.set(edge.target, linked);
+      }
+      if (matches.has(edge.target) && !matches.has(edge.source)) {
+        const linked = adjacentMatches.get(edge.source) ?? new Set<string>();
+        linked.add(edge.target);
+        adjacentMatches.set(edge.source, linked);
+      }
+    }
+    const retainedIds = new Set(matches);
+    for (const edge of retainedEdges) {
+      retainedIds.add(edge.source);
+      retainedIds.add(edge.target);
+    }
+    const nodes = graph.nodes.flatMap((node) => {
+      if (!retainedIds.has(node.id)) return [];
+      const focusRole: FocusRole = matches.has(node.id)
+        ? "match"
+        : (adjacentMatches.get(node.id)?.size ?? 0) > 1 ? "bridge" : "neighbor";
+      return [{ ...node, focusRole }];
+    });
+    return {
+      ...graph,
+      nodes,
+      edges: retainedEdges,
+      aspectFilter: { selected: aspect, anyLabeled, matchCount: matches.size },
+    };
   }
 
   listVersionSources(libraryId: string): Array<ReturnType<AgentDatabase["getVersionSource"]> & {}> {
@@ -1422,7 +1490,10 @@ export class AgentDatabase {
   }
 
   getAbstractNode(id: string): AbstractNode | undefined {
-    const result = row(this.sql.prepare("SELECT * FROM abstract_nodes WHERE id = ?"), id);
+    const result = row(this.sql.prepare(`
+      SELECT n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+      FROM abstract_nodes n WHERE n.id = ?
+    `), id);
     return result ? this.withNodeCitations(nodeFrom(result)) : undefined;
   }
 

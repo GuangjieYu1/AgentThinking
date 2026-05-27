@@ -16,12 +16,15 @@ import {
 } from "@xyflow/react";
 import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, type SimulationNodeDatum } from "d3-force";
 import {
+  aspectKinds,
   relationStatuses,
   relationTypes,
   type AbstractNode,
+  type AspectKind,
   type Citation,
   type GraphEdge,
   type GraphNode,
+  type GraphResponse,
   type GraphView,
   type Relation,
   type RelationStatus,
@@ -40,6 +43,17 @@ interface LayoutLink {
 interface PositionedNode extends SimulationNodeDatum {
   id: string;
 }
+
+const aspectLabels: Record<AspectKind, string> = {
+  person: "人物",
+  operation: "操作",
+  system: "系统",
+  story: "事件",
+  claim: "命题",
+  conflict: "冲突",
+  time: "时间",
+  other: "其他",
+};
 
 function relationColor(status: RelationStatus): string {
   if (status === "suggested") return "#e7a93c";
@@ -150,7 +164,10 @@ function visualNodes(
       ...(direction === "horizontal" ? { sourcePosition: Position.Right, targetPosition: Position.Left } : {}),
       ...(direction === "vertical" ? { sourcePosition: Position.Bottom, targetPosition: Position.Top } : {}),
       data: { label, entity: record },
-      className: record.nodeType === "chunk" ? "flow-chunk" : record.data.level === 2 ? "flow-theme" : `flow-${record.data.kind}`,
+      className: [
+        record.nodeType === "chunk" ? "flow-chunk" : record.data.level === 2 ? "flow-theme" : `flow-${record.data.kind}`,
+        record.focusRole === "match" ? "flow-aspect-match" : record.focusRole ? "flow-context" : "",
+      ].filter(Boolean).join(" "),
       style: {
         width: record.nodeType === "chunk" ? 250 : record.data.level === 2 ? 245 : 210,
         border: "none",
@@ -274,6 +291,7 @@ export function GraphWorkspace({
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance<VisualNode, VisualEdge>>();
   const [records, setRecords] = useState<GraphNode[]>([]);
   const [edgeRecords, setEdgeRecords] = useState<GraphEdge[]>([]);
+  const [aspectFilter, setAspectFilter] = useState<GraphResponse["aspectFilter"]>();
   const [selected, setSelected] = useState<GraphNode>();
   const [selectedRelation, setSelectedRelation] = useState<Relation>();
   const [selectedAggregate, setSelectedAggregate] = useState<GraphEdge["aggregate"]>();
@@ -282,6 +300,7 @@ export function GraphWorkspace({
   const [focusedNodeId, setFocusedNodeId] = useState<string>();
   const [status, setStatus] = useState<RelationStatus | "">("");
   const [type, setType] = useState<RelationType | "">("");
+  const [aspect, setAspect] = useState<AspectKind | "">("");
   const [manualType, setManualType] = useState<RelationType>("related_to");
   const [manualReason, setManualReason] = useState("用户手动建立的关联");
   const [query, setQuery] = useState("");
@@ -294,10 +313,13 @@ export function GraphWorkspace({
         includeChunks,
         ...(status ? { status } : {}),
         ...(type ? { type } : {}),
+        ...(aspect ? { aspect } : {}),
         view: requestedView,
       });
       setRecords(graph.nodes);
       setEdgeRecords(graph.edges);
+      setAspectFilter(graph.aspectFilter);
+      setSelected((current) => current ? graph.nodes.find((node) => node.id === current.id) : undefined);
       setNodes(layoutNodes(graph.nodes, graph.edges, layout));
       setEdges(displayEdges(graph.edges, layout));
     } catch (cause) {
@@ -316,7 +338,7 @@ export function GraphWorkspace({
     setSelectedAggregate(undefined);
     setResults([]);
     void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view);
-  }, [libraryId, refreshKey, status, type, view, focusedNodeId]);
+  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId]);
 
   const suggested = useMemo(
     () => edges.flatMap((edge) => edge.data?.entity.relation?.status === "suggested" ? [edge.data.entity.relation] : []),
@@ -384,10 +406,14 @@ export function GraphWorkspace({
           <option value="">可见关系</option>
           {relationStatuses.map((item) => <option key={item} value={item}>{item}</option>)}
         </select>
-          <select value={type} onChange={(event) => setType(event.target.value as RelationType | "")}>
+        <select value={type} onChange={(event) => setType(event.target.value as RelationType | "")}>
           <option value="">所有类型</option>
           {relationTypes.map((item) => <option key={item} value={item}>{item}</option>)}
           </select>
+        <select className="aspect-filter" value={aspect} onChange={(event) => setAspect(event.target.value as AspectKind | "")}>
+          <option value="">全部切面</option>
+          {aspectKinds.map((item) => <option key={item} value={item}>{aspectLabels[item]}</option>)}
+        </select>
         <div className="graph-depth" aria-label="图谱层级">
           <button className={view === "overview" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("overview"); }}>概览</button>
           <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
@@ -425,7 +451,7 @@ export function GraphWorkspace({
             fitViewOptions={{ padding: 0.16, minZoom: 0.82, maxZoom: 1.18 }}
           >
             <Background color="#28334c" gap={24} />
-            <MiniMap nodeColor={(node) => node.className === "flow-chunk" ? "#56627c" : node.className === "flow-theme" ? "#cb9b54" : "#40bca2"} />
+            <MiniMap nodeColor={(node) => String(node.className).includes("flow-chunk") ? "#56627c" : String(node.className).includes("flow-theme") ? "#cb9b54" : "#40bca2"} />
             <Controls className="layout-controls" position="bottom-left" showZoom={false} showFitView={false} showInteractive={false}>
               <ControlButton className={layout === "layered" ? "layout-active" : ""} onClick={() => changeLayout("layered")} title="分层布局" aria-label="分层布局">层</ControlButton>
               <ControlButton className={layout === "network" ? "layout-active" : ""} onClick={() => changeLayout("network")} title="网状布局" aria-label="网状布局">网</ControlButton>
@@ -433,6 +459,13 @@ export function GraphWorkspace({
             </Controls>
             <Controls />
           </ReactFlow>
+          {aspect && records.length === 0 && (
+            <div className="graph-empty">
+              {aspectFilter?.anyLabeled
+                ? `当前没有“${aspectLabels[aspect]}”切面节点。`
+                : "当前资料尚未生成切面标签，请重新分析资料后再筛选。"}
+            </div>
+          )}
         </div>
         <aside className="inspector">
           {view === "detail" ? <div className="manual-edge">
@@ -572,7 +605,8 @@ function SelectedNode({
     }}>
       <h3>{node.data.level === 2 ? "主题抽象" : node.data.kind === "claim" ? "命题" : "概念"}</h3>
       {node.data.level === 2 && <small>包含 {node.data.memberCount} 个细节节点，点击图中主题可展开。</small>}
-      {node.data.aspects.length > 0 && <div className="aspect-tags">{node.data.aspects.map((aspect) => <span key={aspect}>{aspect}</span>)}</div>}
+      {node.focusRole && node.focusRole !== "match" && <small>{node.focusRole === "bridge" ? "桥接路径节点" : "关联上下文节点"}</small>}
+      <AspectEditor node={node.data} onSaved={onSaved} onError={onError} />
       <input value={title} onChange={(event) => setTitle(event.target.value)} />
       <textarea value={summary} onChange={(event) => setSummary(event.target.value)} rows={4} />
       <CitationList citations={node.data.citations} onOpenCitation={onOpenCitation} />
@@ -590,6 +624,55 @@ function SelectedNode({
         </button>
       </div>
     </form>
+  );
+}
+
+function AspectEditor({
+  node,
+  onSaved,
+  onError,
+}: {
+  node: AbstractNode;
+  onSaved: () => void;
+  onError: (message: string) => void;
+}) {
+  const [selected, setSelected] = useState<AspectKind[]>(node.aspects);
+
+  useEffect(() => {
+    setSelected(node.aspects);
+  }, [node.id, node.aspects.join(","), node.aspectSource]);
+
+  const toggle = (aspect: AspectKind) => {
+    setSelected((current) => current.includes(aspect)
+      ? current.filter((item) => item !== aspect)
+      : [...current, aspect]);
+  };
+
+  return (
+    <section className="aspect-editor">
+      <div className="aspect-heading">
+        <strong>切面标签</strong>
+        {node.aspectSource === "manual" && <small>人工修正</small>}
+      </div>
+      <div className="aspect-options">
+        {aspectKinds.map((aspect) => (
+          <label key={aspect} className={selected.includes(aspect) ? "checked" : ""}>
+            <input type="checkbox" checked={selected.includes(aspect)} onChange={() => toggle(aspect)} />
+            {aspectLabels[aspect]}
+          </label>
+        ))}
+      </div>
+      <div className="actions">
+        <button type="button" onClick={() => {
+          void api.updateNodeAspects(node.id, selected).then(onSaved).catch((cause: Error) => onError(cause.message));
+        }}>保存切面</button>
+        {node.aspectSource === "manual" && (
+          <button type="button" className="ghost" onClick={() => {
+            void api.resetNodeAspects(node.id).then(onSaved).catch((cause: Error) => onError(cause.message));
+          }}>恢复 AI 分类</button>
+        )}
+      </div>
+    </section>
   );
 }
 

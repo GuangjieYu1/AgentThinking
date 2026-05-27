@@ -107,6 +107,20 @@ describe("HTTP application", () => {
       url: `/api/libraries/${library.id}/graph?view=overview`,
     })).json<{ nodes: Array<{ nodeType: string; data: { level?: number; memberCount?: number } }> }>();
     expect(overview.nodes.some((node) => node.nodeType === "abstract" && node.data.level === 2 && (node.data.memberCount ?? 0) > 0)).toBe(true);
+    const aspectGraph = (await app.inject({
+      method: "GET",
+      url: `/api/libraries/${library.id}/graph?aspect=claim`,
+    })).json<{ nodes: Array<{ id: string; nodeType: string; focusRole?: string; data: { aspects?: string[] } }> }>();
+    const claimNode = aspectGraph.nodes.find((node) => node.nodeType === "abstract" && node.focusRole === "match");
+    expect(claimNode?.data.aspects).toContain("claim");
+    const manuallyTagged = await app.inject({
+      method: "PATCH",
+      url: `/api/nodes/${claimNode!.id}/aspects`,
+      payload: { aspects: ["system"] },
+    });
+    expect(manuallyTagged.body).toContain('"aspectSource":"manual"');
+    const resetTag = await app.inject({ method: "DELETE", url: `/api/nodes/${claimNode!.id}/aspects` });
+    expect(resetTag.body).toContain('"aspectSource":"ai"');
     await app.inject({
       method: "PATCH",
       url: `/api/relations/${suggested!.id}`,

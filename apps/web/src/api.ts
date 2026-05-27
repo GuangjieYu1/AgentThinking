@@ -1,5 +1,6 @@
 import type {
   AbstractNode,
+  AspectKind,
   AnalysisDraft,
   AnalysisStatement,
   Document,
@@ -112,7 +113,7 @@ export const api = {
   },
   graph: (
     id: string,
-    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; view?: GraphView } = {},
+    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; view?: GraphView; aspect?: AspectKind } = {},
   ) => {
     const query = new URLSearchParams();
     if (options.centerId) query.set("centerId", options.centerId);
@@ -120,6 +121,7 @@ export const api = {
     if (options.status) query.set("status", options.status);
     if (options.type) query.set("type", options.type);
     if (options.view) query.set("view", options.view);
+    if (options.aspect) query.set("aspect", options.aspect);
     return request<GraphResponse>(`/libraries/${id}/graph?${query}`);
   },
   search: (id: string, query: string) =>
@@ -132,6 +134,13 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ title, summary }),
     }),
+  updateNodeAspects: (nodeId: string, aspects: AspectKind[]) =>
+    request<AbstractNode>(`/nodes/${nodeId}/aspects`, {
+      method: "PATCH",
+      body: JSON.stringify({ aspects }),
+    }),
+  resetNodeAspects: (nodeId: string) =>
+    request<AbstractNode>(`/nodes/${nodeId}/aspects`, { method: "DELETE" }),
   deleteNode: (nodeId: string) => request<void>(`/nodes/${nodeId}`, { method: "DELETE" }),
   createRelation: (libraryId: string, values: {
     sourceNodeId: string;

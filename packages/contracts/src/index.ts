@@ -34,6 +34,8 @@ export const ocrModes = ["local", "cloud"] as const;
 
 export type AbstractNodeKind = (typeof abstractNodeKinds)[number];
 export type AspectKind = (typeof aspectKinds)[number];
+export type AspectSource = "ai" | "manual";
+export type FocusRole = "match" | "neighbor" | "bridge";
 export type AbstractionLevel = 1 | 2;
 export type GraphView = "detail" | "overview";
 export type RelationType = (typeof relationTypes)[number];
@@ -140,6 +142,7 @@ export interface AbstractNode {
   summary: string;
   level: AbstractionLevel;
   aspects: AspectKind[];
+  aspectSource: AspectSource;
   memberCount: number;
   source: "ai" | "user";
   citations: Citation[];
@@ -184,8 +187,8 @@ export interface IngestJob {
 }
 
 export type GraphNode =
-  | { id: string; nodeType: "abstract"; data: AbstractNode }
-  | { id: string; nodeType: "chunk"; data: Chunk };
+  | { id: string; nodeType: "abstract"; data: AbstractNode; focusRole?: FocusRole }
+  | { id: string; nodeType: "chunk"; data: Chunk; focusRole?: FocusRole };
 
 export interface GraphEdge {
   id: string;
@@ -204,6 +207,11 @@ export interface GraphResponse {
   nodes: GraphNode[];
   edges: GraphEdge[];
   truncated: boolean;
+  aspectFilter?: {
+    selected: AspectKind;
+    anyLabeled: boolean;
+    matchCount: number;
+  };
 }
 
 export interface SearchResult {
@@ -277,6 +285,11 @@ export const updateAbstractNodeSchema = z.object({
   title: z.string().trim().min(1).max(180).optional(),
   summary: z.string().trim().max(2000).optional(),
 });
+
+export const updateNodeAspectsSchema = z.object({
+  aspects: z.array(z.enum(aspectKinds)),
+});
+export type UpdateNodeAspectsInput = z.infer<typeof updateNodeAspectsSchema>;
 
 export const createRelationSchema = z.object({
   sourceNodeId: z.string().min(1),

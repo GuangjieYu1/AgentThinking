@@ -9,17 +9,20 @@ import {
   createLibrarySchema,
   createRelationSchema,
   addStatementEvidenceSchema,
+  aspectKinds,
   evidenceQuerySchema,
   modelStreamSchema,
   relationStatuses,
   relationTypes,
   searchSchema,
   updateAbstractNodeSchema,
+  updateNodeAspectsSchema,
   updateLibrarySettingsSchema,
   updateAnalysisStatementSchema,
   updateRelationSchema,
   type RelationStatus,
   type RelationType,
+  type AspectKind,
 } from "@agent-thinking/contracts";
 import type { AppConfig } from "./config.js";
 import { hasConfiguredModels, hasConfiguredOcr } from "./config.js";
@@ -214,7 +217,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
 
   app.get<{
     Params: { libraryId: string };
-    Querystring: { centerId?: string; includeChunks?: string; status?: string; type?: string; limit?: string; view?: string };
+    Querystring: { centerId?: string; includeChunks?: string; status?: string; type?: string; limit?: string; view?: string; aspect?: string };
   }>("/api/libraries/:libraryId/graph", async (request) => {
     requireLibrary(db, request.params.libraryId);
     const status = relationStatuses.includes(request.query.status as RelationStatus)
@@ -223,6 +226,9 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     const type = relationTypes.includes(request.query.type as RelationType)
       ? request.query.type as RelationType
       : undefined;
+    const aspect = aspectKinds.includes(request.query.aspect as AspectKind)
+      ? request.query.aspect as AspectKind
+      : undefined;
     return db.getGraph(request.params.libraryId, {
       ...(request.query.centerId ? { centerId: request.query.centerId } : {}),
       includeChunks: request.query.includeChunks === "true",
@@ -230,6 +236,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       ...(type ? { type } : {}),
       limit: Number(request.query.limit ?? 150),
       view: request.query.view === "overview" ? "overview" : "detail",
+      ...(aspect ? { aspect } : {}),
     });
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/search", async (request) => {
@@ -246,6 +253,13 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       ...(body.title !== undefined ? { title: body.title } : {}),
       ...(body.summary !== undefined ? { summary: body.summary } : {}),
     });
+  });
+  app.patch<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/aspects", async (request) => {
+    const body = updateNodeAspectsSchema.parse(request.body);
+    return db.updateNodeAspects(request.params.nodeId, body.aspects);
+  });
+  app.delete<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/aspects", async (request) => {
+    return db.resetNodeAspects(request.params.nodeId);
   });
   app.delete<{ Params: { nodeId: string } }>("/api/nodes/:nodeId", async (request, reply) => {
     if (!db.deleteAbstractNode(request.params.nodeId)) return reply.status(404).send({ error: "抽象节点不存在" });

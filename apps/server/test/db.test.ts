@@ -123,6 +123,54 @@ describe("knowledge database", () => {
     db.close();
   });
 
+  it("focuses aspect paths and preserves manual aspect overrides across reanalysis", async () => {
+    const db = await database();
+    const library = db.createLibrary("Aspects");
+    const version = db.createDocumentVersion(library.id, "aspects.txt", "text/plain", "aspects", "aspects").version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 6, text: "system" },
+      { ordinal: 1, headingPath: null, pageNumber: null, startChar: 7, endChar: 13, text: "bridge" },
+      { ordinal: 2, headingPath: null, pageNumber: null, startChar: 14, endChar: 20, text: "engine" },
+      { ordinal: 3, headingPath: null, pageNumber: null, startChar: 21, endChar: 30, text: "neighbor" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [
+        { key: "a", kind: "concept", title: "System A", summary: "", evidenceChunkIds: [chunks[0]!.id], aspects: ["system"] },
+        { key: "bridge", kind: "concept", title: "Bridge", summary: "", evidenceChunkIds: [chunks[1]!.id], aspects: ["other"] },
+        { key: "b", kind: "concept", title: "System B", summary: "", evidenceChunkIds: [chunks[2]!.id], aspects: ["system"] },
+        { key: "neighbor", kind: "claim", title: "Neighbor", summary: "", evidenceChunkIds: [chunks[3]!.id], aspects: ["claim"] },
+      ],
+      relations: [
+        { sourceKey: "a", targetKey: "bridge", type: "related_to", reason: "path", confidence: 0.7, evidenceChunkIds: [] },
+        { sourceKey: "bridge", targetKey: "b", type: "related_to", reason: "path", confidence: 0.7, evidenceChunkIds: [] },
+        { sourceKey: "a", targetKey: "neighbor", type: "supports", reason: "context", confidence: 0.7, evidenceChunkIds: [] },
+      ],
+    });
+
+    const focused = db.getGraph(library.id, { aspect: "system" });
+    const roles = new Map(focused.nodes.map((node) => [node.nodeType === "abstract" ? node.data.title : node.id, node.focusRole]));
+    expect(roles.get("System A")).toBe("match");
+    expect(roles.get("System B")).toBe("match");
+    expect(roles.get("Bridge")).toBe("bridge");
+    expect(roles.get("Neighbor")).toBe("neighbor");
+    const systemA = focused.nodes.find((node) => node.nodeType === "abstract" && node.data.title === "System A")!;
+    const manual = db.updateNodeAspects(systemA.id, ["person"]);
+    expect(manual).toMatchObject({ aspects: ["person"], aspectSource: "manual" });
+
+    const regenerated = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 6, text: "system" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [{ key: "a", kind: "concept", title: "System A", summary: "", evidenceChunkIds: [regenerated[0]!.id], aspects: ["system"] }],
+      relations: [],
+    });
+    const retained = db.getGraph(library.id, {}).nodes.find((node) => node.nodeType === "abstract" && node.data.title === "System A");
+    expect(retained?.nodeType === "abstract" && retained.data.aspectSource).toBe("manual");
+    expect(retained?.nodeType === "abstract" && retained.data.aspects).toEqual(["person"]);
+    expect(db.resetNodeAspects(systemA.id)).toMatchObject({ aspects: ["system"], aspectSource: "ai" });
+    db.close();
+  });
+
   it("prevents relations between different libraries", async () => {
     const db = await database();
     const left = db.createLibrary("Left");

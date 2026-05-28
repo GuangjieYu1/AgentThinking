@@ -201,7 +201,19 @@ export function AnalysisWorkspace({
                 <span>{checking.has(selected.id) ? "检查中..." : precheckLabels[selected.precheck.status]}</span>
               </div>
               {selected.precheck.reason && <p>{selected.precheck.reason}</p>}
-              {selected.precheck.status === "failed" && <button onClick={() => void runPrecheck(selected)}>重新检查</button>}
+              {selected.precheck.suggestions.length > 0 && (
+                <div className="precheck-suggestions">
+                  <strong>AI 建议</strong>
+                  <ul>
+                    {selected.precheck.suggestions.map((suggestion) => <li key={suggestion}>{suggestion}</li>)}
+                  </ul>
+                </div>
+              )}
+              {selected.precheck.status !== "not_checked" && !checking.has(selected.id) && (
+                <button className="ghost" onClick={() => void runPrecheck(selected)}>
+                  {selected.precheck.status === "failed" ? "重新检查" : "重新预检"}
+                </button>
+              )}
             </section>
           </> : <p className="muted">完成关系审核后，在此核对可发布的分析陈述。</p>}
         </main>

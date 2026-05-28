@@ -39,8 +39,8 @@ describe("knowledge database", () => {
     ]);
     db.saveExtraction(library.id, {
       nodes: [
-        { key: "a", kind: "concept", title: "Alpha", summary: "", evidenceChunkIds: [chunks[0]!.id] },
-        { key: "b", kind: "claim", title: "Beta", summary: "", evidenceChunkIds: [chunks[1]!.id] },
+        { key: "a", kind: "concept", title: "Alpha", summary: "", evidenceChunkIds: [chunks[0]!.id], aspects: [] },
+        { key: "b", kind: "claim", title: "Beta", summary: "", evidenceChunkIds: [chunks[1]!.id], aspects: [] },
       ],
       relations: [{
         sourceKey: "a",
@@ -67,8 +67,8 @@ describe("knowledge database", () => {
     ]);
     const extraction = (evidenceChunkIds: string[]) => ({
       nodes: [
-        { key: "a", kind: "concept" as const, title: "A", summary: "", evidenceChunkIds: [chunks[0]!.id] },
-        { key: "b", kind: "claim" as const, title: "B", summary: "", evidenceChunkIds: [chunks[1]!.id] },
+        { key: "a", kind: "concept" as const, title: "A", summary: "", evidenceChunkIds: [chunks[0]!.id], aspects: [] },
+        { key: "b", kind: "claim" as const, title: "B", summary: "", evidenceChunkIds: [chunks[1]!.id], aspects: [] },
       ],
       relations: [{
         sourceKey: "a",
@@ -79,8 +79,8 @@ describe("knowledge database", () => {
         evidenceChunkIds,
       }],
     });
-    db.saveExtraction(library.id, extraction([chunks[0]!.id]));
-    db.saveExtraction(library.id, extraction([chunks[1]!.id]));
+    db.saveExtraction(library.id, extraction([chunks[0]!.id]), version.id);
+    db.saveExtraction(library.id, extraction([chunks[1]!.id]), version.id);
     const relations = db.getGraph(library.id, {}).edges.map((edge) => edge.relation).filter(Boolean);
     expect(relations).toHaveLength(1);
     expect(relations[0]?.evidenceChunkIds).toEqual(expect.arrayContaining(chunks.map((chunk) => chunk.id)));
@@ -112,7 +112,7 @@ describe("knowledge database", () => {
         { title: "基础设施", summary: "系统主题", memberKeys: ["system"], evidenceChunkIds: [chunks[0]!.id], aspects: ["system"] },
         { title: "运行流程", summary: "操作主题", memberKeys: ["operation"], evidenceChunkIds: [chunks[1]!.id], aspects: ["operation"] },
       ],
-    });
+    }, version.id);
     const overview = db.getGraph(library.id, { view: "overview" });
     expect(overview.nodes.filter((node) => node.nodeType === "abstract").map((node) => node.data.level)).toEqual([2, 2]);
     expect(overview.edges[0]?.aggregate).toMatchObject({ type: "supports", count: 1 });
@@ -145,7 +145,7 @@ describe("knowledge database", () => {
         { sourceKey: "bridge", targetKey: "b", type: "related_to", reason: "path", confidence: 0.7, evidenceChunkIds: [] },
         { sourceKey: "a", targetKey: "neighbor", type: "supports", reason: "context", confidence: 0.7, evidenceChunkIds: [] },
       ],
-    });
+    }, version.id);
 
     const focused = db.getGraph(library.id, { aspect: "system" });
     const roles = new Map(focused.nodes.map((node) => [node.nodeType === "abstract" ? node.data.title : node.id, node.focusRole]));
@@ -163,7 +163,7 @@ describe("knowledge database", () => {
     db.saveExtraction(library.id, {
       nodes: [{ key: "a", kind: "concept", title: "System A", summary: "", evidenceChunkIds: [regenerated[0]!.id], aspects: ["system"] }],
       relations: [],
-    });
+    }, version.id);
     const retained = db.getGraph(library.id, {}).nodes.find((node) => node.nodeType === "abstract" && node.data.title === "System A");
     expect(retained?.nodeType === "abstract" && retained.data.aspectSource).toBe("manual");
     expect(retained?.nodeType === "abstract" && retained.data.aspects).toEqual(["person"]);
@@ -171,16 +171,80 @@ describe("knowledge database", () => {
     db.close();
   });
 
+  it("rebuilds AI aspects from individual source contributions and respects manual-empty effective labels", async () => {
+    const db = await database();
+    const library = db.createLibrary("Shared aspects");
+    const firstVersion = db.createDocumentVersion(library.id, "first.txt", "text/plain", "first", "first").version;
+    const secondVersion = db.createDocumentVersion(library.id, "second.txt", "text/plain", "second", "second").version;
+    const [firstChunk] = db.replaceChunks(library.id, firstVersion.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 7, text: "system" },
+    ]);
+    const [secondChunk] = db.replaceChunks(library.id, secondVersion.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 5, text: "claim" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [{ key: "shared", kind: "concept", title: "Shared", summary: "", evidenceChunkIds: [firstChunk!.id], aspects: ["system"] }],
+      relations: [],
+    }, firstVersion.id);
+    db.saveExtraction(library.id, {
+      nodes: [{ key: "shared", kind: "concept", title: "Shared", summary: "", evidenceChunkIds: [secondChunk!.id], aspects: ["claim"] }],
+      relations: [],
+    }, secondVersion.id);
+
+    const shared = db.getGraph(library.id, {}).nodes.find((node) => node.nodeType === "abstract")!;
+    expect(shared.nodeType === "abstract" && shared.data.aspects).toEqual(["system", "claim"]);
+    expect(db.updateNodeAspects(shared.id, [])).toMatchObject({ aspects: [], aspectSource: "manual" });
+    expect(db.getGraph(library.id, { aspect: "system" }).aspectFilter).toMatchObject({ anyLabeled: false, matchCount: 0 });
+    db.resetNodeAspects(shared.id);
+
+    const [replacedChunk] = db.replaceChunks(library.id, firstVersion.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 7, text: "person" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [{ key: "shared", kind: "concept", title: "Shared", summary: "", evidenceChunkIds: [replacedChunk!.id], aspects: ["person"] }],
+      relations: [],
+    }, firstVersion.id);
+    const updated = db.getGraph(library.id, {}).nodes.find((node) => node.nodeType === "abstract");
+    expect(updated?.nodeType === "abstract" && updated.data.aspects).toEqual(["person", "claim"]);
+    db.close();
+  });
+
+  it("backfills existing non-empty AI aspect labels when adding contribution storage", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-migration-"));
+    temporaryDirectories.push(dir);
+    const db = new AgentDatabase(dir);
+    const library = db.createLibrary("Migrated aspects");
+    const version = db.createDocumentVersion(library.id, "old.txt", "text/plain", "old", "old").version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 6, text: "tagged" },
+      { ordinal: 1, headingPath: null, pageNumber: null, startChar: 7, endChar: 14, text: "untagged" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [
+        { key: "tagged", kind: "concept", title: "Tagged", summary: "", evidenceChunkIds: [chunks[0]!.id], aspects: ["system"] },
+        { key: "untagged", kind: "concept", title: "Untagged", summary: "", evidenceChunkIds: [chunks[1]!.id], aspects: [] },
+      ],
+      relations: [],
+    });
+    db.sql.prepare("DELETE FROM schema_migrations WHERE version = 6").run();
+    db.close();
+
+    const migrated = new AgentDatabase(dir);
+    const contributions = migrated.sql.prepare("SELECT aspects_json FROM abstract_node_aspect_contributions").all() as Array<{ aspects_json: string }>;
+    expect(contributions.map((entry) => JSON.parse(entry.aspects_json))).toEqual([["system"]]);
+    migrated.close();
+  });
+
   it("prevents relations between different libraries", async () => {
     const db = await database();
     const left = db.createLibrary("Left");
     const right = db.createLibrary("Right");
     db.saveExtraction(left.id, {
-      nodes: [{ key: "a", kind: "concept", title: "Left", summary: "", evidenceChunkIds: [] }],
+      nodes: [{ key: "a", kind: "concept", title: "Left", summary: "", evidenceChunkIds: [], aspects: [] }],
       relations: [],
     });
     db.saveExtraction(right.id, {
-      nodes: [{ key: "b", kind: "concept", title: "Right", summary: "", evidenceChunkIds: [] }],
+      nodes: [{ key: "b", kind: "concept", title: "Right", summary: "", evidenceChunkIds: [], aspects: [] }],
       relations: [],
     });
     const leftNode = db.getGraph(left.id, {}).nodes[0]!;
@@ -203,7 +267,7 @@ describe("knowledge database", () => {
       { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 6, text: "failed" },
     ]);
     db.saveExtraction(library.id, {
-      nodes: [{ key: "bad", kind: "concept", title: "Failed", summary: "", evidenceChunkIds: [chunks[0]!.id] }],
+      nodes: [{ key: "bad", kind: "concept", title: "Failed", summary: "", evidenceChunkIds: [chunks[0]!.id], aspects: [] }],
       relations: [],
     });
     db.updateJob(job.id, "failed", 0, "provider error");
@@ -220,8 +284,8 @@ describe("knowledge database", () => {
     const library = db.createLibrary("Node removal");
     db.saveExtraction(library.id, {
       nodes: [
-        { key: "one", kind: "concept", title: "One", summary: "", evidenceChunkIds: [] },
-        { key: "two", kind: "claim", title: "Two", summary: "", evidenceChunkIds: [] },
+        { key: "one", kind: "concept", title: "One", summary: "", evidenceChunkIds: [], aspects: [] },
+        { key: "two", kind: "claim", title: "Two", summary: "", evidenceChunkIds: [], aspects: [] },
       ],
       relations: [{
         sourceKey: "one",
@@ -249,8 +313,8 @@ describe("knowledge database", () => {
     ]);
     db.saveExtraction(library.id, {
       nodes: [
-        { key: "a", kind: "concept", title: "A", summary: "", evidenceChunkIds: [chunks[0]!.id] },
-        { key: "b", kind: "claim", title: "B", summary: "", evidenceChunkIds: [chunks[1]!.id] },
+        { key: "a", kind: "concept", title: "A", summary: "", evidenceChunkIds: [chunks[0]!.id], aspects: [] },
+        { key: "b", kind: "claim", title: "B", summary: "", evidenceChunkIds: [chunks[1]!.id], aspects: [] },
       ],
       relations: [],
     });
@@ -265,7 +329,14 @@ describe("knowledge database", () => {
     expect(draft.statements.map((statement) => statement.relationId)).toContain(manual.id);
     const statement = draft.statements[0]!;
     expect(() => db.updateAnalysisStatement(statement.id, { status: "approved" })).toThrow(/至少一条原文证据/);
-    db.addStatementEvidence(statement.id, chunks[0]!.id);
+    const advised = db.saveStatementPrecheck(statement.id, {
+      status: "unsupported",
+      reason: "论据无法直接推出该结论。",
+      suggestions: ["添加明确支持关系的原文证据。"],
+    });
+    expect(advised.precheck.suggestions).toEqual(["添加明确支持关系的原文证据。"]);
+    const withEvidence = db.addStatementEvidence(statement.id, chunks[0]!.id);
+    expect(withEvidence.precheck.suggestions).toEqual([]);
     expect(db.updateAnalysisStatement(statement.id, { status: "approved" }).status).toBe("approved");
     const changed = db.addStatementEvidence(statement.id, chunks[1]!.id);
     expect(changed.status).toBe("pending");

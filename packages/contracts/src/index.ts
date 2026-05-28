@@ -230,6 +230,7 @@ export interface PublishedAnalysis {
 export interface StatementPrecheck {
   status: StatementPrecheckStatus;
   reason: string | null;
+  suggestions: string[];
   checkedAt: string | null;
   contentUpdatedAt: string | null;
 }
@@ -320,6 +321,7 @@ export const evidenceQuerySchema = z.object({
 export const statementPrecheckSchema = z.object({
   status: z.enum(["supported", "partially_supported", "unsupported"]),
   reason: z.string().trim().min(1).max(1000),
+  suggestions: z.array(z.string().trim().min(1).max(500)).max(5).default([]),
 });
 
 export type StatementPrecheckOutput = z.infer<typeof statementPrecheckSchema>;
@@ -341,7 +343,7 @@ export const extractionSchema = z.object({
       title: z.string().trim().min(1).max(180),
       summary: z.string().trim().max(2000),
       evidenceChunkIds: z.array(z.string()).default([]),
-      aspects: z.array(z.enum(aspectKinds)).optional(),
+      aspects: z.array(z.enum(aspectKinds)),
     }),
   ),
   relations: z.array(
@@ -360,7 +362,7 @@ export const extractionSchema = z.object({
       summary: z.string().trim().max(2000),
       memberKeys: z.array(z.string()).min(1),
       evidenceChunkIds: z.array(z.string()).default([]),
-      aspects: z.array(z.enum(aspectKinds)).optional(),
+      aspects: z.array(z.enum(aspectKinds)),
     }),
   ).optional(),
 });

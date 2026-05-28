@@ -29,7 +29,7 @@ function model(): ModelProvider {
     configured: true,
     embed: async () => [],
     extract: async () => ({ nodes: [], relations: [] }),
-    precheckStatement: async () => ({ status: "supported", reason: "ok" }),
+    precheckStatement: async () => ({ status: "supported", reason: "ok", suggestions: [] }),
     stream: async function* () { yield { type: "content", text: "ok" }; },
     test: async () => ({ ok: true, provider: "test", message: "ok" }),
   };

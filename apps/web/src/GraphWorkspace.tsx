@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import {
   Background,
   ControlButton,
@@ -33,7 +33,7 @@ import {
 } from "@agent-thinking/contracts";
 import { api } from "./api";
 
-type VisualNode = Node<{ label: string; entity: GraphNode }>;
+type VisualNode = Node<{ label: ReactNode; entity: GraphNode }>;
 type VisualEdge = Edge<{ entity: GraphEdge }>;
 type LayoutMode = "layered" | "network" | "tree";
 interface LayoutLink {
@@ -152,12 +152,16 @@ function visualNodes(
   records: GraphNode[],
   positions: Map<string, { x: number; y: number }>,
   direction?: "horizontal" | "vertical",
+  activeAspect?: AspectKind,
 ): VisualNode[] {
   return records.map((record) => {
     const point = positions.get(record.id);
-    const label = record.nodeType === "abstract"
+    const title = record.nodeType === "abstract"
       ? record.data.title
       : `${record.data.pageNumber ? `P${record.data.pageNumber} ` : ""}${record.data.text.slice(0, 36)}`;
+    const label = record.nodeType === "abstract" && record.focusRole === "match" && activeAspect
+      ? <div className="flow-label"><span>{title}</span><small className="flow-aspect-tag">{aspectLabels[activeAspect]}</small></div>
+      : title;
     return {
       id: record.id,
       position: { x: point?.x ?? 0, y: point?.y ?? 0 },
@@ -177,7 +181,7 @@ function visualNodes(
   });
 }
 
-function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[] {
+function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind): VisualNode[] {
   const links: LayoutLink[] = graphEdges.map((edge) => ({
     source: edge.source,
     target: edge.target,
@@ -193,10 +197,10 @@ function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNod
       });
     });
   });
-  return visualNodes(records, positions, "horizontal");
+  return visualNodes(records, positions, "horizontal", activeAspect);
 }
 
-function treeLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[] {
+function treeLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind): VisualNode[] {
   const links: LayoutLink[] = graphEdges.map((edge) => ({
     source: edge.source,
     target: edge.target,
@@ -212,10 +216,10 @@ function treeLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[]
       });
     });
   });
-  return visualNodes(records, positions, "vertical");
+  return visualNodes(records, positions, "vertical", activeAspect);
 }
 
-function networkLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNode[] {
+function networkLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind): VisualNode[] {
   const positions: PositionedNode[] = records.map((record) => ({ id: record.id }));
   const links = graphEdges.map((edge) => ({
     source: edge.source,
@@ -239,12 +243,12 @@ function networkLayout(records: GraphNode[], graphEdges: GraphEdge[]): VisualNod
   return visualNodes(records, new Map(positions.map((position) => [position.id, {
     x: position.x ?? 0,
     y: position.y ?? 0,
-  }])));
+  }])), undefined, activeAspect);
 }
 
-function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[], layout: LayoutMode): VisualNode[] {
-  if (layout === "network") return networkLayout(records, graphEdges);
-  return layout === "tree" ? treeLayout(records, graphEdges) : layeredLayout(records, graphEdges);
+function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[], layout: LayoutMode, activeAspect?: AspectKind): VisualNode[] {
+  if (layout === "network") return networkLayout(records, graphEdges, activeAspect);
+  return layout === "tree" ? treeLayout(records, graphEdges, activeAspect) : layeredLayout(records, graphEdges, activeAspect);
 }
 
 function displayEdges(records: GraphEdge[], layout: LayoutMode): VisualEdge[] {
@@ -320,7 +324,7 @@ export function GraphWorkspace({
       setEdgeRecords(graph.edges);
       setAspectFilter(graph.aspectFilter);
       setSelected((current) => current ? graph.nodes.find((node) => node.id === current.id) : undefined);
-      setNodes(layoutNodes(graph.nodes, graph.edges, layout));
+      setNodes(layoutNodes(graph.nodes, graph.edges, layout, aspect || undefined));
       setEdges(displayEdges(graph.edges, layout));
     } catch (cause) {
       onError((cause as Error).message);
@@ -391,7 +395,7 @@ export function GraphWorkspace({
 
   const changeLayout = (nextLayout: LayoutMode) => {
     setLayout(nextLayout);
-    setNodes(layoutNodes(records, edgeRecords, nextLayout));
+    setNodes(layoutNodes(records, edgeRecords, nextLayout, aspect || undefined));
     setEdges(displayEdges(edgeRecords, nextLayout));
   };
 

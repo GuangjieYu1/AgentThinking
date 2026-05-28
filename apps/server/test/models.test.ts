@@ -59,6 +59,34 @@ describe("DeepSeek model configuration", () => {
     expect(body.response_format).toEqual({ type: "json_object" });
   });
 
+  it("rejects extracted nodes that omit required aspect arrays", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({
+          nodes: [{ key: "n1", kind: "concept", title: "Node", summary: "", evidenceChunkIds: [] }],
+          relations: [],
+        }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const chunk: Chunk = {
+      id: "chunk-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      ordinal: 0,
+      headingPath: null,
+      pageNumber: null,
+      startLine: null,
+      endLine: null,
+      blockId: null,
+      startChar: 0,
+      endChar: 4,
+      text: "概念证据",
+      aspects: [],
+    };
+    await expect(provider.extract([chunk], new Map())).rejects.toThrow();
+  });
+
   it("forwards streamed DeepSeek content and reasoning deltas", async () => {
     const upstream = [
       'data: {"choices":[{"delta":{"reasoning_content":"思考"}}]}',
@@ -87,7 +115,11 @@ describe("DeepSeek model configuration", () => {
   it("prechecks an analysis statement against supplied citations", async () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       new Response(JSON.stringify({
-        choices: [{ message: { content: JSON.stringify({ status: "supported", reason: "引用直接支持陈述。" }) } }],
+        choices: [{ message: { content: JSON.stringify({
+          status: "partially_supported",
+          reason: "论据只支持部分结论。",
+          suggestions: ["补充直接说明因果关系的证据。"],
+        }) } }],
       }), { status: 200, headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
     const provider = new OpenAICompatibleProvider(config);
@@ -103,8 +135,10 @@ describe("DeepSeek model configuration", () => {
       blockId: null,
       excerpt: "材料支持结论。",
     }]);
-    expect(result.status).toBe("supported");
+    expect(result.status).toBe("partially_supported");
+    expect(result.suggestions).toEqual(["补充直接说明因果关系的证据。"]);
     const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as { messages: Array<{ content: string }> };
     expect(body.messages[1]!.content).toContain("材料支持结论");
+    expect(body.messages[0]!.content).toContain("relationship");
   });
 });

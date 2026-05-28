@@ -94,9 +94,17 @@ export class FakeModelProvider implements ModelProvider {
 
   async precheckStatement(_text: string, citations: Citation[]): Promise<StatementPrecheckOutput> {
     if (citations.length === 0) {
-      return { status: "unsupported", reason: "尚未关联原文证据，无法验证陈述。" };
+      return {
+        status: "unsupported",
+        reason: "尚未关联原文证据，无法验证陈述。",
+        suggestions: ["为该陈述添加能够直接支撑其结论或关联关系的原文引用。"],
+      };
     }
-    return { status: "supported", reason: "演示模式：该陈述已附带可定位来源，请由审核者核对原文后裁决。" };
+    return {
+      status: "supported",
+      reason: "演示模式：该陈述已附带可定位来源，请由审核者核对原文后裁决。",
+      suggestions: [],
+    };
   }
 
   async *stream(prompt: string): AsyncGenerator<{ type: "content"; text: string }> {
@@ -181,7 +189,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
             '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
             '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
             "Node kind is concept or claim. Relation type must be supports, contradicts, explains, depends_on, example_of, or related_to. " +
-            "Aspects are optional labels chosen from person, operation, system, story, claim, conflict, time, other. " +
+            "Every node and theme must include an aspects array (it may be empty) chosen from person, operation, system, story, claim, conflict, time, other. " +
             "Create a small number of themes only when multiple nodes share a defensible higher-level subject; themes organize navigation and must cite evidence. " +
             "Candidate evidence may come from other documents and should be used to identify contradictions. " +
             "Every node and relation must cite evidenceChunkIds from supplied evidence or candidate ids; only create defensible relationships.",
@@ -203,7 +211,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
   async precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput> {
     if (citations.length === 0) {
-      return { status: "unsupported", reason: "尚未关联原文证据，无法验证陈述。" };
+      return {
+        status: "unsupported",
+        reason: "尚未关联原文证据，无法验证陈述。",
+        suggestions: ["补充直接支持该陈述及其关系判断的原文证据。"],
+      };
     }
     if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
     const evidence = citations.map((citation) => ({
@@ -222,9 +234,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
         {
           role: "system",
           content:
-            "Determine whether the supplied source excerpts support the analysis statement. " +
-            'Return JSON only: {"status":"supported|partially_supported|unsupported","reason":"..."}. ' +
-            "Use supported only when the statement is directly justified by the excerpts. Be conservative.",
+            "Review whether the supplied source excerpts support the analysis statement and whether any asserted relationship between concepts or claims is justified. " +
+            'Return JSON only: {"status":"supported|partially_supported|unsupported","reason":"...","suggestions":["..."]}. ' +
+            "Use supported only when the statement and asserted relationship are directly justified by the excerpts. " +
+            "When support is weak, missing, or the relationship appears irrelevant, provide up to three concise, actionable suggestions, such as what evidence is missing or which relationship needs reconsideration. " +
+            "Return an empty suggestions array only when there is no meaningful improvement to recommend. Be conservative.",
         },
         { role: "user", content: JSON.stringify({ statement: text, evidence }) },
       ],

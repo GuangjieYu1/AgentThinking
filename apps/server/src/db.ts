@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync as NativeDatabaseSync } from "node:sqlite";
+import { aspectKinds } from "@agent-thinking/contracts";
 import type {
   AbstractNode,
   AbstractNodeKind,
@@ -102,7 +103,26 @@ function nodeFrom(r: Row): AbstractNode {
 function parseAspects(value: Row[string] | undefined): AspectKind[] {
   if (typeof value !== "string") return [];
   try {
-    return JSON.parse(value) as AspectKind[];
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return normalizeAspects(parsed.filter(
+      (entry): entry is AspectKind => typeof entry === "string" && aspectKinds.includes(entry as AspectKind),
+    ));
+  } catch {
+    return [];
+  }
+}
+
+function normalizeAspects(aspects: readonly AspectKind[]): AspectKind[] {
+  const selected = new Set(aspects);
+  return aspectKinds.filter((aspect) => selected.has(aspect));
+}
+
+function parseTextList(value: Row[string] | undefined): string[] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
   } catch {
     return [];
   }
@@ -260,6 +280,7 @@ export class AgentDatabase {
         invalidated_at TEXT,
         precheck_status TEXT NOT NULL DEFAULT 'not_checked',
         precheck_reason TEXT,
+        precheck_suggestions_json TEXT NOT NULL DEFAULT '[]',
         precheck_checked_at TEXT,
         precheck_content_updated_at TEXT,
         created_at TEXT NOT NULL,
@@ -280,9 +301,16 @@ export class AgentDatabase {
         updated_at TEXT NOT NULL,
         PRIMARY KEY(parent_node_id, child_node_id)
       );
+      CREATE TABLE IF NOT EXISTS abstract_node_aspect_contributions (
+        node_id TEXT NOT NULL REFERENCES abstract_nodes(id) ON DELETE CASCADE,
+        analyzed_version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        aspects_json TEXT NOT NULL DEFAULT '[]',
+        PRIMARY KEY(node_id, analyzed_version_id)
+      );
       CREATE INDEX IF NOT EXISTS idx_source_links_version ON source_links(version_id);
       CREATE INDEX IF NOT EXISTS idx_statements_library_status ON analysis_statements(library_id, status);
       CREATE INDEX IF NOT EXISTS idx_abstraction_child ON abstraction_memberships(child_node_id);
+      CREATE INDEX IF NOT EXISTS idx_aspect_contributions_version ON abstract_node_aspect_contributions(analyzed_version_id);
     `);
     this.addColumn("chunks", "start_line", "INTEGER");
     this.addColumn("chunks", "end_line", "INTEGER");
@@ -295,6 +323,7 @@ export class AgentDatabase {
     this.addColumn("analysis_statements", "invalidated_at", "TEXT");
     this.addColumn("analysis_statements", "precheck_status", "TEXT NOT NULL DEFAULT 'not_checked'");
     this.addColumn("analysis_statements", "precheck_reason", "TEXT");
+    this.addColumn("analysis_statements", "precheck_suggestions_json", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("analysis_statements", "precheck_checked_at", "TEXT");
     this.addColumn("analysis_statements", "precheck_content_updated_at", "TEXT");
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
@@ -302,6 +331,18 @@ export class AgentDatabase {
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (4, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (5, ?)").run(now());
+    if (!row(this.sql.prepare("SELECT version FROM schema_migrations WHERE version = 6"))) {
+      this.sql.prepare(`
+        INSERT OR IGNORE INTO abstract_node_aspect_contributions (node_id, analyzed_version_id, aspects_json)
+        SELECT DISTINCT n.id, c.version_id, n.aspects_json
+        FROM abstract_nodes n
+        JOIN abstract_node_evidence e ON e.node_id = n.id
+        JOIN chunks c ON c.id = e.chunk_id
+        WHERE n.aspects_json IS NOT NULL AND n.aspects_json != '[]'
+      `).run();
+      this.sql.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?)").run(now());
+    }
+    this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (7, ?)").run(now());
   }
 
   private addColumn(table: string, column: string, definition: string): void {
@@ -678,6 +719,12 @@ export class AgentDatabase {
   }
 
   private clearGeneratedForVersion(versionId: string): void {
+    const contributionNodes = rows(
+      this.sql.prepare("SELECT node_id FROM abstract_node_aspect_contributions WHERE analyzed_version_id = ?"),
+      versionId,
+    ).map((entry) => String(entry.node_id));
+    this.sql.prepare("DELETE FROM abstract_node_aspect_contributions WHERE analyzed_version_id = ?").run(versionId);
+    this.refreshAiAspects(contributionNodes);
     this.sql.prepare(`
       DELETE FROM relations
       WHERE created_by = 'ai' AND id IN (
@@ -698,12 +745,40 @@ export class AgentDatabase {
     `).run();
   }
 
+  private mergeAspectContribution(nodeId: string, analyzedVersionId: string, aspects: AspectKind[]): void {
+    const current = row(
+      this.sql.prepare("SELECT aspects_json FROM abstract_node_aspect_contributions WHERE node_id = ? AND analyzed_version_id = ?"),
+      nodeId,
+      analyzedVersionId,
+    );
+    const merged = normalizeAspects([...parseAspects(current?.aspects_json), ...aspects]);
+    this.sql.prepare(`
+      INSERT INTO abstract_node_aspect_contributions (node_id, analyzed_version_id, aspects_json)
+      VALUES (?, ?, ?)
+      ON CONFLICT(node_id, analyzed_version_id) DO UPDATE SET aspects_json = excluded.aspects_json
+    `).run(nodeId, analyzedVersionId, JSON.stringify(merged));
+    this.refreshAiAspects([nodeId]);
+  }
+
+  private refreshAiAspects(nodeIds: Iterable<string>): void {
+    const update = this.sql.prepare("UPDATE abstract_nodes SET aspects_json = ?, updated_at = ? WHERE id = ?");
+    for (const nodeId of new Set(nodeIds)) {
+      const aspects = normalizeAspects(
+        rows(
+          this.sql.prepare("SELECT aspects_json FROM abstract_node_aspect_contributions WHERE node_id = ?"),
+          nodeId,
+        ).flatMap((entry) => parseAspects(entry.aspects_json)),
+      );
+      update.run(JSON.stringify(aspects), now(), nodeId);
+    }
+  }
+
   private invalidateStatementsForVersion(versionId: string): void {
     const timestamp = now();
     this.sql.prepare(`
       UPDATE analysis_statements
       SET status = 'pending', invalidated_reason = '来源版本已重新分析，请重新核对引用',
-        invalidated_at = ?, precheck_status = 'not_checked', precheck_reason = NULL,
+        invalidated_at = ?, precheck_status = 'not_checked', precheck_reason = NULL, precheck_suggestions_json = '[]',
         precheck_checked_at = NULL, precheck_content_updated_at = NULL, updated_at = ?
       WHERE id IN (
         SELECT se.statement_id FROM analysis_statement_evidence se
@@ -818,7 +893,7 @@ export class AgentDatabase {
     }));
   }
 
-  saveExtraction(libraryId: string, extraction: ExtractionOutput): void {
+  saveExtraction(libraryId: string, extraction: ExtractionOutput, analyzedVersionId?: string): void {
     const keyToId = new Map<string, string>();
     const findNode = this.sql.prepare(
       "SELECT * FROM abstract_nodes WHERE library_id = ? AND kind = ? AND level = ? AND title = ? COLLATE NOCASE LIMIT 1",
@@ -827,9 +902,19 @@ export class AgentDatabase {
       INSERT INTO abstract_nodes (id, library_id, kind, title, summary, level, aspects_json, source, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'ai', ?, ?)
     `);
-    const updateNodeAspects = this.sql.prepare(
+    const updateAiNodeAspects = this.sql.prepare(
       "UPDATE abstract_nodes SET aspects_json = ?, updated_at = ? WHERE id = ?",
     );
+    const getAiNodeAspects = this.sql.prepare("SELECT aspects_json FROM abstract_nodes WHERE id = ?");
+    const saveAiAspects = (nodeId: string, aspects: AspectKind[]) => {
+      if (analyzedVersionId) {
+        this.mergeAspectContribution(nodeId, analyzedVersionId, aspects);
+      } else {
+        const current = row(getAiNodeAspects, nodeId);
+        const merged = normalizeAspects([...parseAspects(current?.aspects_json), ...aspects]);
+        updateAiNodeAspects.run(JSON.stringify(merged), now(), nodeId);
+      }
+    };
     const evidence = this.sql.prepare(
       "INSERT OR IGNORE INTO abstract_node_evidence (node_id, chunk_id) VALUES (?, ?)",
     );
@@ -849,12 +934,10 @@ export class AgentDatabase {
         const timestamp = now();
         insertNode.run(
           nodeId, libraryId, extracted.kind, extracted.title, extracted.summary, 1,
-          JSON.stringify(extracted.aspects ?? []), timestamp, timestamp,
+          JSON.stringify([]), timestamp, timestamp,
         );
-      } else if (extracted.aspects?.length) {
-        const aspects = [...new Set([...parseAspects(existing.aspects_json), ...extracted.aspects])];
-        updateNodeAspects.run(JSON.stringify(aspects), now(), nodeId);
       }
+      saveAiAspects(nodeId, extracted.aspects);
       keyToId.set(extracted.key, nodeId);
       for (const chunkId of extracted.evidenceChunkIds) evidence.run(nodeId, chunkId);
     }
@@ -893,12 +976,10 @@ export class AgentDatabase {
         const timestamp = now();
         insertNode.run(
           themeId, libraryId, "concept", theme.title, theme.summary, 2,
-          JSON.stringify(theme.aspects ?? []), timestamp, timestamp,
+          JSON.stringify([]), timestamp, timestamp,
         );
-      } else if (theme.aspects?.length) {
-        const aspects = [...new Set([...parseAspects(existing.aspects_json), ...theme.aspects])];
-        updateNodeAspects.run(JSON.stringify(aspects), now(), themeId);
       }
+      saveAiAspects(themeId, theme.aspects);
       const themeEvidence = new Set(theme.evidenceChunkIds);
       for (const extracted of extraction.nodes) {
         if (theme.memberKeys.includes(extracted.key)) {
@@ -1034,7 +1115,7 @@ export class AgentDatabase {
   ): GraphResponse {
     if (options.view === "overview") {
       const graph = this.getOverviewGraph(libraryId, options);
-      return options.aspect ? this.focusGraph(graph, options.aspect) : graph;
+      return options.aspect ? this.focusGraph(libraryId, graph, options.aspect) : graph;
     }
     const limit = Math.min(Math.max(options.limit ?? 150, 1), 400);
     const filters = ["library_id = ?"];
@@ -1164,7 +1245,7 @@ export class AgentDatabase {
       }
     }
     const graph = { nodes: graphNodes, edges: graphEdges, truncated };
-    return options.aspect ? this.focusGraph(graph, options.aspect) : graph;
+    return options.aspect ? this.focusGraph(libraryId, graph, options.aspect) : graph;
   }
 
   private getOverviewGraph(
@@ -1250,9 +1331,15 @@ export class AgentDatabase {
     return { nodes: graphNodes, edges: [...aggregates.values()], truncated };
   }
 
-  private focusGraph(graph: GraphResponse, aspect: AspectKind): GraphResponse {
+  private focusGraph(libraryId: string, graph: GraphResponse, aspect: AspectKind): GraphResponse {
     const abstractNodes = graph.nodes.filter((node) => node.nodeType === "abstract");
-    const anyLabeled = abstractNodes.some((node) => node.data.aspects.length > 0);
+    const anyLabeled = rows(
+      this.sql.prepare("SELECT aspects_json, manual_aspects_json FROM abstract_nodes WHERE library_id = ?"),
+      libraryId,
+    ).some((entry) => {
+      const effective = entry.manual_aspects_json === null ? entry.aspects_json : entry.manual_aspects_json;
+      return parseAspects(effective).length > 0;
+    });
     const matches = new Set(
       abstractNodes.filter((node) => node.data.aspects.includes(aspect)).map((node) => node.id),
     );
@@ -1386,13 +1473,14 @@ export class AgentDatabase {
         invalidated_at = CASE WHEN ? THEN ? ELSE invalidated_at END,
         precheck_status = CASE WHEN ? THEN 'not_checked' ELSE precheck_status END,
         precheck_reason = CASE WHEN ? THEN NULL ELSE precheck_reason END,
+        precheck_suggestions_json = CASE WHEN ? THEN '[]' ELSE precheck_suggestions_json END,
         precheck_checked_at = CASE WHEN ? THEN NULL ELSE precheck_checked_at END,
         precheck_content_updated_at = CASE WHEN ? THEN NULL ELSE precheck_content_updated_at END
       WHERE id = ?
     `).run(
       nextText, nextStatus, timestamp,
       resetReview ? 1 : 0, resetReview ? 1 : 0, timestamp,
-      resetReview ? 1 : 0, resetReview ? 1 : 0, resetReview ? 1 : 0, resetReview ? 1 : 0,
+      resetReview ? 1 : 0, resetReview ? 1 : 0, resetReview ? 1 : 0, resetReview ? 1 : 0, resetReview ? 1 : 0,
       id,
     );
     return this.getAnalysisStatement(id) as AnalysisStatement;
@@ -1445,6 +1533,7 @@ export class AgentDatabase {
       precheck: {
         status: (result.precheck_status === null ? "not_checked" : String(result.precheck_status)) as AnalysisStatement["precheck"]["status"],
         reason: result.precheck_reason === null ? null : String(result.precheck_reason),
+        suggestions: parseTextList(result.precheck_suggestions_json),
         checkedAt: result.precheck_checked_at === null ? null : String(result.precheck_checked_at),
         contentUpdatedAt: result.precheck_content_updated_at === null ? null : String(result.precheck_content_updated_at),
       },
@@ -1459,10 +1548,10 @@ export class AgentDatabase {
     const timestamp = now();
     this.sql.prepare(`
       UPDATE analysis_statements
-      SET precheck_status = ?, precheck_reason = ?, precheck_checked_at = ?,
+      SET precheck_status = ?, precheck_reason = ?, precheck_suggestions_json = ?, precheck_checked_at = ?,
         precheck_content_updated_at = ?
       WHERE id = ?
-    `).run(result.status, result.reason, timestamp, statement.updatedAt, id);
+    `).run(result.status, result.reason, JSON.stringify(result.suggestions), timestamp, statement.updatedAt, id);
     return this.getAnalysisStatement(id) as AnalysisStatement;
   }
 
@@ -1471,7 +1560,7 @@ export class AgentDatabase {
     if (!statement) throw new Error("分析陈述不存在");
     this.sql.prepare(`
       UPDATE analysis_statements
-      SET precheck_status = 'failed', precheck_reason = ?, precheck_checked_at = ?,
+      SET precheck_status = 'failed', precheck_reason = ?, precheck_suggestions_json = '[]', precheck_checked_at = ?,
         precheck_content_updated_at = ?
       WHERE id = ?
     `).run(reason, now(), statement.updatedAt, id);
@@ -1483,7 +1572,7 @@ export class AgentDatabase {
     this.sql.prepare(`
       UPDATE analysis_statements
       SET status = 'pending', invalidated_reason = ?, invalidated_at = ?,
-        precheck_status = 'not_checked', precheck_reason = NULL,
+        precheck_status = 'not_checked', precheck_reason = NULL, precheck_suggestions_json = '[]',
         precheck_checked_at = NULL, precheck_content_updated_at = NULL, updated_at = ?
       WHERE relation_id = ?
     `).run(reason, timestamp, timestamp, relationId);

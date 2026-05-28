@@ -155,7 +155,7 @@ export class IngestionQueue extends EventEmitter {
           }
         }
         const extraction = await this.model.extract(batch, related);
-        this.db.saveExtraction(source.libraryId, extraction);
+        this.db.saveExtraction(source.libraryId, extraction, source.version.id);
       }
 
       // Existing chunks need a reciprocal look at new material so import order does not
@@ -166,7 +166,7 @@ export class IngestionQueue extends EventEmitter {
         const anchors = batch.map((entry) => entry.chunk);
         const related = new Map(batch.map((entry) => [entry.chunk.id, [...entry.newContext.values()]]));
         const extraction = await this.model.extract(anchors, related);
-        this.db.saveExtraction(source.libraryId, extraction);
+        this.db.saveExtraction(source.libraryId, extraction, source.version.id);
       }
 
       this.setStage(jobId, "indexing", 0.94);

@@ -272,11 +272,26 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .pulse-panel-heading small { color: #a8b7d0; }
 .pulse-status-correct { border-color: #2f8064; box-shadow: inset 0 0 0 1px #2f806433; }
 .pulse-status-wrong { border-color: #804157; box-shadow: inset 0 0 0 1px #80415744; }
+.pulse-stream-panel { border-color: #2c5a72; box-shadow: inset 0 0 0 1px #2c5a7244; }
 .pulse-question { margin: 0; color: #e4edf7; font-weight: 700; }
 .pulse-panel p:not(.pulse-question) { margin: 0; color: #c7d4e7; line-height: 1.5; }
 .pulse-panel > small { color: #8fa1bc; line-height: 1.45; }
 .pulse-review-actions, .pulse-hit-summary { display: flex; gap: 7px; flex-wrap: wrap; }
 .pulse-review-actions button { flex: 1; padding: 7px 9px; }
+.pulse-stream-status {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px;
+  background: #0d1728; color: #b9c8dd; font-size: 12px;
+}
+.pulse-live-dot {
+  width: 8px; height: 8px; border-radius: 999px; background: #40d6b2;
+  box-shadow: 0 0 0 5px #40d6b220;
+}
+.pulse-draft-answer {
+  display: grid; gap: 6px; padding: 8px 10px; border-left: 3px solid #40d6b2;
+  border-radius: 7px; background: #101d2f;
+}
+.pulse-draft-answer strong { color: #7edac3; font-size: 12px; }
+.pulse-draft-answer p { max-height: 120px; overflow-y: auto; }
 .pulse-playback {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 7px; border: 1px solid #223047;
   border-radius: 8px; background: #0d1728;
@@ -301,6 +316,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .pulse-hits strong { color: #dce7f6; font-size: 12px; }
 .pulse-hits span { color: #92a4bf; font-size: 12px; }
 .pulse-hits small { color: #7edac3; }
+.pulse-stream-hits button:disabled { opacity: 1; cursor: default; }
 .pulse-hit-pending { opacity: .42; }
 .pulse-hit-pending small { color: #74839c; }
 .manual-edge { display: grid; gap: 7px; }
@@ -367,12 +383,29 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .flow-pulse-direct { animation: pulseReveal .42s ease-out; box-shadow: 0 0 0 2px #f8d26a, 0 0 30px #f8d26a66 !important; }
 .flow-pulse-bridge { animation: pulseReveal .42s ease-out; box-shadow: 0 0 0 2px #c6a2ff, 0 0 26px #8b5cf666 !important; }
 .flow-pulse-expanded { animation: pulseReveal .42s ease-out; box-shadow: 0 0 0 1px #7db8ff, 0 0 18px #60a5fa55 !important; }
+.flow-pulse-active {
+  animation: pulseCurrentNode .72s ease-out;
+  box-shadow: 0 0 0 4px #fff0a6, 0 0 38px #f8d26aaa !important;
+  filter: brightness(1.18);
+}
+.react-flow__edge.flow-pulse-active-edge path {
+  animation: pulseCurrentEdge .72s ease-out;
+}
 .flow-pulse-correct { box-shadow: 0 0 0 2px #4bd493, 0 0 24px #4bd49355 !important; }
 .flow-pulse-wrong { box-shadow: 0 0 0 2px #ef5f7a, 0 0 24px #ef5f7a66 !important; }
 .flow-pulse-mixed { box-shadow: 0 0 0 2px #e7b84d, 0 0 22px #e7b84d55 !important; }
 @keyframes pulseReveal {
   from { filter: brightness(.62); }
   to { filter: brightness(1); }
+}
+@keyframes pulseCurrentNode {
+  0% { filter: brightness(.82); }
+  42% { filter: brightness(1.35); }
+  100% { filter: brightness(1.18); }
+}
+@keyframes pulseCurrentEdge {
+  from { stroke-dashoffset: 28; opacity: .45; }
+  to { stroke-dashoffset: 0; opacity: 1; }
 }
 .flow-label { display: grid; justify-items: center; gap: 5px; }
 .flow-aspect-tag {

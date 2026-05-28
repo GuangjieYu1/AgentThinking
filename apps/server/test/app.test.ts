@@ -137,6 +137,18 @@ describe("HTTP application", () => {
     const listedPulses = (await app.inject({ method: "GET", url: `/api/libraries/${library.id}/pulses` }))
       .json<Array<{ id: string }>>();
     expect(listedPulses[0]?.id).toBe(createdPulse.pulse.id);
+    const streamedPulse = await app.inject({
+      method: "POST",
+      url: `/api/libraries/${library.id}/pulses/stream`,
+      payload: { question: "claim follows", mode: "full" },
+    });
+    expect(streamedPulse.statusCode).toBe(200);
+    expect(streamedPulse.body).toContain('"type":"start"');
+    expect(streamedPulse.body).toContain('"type":"stage"');
+    expect(streamedPulse.body).toContain('"type":"hit"');
+    expect(streamedPulse.body).toContain('"type":"answer"');
+    expect(streamedPulse.body).toContain('"type":"done"');
+    expect(streamedPulse.body).toContain('"response"');
     const markedWrong = (await app.inject({
       method: "PATCH",
       url: `/api/pulses/${createdPulse.pulse.id}/review`,

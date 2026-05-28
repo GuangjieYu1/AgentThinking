@@ -25,6 +25,7 @@ import {
   type RelationStatus,
   type RelationType,
   type AspectKind,
+  type PulseStreamEvent,
 } from "@agent-thinking/contracts";
 import type { AppConfig } from "./config.js";
 import { hasConfiguredModels, hasConfiguredOcr } from "./config.js";
@@ -266,6 +267,30 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     requireLibrary(db, request.params.libraryId);
     const { question, mode } = createPulseSchema.parse(request.body);
     return reply.status(201).send(await pulseEngine.create(request.params.libraryId, question, mode));
+  });
+  app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses/stream", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId);
+    const { question, mode } = createPulseSchema.parse(request.body);
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    const send = (event: PulseStreamEvent): void => {
+      reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+    try {
+      await pulseEngine.create(request.params.libraryId, question, mode, send);
+    } catch (error) {
+      send({
+        type: "error",
+        message: error instanceof Error ? error.message : "脉冲流式请求失败",
+      });
+    } finally {
+      reply.raw.end();
+    }
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request) => {
     requireLibrary(db, request.params.libraryId);

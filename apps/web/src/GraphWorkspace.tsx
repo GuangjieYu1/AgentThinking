@@ -29,6 +29,7 @@ import {
   type Pulse,
   type PulseInputMode,
   type PulseResponse,
+  type PulseStreamHit,
   type Relation,
   type RelationStatus,
   type RelationType,
@@ -41,6 +42,8 @@ type VisualEdge = Edge<{ entity: GraphEdge }>;
 type LayoutMode = "layered" | "network" | "tree";
 type PulseLayerMode = "normal" | "current" | "stats" | "wrong" | "correct";
 type PulseHitRecord = PulseResponse["hits"][number];
+type PulseStreamHitRecord = PulseStreamHit;
+type PulseDecorated = { pulseActive?: boolean };
 interface LayoutLink {
   source: string;
   target: string;
@@ -59,6 +62,9 @@ const aspectLabels: Record<AspectKind, string> = {
   time: "时间",
   other: "其他",
 };
+
+const pulseInitialRevealDelayMs = 455;
+const pulseRevealDelayMs = 1050;
 
 function relationColor(status: RelationStatus): string {
   if (status === "suggested") return "#e7a93c";
@@ -93,9 +99,19 @@ function pulseTraceColor(record: GraphEdge, mode: PulseLayerMode, fallback: stri
   return fallback;
 }
 
+function isPulseActive(record: GraphNode | GraphEdge): boolean {
+  return Boolean((record as PulseDecorated).pulseActive);
+}
+
+function withPulseActive<T extends GraphNode | GraphEdge>(record: T): T {
+  return { ...record, pulseActive: true } as T;
+}
+
 const pulseRoleRank = { direct: 0, bridge: 1, expanded: 2 } satisfies Record<NonNullable<GraphNode["pulseRole"]>, number>;
 
-function sortPulseHits(left: PulseHitRecord, right: PulseHitRecord): number {
+type SortablePulseHit = Pick<PulseHitRecord, "stepIndex" | "pathRole" | "score" | "label">;
+
+function sortPulseHits(left: SortablePulseHit, right: SortablePulseHit): number {
   return (left.stepIndex ?? 999) - (right.stepIndex ?? 999) ||
     pulseRoleRank[left.pathRole] - pulseRoleRank[right.pathRole] ||
     right.score - left.score ||
@@ -131,8 +147,8 @@ function orderedPulseHits(response: PulseResponse | undefined): PulseHitRecord[]
     return true;
   };
   const appendNodeCluster = (nodeId: string) => {
-    for (const chunkHit of evidenceChunksByNode.get(nodeId) ?? []) append(chunkHit);
     append(byKey.get(`node:${nodeId}`));
+    for (const chunkHit of evidenceChunksByNode.get(nodeId) ?? []) append(chunkHit);
   };
   const revealedNodes = () => new Set(
     ordered.filter((hit) => hit.targetType === "node").map((hit) => hit.targetId),
@@ -176,7 +192,7 @@ function pulseStepExplanation(hit: PulseHitRecord | undefined, total: number): s
   return `第 ${hit.stepIndex ?? "?"} 步点亮${target}「${hit.label}」。看到的信息：${observation} 选择理由：${rationale}`;
 }
 
-function pulseHitKey(hit: PulseHitRecord): string {
+function pulseHitKey(hit: Pick<PulseHitRecord, "targetType" | "targetId">): string {
   return `${hit.targetType}:${hit.targetId}`;
 }
 
@@ -190,7 +206,12 @@ function graphEdgePulseKeys(record: GraphEdge): string[] {
 }
 
 function withoutCurrentPulse<T extends GraphNode | GraphEdge>(record: T): T {
-  const { pulseScore: _pulseScore, pulseRole: _pulseRole, ...rest } = record;
+  const {
+    pulseActive: _pulseActive,
+    pulseScore: _pulseScore,
+    pulseRole: _pulseRole,
+    ...rest
+  } = record as T & PulseDecorated;
   return rest as T;
 }
 
@@ -202,18 +223,26 @@ function revealPulseGraph(
   revealCount: number,
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
   if (mode !== "current" || !pulse) return { nodes: graphNodes, edges: graphEdges };
-  const revealed = new Set(orderedPulseHits(pulse).slice(0, revealCount).map(pulseHitKey));
-  const nodes = graphNodes.map((record) =>
-    record.pulseRole && !revealed.has(graphNodePulseKey(record)) ? withoutCurrentPulse(record) : record,
-  );
+  const ordered = orderedPulseHits(pulse);
+  const revealedHits = ordered.slice(0, revealCount);
+  const revealed = new Set(revealedHits.map(pulseHitKey));
+  const activeHit = revealedHits.at(-1);
+  const activeKey = activeHit ? pulseHitKey(activeHit) : "";
+  const nodes = graphNodes.map((record) => {
+    const visible = record.pulseRole && !revealed.has(graphNodePulseKey(record)) ? withoutCurrentPulse(record) : record;
+    return activeKey === graphNodePulseKey(record) && visible.pulseRole ? withPulseActive(visible) : visible;
+  });
   const edges = graphEdges.map((record) => {
     const keys = graphEdgePulseKeys(record);
     const edgeIsRevealed = keys.some((key) => revealed.has(key));
     if (record.pulseRole && !edgeIsRevealed) return withoutCurrentPulse(record);
+    let next = record;
     if (!record.pulseRole && record.edgeType === "evidence" && revealed.has(`node:${record.source}`) && revealed.has(`chunk:${record.target}`)) {
-      return { ...record, pulseRole: "expanded" as const, pulseScore: 0.32 };
+      next = { ...record, pulseRole: "expanded" as const, pulseScore: 0.32 };
     }
-    return record;
+    const relationIsActive = graphEdgePulseKeys(next).some((key) => key === activeKey);
+    const evidenceIsActive = next.edgeType === "evidence" && activeKey === `chunk:${next.target}` && revealed.has(`node:${next.source}`);
+    return (relationIsActive || evidenceIsActive) && next.pulseRole ? withPulseActive(next) : next;
   });
   return { nodes, edges };
 }
@@ -329,6 +358,7 @@ function visualNodes(
         record.nodeType === "chunk" ? "flow-chunk" : record.data.level === 2 ? "flow-theme" : `flow-${record.data.kind}`,
         record.focusRole === "match" ? "flow-aspect-match" : record.focusRole ? "flow-context" : "",
         pulseTraceClass(record, pulseMode),
+        pulseMode === "current" && isPulseActive(record) ? "flow-pulse-active" : "",
       ].filter(Boolean).join(" "),
       style: {
         width: record.nodeType === "chunk" ? 250 : record.data.level === 2 ? 245 : 210,
@@ -414,18 +444,21 @@ function displayEdges(records: GraphEdge[], layout: LayoutMode, pulseMode: Pulse
     const status = record.relation?.status;
     const baseStroke = record.edgeType === "evidence" ? "#56627c" : record.edgeType === "membership" ? "#557d85" : relationColor(status ?? "manual");
     const pulseClass = pulseTraceClass(record, pulseMode);
+    const active = pulseMode === "current" && isPulseActive(record);
     const edge: VisualEdge = {
       id: record.id,
       source: record.source,
       target: record.target,
       type: layout === "network" ? "default" : "smoothstep",
       data: { entity: record },
-      animated: status === "suggested",
+      animated: status === "suggested" || active,
+      ...(active ? { className: "flow-pulse-active-edge" } : {}),
       style: {
         stroke: pulseTraceColor(record, pulseMode, baseStroke),
-        strokeWidth: record.pulseRole ? 3.5 : record.pulseStats ? 3 : record.aggregate ? 2.8 : record.edgeType === "evidence" ? 1.5 : 2,
+        strokeWidth: active ? 4.8 : record.pulseRole ? 3.5 : record.pulseStats ? 3 : record.aggregate ? 2.8 : record.edgeType === "evidence" ? 1.5 : 2,
         opacity: pulseClass === "flow-pulse-muted" ? 0.22 : 1,
-        ...(status === "suggested" || record.edgeType !== "relation" ? { strokeDasharray: "5 4" } : {}),
+        ...(active ? { strokeDasharray: "10 6", filter: "drop-shadow(0 0 7px #f8d26a)" } : {}),
+        ...(!active && (status === "suggested" || record.edgeType !== "relation") ? { strokeDasharray: "5 4" } : {}),
       },
       labelStyle: { fill: "#b5c5dd", fontSize: 12, fontWeight: 600 },
     };
@@ -478,6 +511,9 @@ export function GraphWorkspace({
   const [pulseRevealCount, setPulseRevealCount] = useState(0);
   const [pulsePlaying, setPulsePlaying] = useState(false);
   const [pulsing, setPulsing] = useState(false);
+  const [pulseStreamMessage, setPulseStreamMessage] = useState("");
+  const [pulseStreamHits, setPulseStreamHits] = useState<PulseStreamHitRecord[]>([]);
+  const [pulseDraftAnswer, setPulseDraftAnswer] = useState("");
   const currentPulseHits = useMemo(() => orderedPulseHits(currentPulse), [currentPulse]);
   const currentPulseStep = currentPulseHits[Math.max(0, Math.min(pulseRevealCount, currentPulseHits.length) - 1)];
   const revealedPulseTargets = useMemo(
@@ -532,7 +568,7 @@ export function GraphWorkspace({
     }
     const timer = window.setTimeout(() => {
       setPulseRevealCount((count) => Math.min(count + 1, currentPulseHits.length));
-    }, pulseRevealCount === 0 ? 650 : 1500);
+    }, pulseRevealCount === 0 ? pulseInitialRevealDelayMs : pulseRevealDelayMs);
     return () => window.clearTimeout(timer);
   }, [pulseMode, currentPulse?.pulse.id, pulsePlaying, pulseRevealCount, currentPulseHits.length]);
 
@@ -548,6 +584,9 @@ export function GraphWorkspace({
     setPulseMode("normal");
     setPulseRevealCount(0);
     setPulsePlaying(false);
+    setPulseStreamMessage("");
+    setPulseStreamHits([]);
+    setPulseDraftAnswer("");
     void api.pulses(libraryId).then(setPulseHistory).catch((cause: Error) => onError(cause.message));
   }, [libraryId, refreshKey]);
 
@@ -581,15 +620,54 @@ export function GraphWorkspace({
   const runPulse = async (event: FormEvent) => {
     event.preventDefault();
     if (!pulseQuestion.trim() || pulsing) return;
+    const question = pulseQuestion.trim();
     setPulsing(true);
+    setCurrentPulse(undefined);
+    setPulseMode("normal");
+    setPulseRevealCount(0);
+    setPulsePlaying(false);
+    setPulseStreamMessage("正在启动脉冲...");
+    setPulseStreamHits([]);
+    setPulseDraftAnswer("");
     try {
-      const response = await api.createPulse(libraryId, pulseQuestion, pulseInputMode);
-      setCurrentPulse(response);
-      setPulseHistory((history) => [response.pulse, ...history.filter((pulse) => pulse.id !== response.pulse.id)]);
-      setPulseMode("current");
-      setPulseRevealCount(0);
-      setPulsePlaying(true);
-      applyGraph(response.graph, layout, "current", 0, response);
+      await api.streamPulse(libraryId, question, pulseInputMode, (update) => {
+        if (update.type === "start") {
+          setPulseStreamMessage(update.mode === "progressive" ? "正在渐进式点亮图谱..." : "正在全量召回图谱...");
+          return;
+        }
+        if (update.type === "stage") {
+          setPulseStreamMessage(update.message);
+          return;
+        }
+        if (update.type === "hit") {
+          setPulseStreamHits((hits) => {
+            const key = pulseHitKey(update.hit);
+            const existing = hits.findIndex((hit) => pulseHitKey(hit) === key);
+            const next = existing >= 0 ? [...hits.slice(0, existing), update.hit, ...hits.slice(existing + 1)] : [...hits, update.hit];
+            return next.sort(sortPulseHits);
+          });
+          return;
+        }
+        if (update.type === "answer") {
+          setPulseDraftAnswer(update.answer);
+          setPulseStreamMessage("回答已生成，正在写入脉冲记录...");
+          return;
+        }
+        if (update.type === "done") {
+          const response = update.response;
+          setCurrentPulse(response);
+          setPulseHistory((history) => [response.pulse, ...history.filter((pulse) => pulse.id !== response.pulse.id)]);
+          setPulseMode("current");
+          setPulseRevealCount(0);
+          setPulsePlaying(true);
+          setPulseStreamMessage("");
+          setPulseStreamHits([]);
+          setPulseDraftAnswer("");
+          applyGraph(response.graph, layout, "current", 0, response);
+          return;
+        }
+        if (update.type === "error") throw new Error(update.message);
+      });
     } catch (cause) {
       onError((cause as Error).message);
     } finally {
@@ -601,11 +679,17 @@ export function GraphWorkspace({
     if (!pulseId) {
       setCurrentPulse(undefined);
       setPulseMode("normal");
+      setPulseStreamMessage("");
+      setPulseStreamHits([]);
+      setPulseDraftAnswer("");
       return;
     }
     try {
       const response = await api.pulse(libraryId, pulseId);
       setCurrentPulse(response);
+      setPulseStreamMessage("");
+      setPulseStreamHits([]);
+      setPulseDraftAnswer("");
       setPulseQuestion(response.pulse.question);
       setPulseInputMode(response.pulse.inputMode);
       setPulseMode("current");
@@ -795,6 +879,40 @@ export function GraphWorkspace({
           )}
         </div>
         <aside className="inspector">
+          {!currentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
+            <div className="pulse-panel pulse-stream-panel">
+              <div className="pulse-panel-heading">
+                <h3>脉冲生成中</h3>
+                <small>{pulseInputMode === "progressive" ? "渐进输入" : "全量输入"}</small>
+              </div>
+              <p className="pulse-question">{pulseQuestion}</p>
+              <div className="pulse-stream-status">
+                <span className="pulse-live-dot" />
+                <span>{pulseStreamMessage || "正在等待首个脉冲事件..."}</span>
+              </div>
+              {pulseDraftAnswer && (
+                <div className="pulse-draft-answer">
+                  <strong>已生成回答草稿</strong>
+                  <p>{pulseDraftAnswer}</p>
+                </div>
+              )}
+              <div className="pulse-hit-summary">
+                <span>已命中 {pulseStreamHits.length}</span>
+                <span>节点 {pulseStreamHits.filter((hit) => hit.targetType === "node").length}</span>
+                <span>关系 {pulseStreamHits.filter((hit) => hit.targetType === "relation").length}</span>
+                <span>证据 {pulseStreamHits.filter((hit) => hit.targetType === "chunk").length}</span>
+              </div>
+              <div className="pulse-hits pulse-stream-hits">
+                {pulseStreamHits.slice(0, 10).map((hit) => (
+                  <button type="button" key={pulseHitKey(hit)} disabled>
+                    <strong>{hit.label}</strong>
+                    <span>{hit.reason}</span>
+                    <small>{hit.pathRole} · {hit.score.toFixed(2)}</small>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {currentPulse && (
             <div className={`pulse-panel pulse-status-${currentPulse.pulse.status}`}>
               <div className="pulse-panel-heading">

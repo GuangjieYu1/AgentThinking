@@ -19,6 +19,7 @@ import type {
   Pulse,
   PulseInputMode,
   PulseResponse,
+  PulseStreamEvent,
   PublishedAnalysis,
   SourceStructure,
 } from "@agent-thinking/contracts";
@@ -150,6 +151,40 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ question, mode }),
     }),
+  streamPulse: async (
+    libraryId: string,
+    question: string,
+    mode: PulseInputMode = "full",
+    onEvent: (event: PulseStreamEvent) => void,
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    const response = await fetch(`/api/libraries/${libraryId}/pulses/stream`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question, mode }),
+      ...(signal ? { signal } : {}),
+    });
+    if (!response.ok || !response.body) {
+      const failure = await response.json().catch(() => ({ error: response.statusText })) as { error?: string };
+      throw new Error(failure.error ?? "脉冲流式请求失败");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      buffered += decoder.decode(value, { stream: !done });
+      const parts = buffered.split(/\r?\n\r?\n/);
+      buffered = done ? "" : parts.pop() ?? "";
+      for (const block of parts) {
+        for (const line of block.split(/\r?\n/)) {
+          if (!line.startsWith("data:")) continue;
+          onEvent(JSON.parse(line.slice(5).trim()) as PulseStreamEvent);
+        }
+      }
+      if (done) break;
+    }
+  },
   reviewPulse: (pulseId: string, status: "correct" | "wrong") =>
     request<PulseResponse>(`/pulses/${pulseId}/review`, {
       method: "PATCH",

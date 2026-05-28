@@ -274,6 +274,19 @@ export interface PulseHit {
   excerpt: string | null;
 }
 
+export interface PulseStreamHit {
+  targetType: PulseHitTargetType;
+  targetId: string;
+  score: number;
+  reason: string;
+  pathRole: PulsePathRole;
+  stepIndex: number | null;
+  observation: string | null;
+  rationale: string | null;
+  label: string;
+  excerpt: string | null;
+}
+
 export interface PulseStats {
   correctCount: number;
   wrongCount: number;
@@ -292,6 +305,14 @@ export interface PulseResponse {
   hits: PulseHit[];
   graph: GraphResponse;
 }
+
+export type PulseStreamEvent =
+  | { type: "start"; mode: PulseInputMode; question: string }
+  | { type: "stage"; message: string }
+  | { type: "hit"; hit: PulseStreamHit }
+  | { type: "answer"; answer: string; summary: string }
+  | { type: "done"; response: PulseResponse }
+  | { type: "error"; message: string };
 
 export interface PulseAnswerContext {
   mode?: PulseInputMode;

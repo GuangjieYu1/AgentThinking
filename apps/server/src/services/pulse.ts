@@ -4,11 +4,14 @@ import type {
   PulseInputMode,
   PulseNavigationCandidate,
   PulseResponse,
+  PulseStreamEvent,
   Relation,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
 import type { VectorStore } from "./vector-store.js";
+
+type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
 
 function clampScore(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -25,10 +28,27 @@ function relationLabel(relation: Relation, nodes: Map<string, AbstractNode>): st
   return `${source} ${relation.type} ${target}`;
 }
 
-function addHit(hits: Map<string, PendingPulseHit>, hit: PendingPulseHit): void {
+async function emitPulse(eventSink: PulseEventSink | undefined, event: PulseStreamEvent): Promise<void> {
+  if (eventSink) await eventSink(event);
+}
+
+function addHit(hits: Map<string, PendingPulseHit>, hit: PendingPulseHit): PendingPulseHit | undefined {
   const key = `${hit.targetType}:${hit.targetId}`;
   const previous = hits.get(key);
-  if (!previous || hit.score > previous.score) hits.set(key, hit);
+  if (!previous || hit.score > previous.score) {
+    hits.set(key, hit);
+    return hit;
+  }
+  return undefined;
+}
+
+async function recordHit(
+  hits: Map<string, PendingPulseHit>,
+  hit: PendingPulseHit,
+  eventSink?: PulseEventSink,
+): Promise<void> {
+  const accepted = addHit(hits, hit);
+  if (accepted) await emitPulse(eventSink, { type: "hit", hit: accepted });
 }
 
 function relationTouchesBridge(relation: Relation, directNodeIds: Set<string>, bridgeNodeIds: Set<string>): boolean {
@@ -43,24 +63,35 @@ export class PulseEngine {
     private readonly model: ModelProvider,
   ) {}
 
-  async create(libraryId: string, question: string, mode: PulseInputMode = "full"): Promise<PulseResponse> {
-    return mode === "progressive" ? this.createProgressive(libraryId, question) : this.createFull(libraryId, question);
+  async create(
+    libraryId: string,
+    question: string,
+    mode: PulseInputMode = "full",
+    eventSink?: PulseEventSink,
+  ): Promise<PulseResponse> {
+    await emitPulse(eventSink, { type: "start", mode, question });
+    const response = mode === "progressive"
+      ? await this.createProgressive(libraryId, question, eventSink)
+      : await this.createFull(libraryId, question, eventSink);
+    await emitPulse(eventSink, { type: "done", response });
+    return response;
   }
 
-  private async createFull(libraryId: string, question: string): Promise<PulseResponse> {
+  private async createFull(libraryId: string, question: string, eventSink?: PulseEventSink): Promise<PulseResponse> {
     if (!this.model.configured) throw new Error("脉冲问答需要配置模型服务");
     const hits = new Map<string, PendingPulseHit>();
     const chunks = new Map<string, Chunk>();
     const nodes = new Map<string, AbstractNode>();
     const relations = new Map<string, Relation>();
 
+    await emitPulse(eventSink, { type: "stage", message: "正在召回语义证据" });
     const [embedding] = await this.model.embed([question]);
     const semanticChunks = embedding ? this.vectors.search(libraryId, embedding, 8) : [];
     for (const result of semanticChunks) {
       if (result.score < 0.16) continue;
       const score = clampScore(0.58 + result.score * 0.34);
       chunks.set(result.chunk.id, result.chunk);
-      addHit(hits, {
+      await recordHit(hits, {
         targetType: "chunk",
         targetId: result.chunk.id,
         score,
@@ -71,13 +102,13 @@ export class PulseEngine {
         rationale: "该片段的向量相似度超过阈值，因此进入本次回答的证据集合。",
         label: chunkLabel(result.chunk),
         excerpt: result.chunk.text.slice(0, 220),
-      });
+      }, eventSink);
     }
 
     for (const result of this.db.searchText(libraryId, question, 8)) {
       const score = Math.max(0.72, clampScore(0.82 + result.score * 0.01));
       chunks.set(result.chunk.id, result.chunk);
-      addHit(hits, {
+      await recordHit(hits, {
         targetType: "chunk",
         targetId: result.chunk.id,
         score,
@@ -88,7 +119,7 @@ export class PulseEngine {
         rationale: "该片段包含问题中的显式词，因此用于补足语义召回可能漏掉的证据。",
         label: chunkLabel(result.chunk),
         excerpt: result.chunk.text.slice(0, 220),
-      });
+      }, eventSink);
     }
 
     const chunkNodeMap = this.db.getNodesForChunks(libraryId, [...chunks.keys()]);
@@ -96,7 +127,7 @@ export class PulseEngine {
       const chunkHit = hits.get(`chunk:${chunkId}`);
       for (const node of linkedNodes) {
         nodes.set(node.id, node);
-        addHit(hits, {
+        await recordHit(hits, {
           targetType: "node",
           targetId: node.id,
           score: Math.min(1, (chunkHit?.score ?? 0.66) + 0.08),
@@ -107,13 +138,13 @@ export class PulseEngine {
           rationale: "这个节点直接引用了已命中的 chunk，因此它是回答路径中的可追溯概念或命题。",
           label: node.title,
           excerpt: node.summary.slice(0, 220) || null,
-        });
+        }, eventSink);
       }
     }
 
     for (const result of this.db.searchAbstractNodes(libraryId, question, 10)) {
       nodes.set(result.node.id, result.node);
-      addHit(hits, {
+      await recordHit(hits, {
         targetType: "node",
         targetId: result.node.id,
         score: result.score,
@@ -124,7 +155,7 @@ export class PulseEngine {
         rationale: "该节点的标题或摘要命中了问题词，因此加入直接激活集合。",
         label: result.node.title,
         excerpt: result.node.summary.slice(0, 220) || null,
-      });
+      }, eventSink);
     }
 
     const directNodeIds = new Set(
@@ -165,7 +196,7 @@ export class PulseEngine {
       const target = this.db.getAbstractNode(relation.targetNodeId);
       if (source) nodes.set(source.id, source);
       if (target) nodes.set(target.id, target);
-      addHit(hits, {
+      await recordHit(hits, {
         targetType: "relation",
         targetId: relation.id,
         score: connectsDirects ? 0.72 : 0.58,
@@ -178,14 +209,14 @@ export class PulseEngine {
           : "这条关系连接直接节点和桥接节点，能把分散命中收束成一条路径。",
         label: relationLabel(relation, nodes),
         excerpt: relation.reason,
-      });
+      }, eventSink);
     }
 
     for (const nodeId of bridgeNodeIds) {
       const node = nodes.get(nodeId) ?? this.db.getAbstractNode(nodeId);
       if (!node || directNodeIds.has(node.id)) continue;
       nodes.set(node.id, node);
-      addHit(hits, {
+      await recordHit(hits, {
         targetType: "node",
         targetId: node.id,
         score: 0.62,
@@ -196,13 +227,13 @@ export class PulseEngine {
         rationale: "该节点同时邻接多个直接激活节点，因此被保留为桥接路径，而不是普通邻居。",
         label: node.title,
         excerpt: node.summary.slice(0, 220) || null,
-      });
+      }, eventSink);
     }
 
-    return this.finishPulse(libraryId, question, "full", hits, chunks, nodes, relations);
+    return this.finishPulse(libraryId, question, "full", hits, chunks, nodes, relations, eventSink);
   }
 
-  private async createProgressive(libraryId: string, question: string): Promise<PulseResponse> {
+  private async createProgressive(libraryId: string, question: string, eventSink?: PulseEventSink): Promise<PulseResponse> {
     if (!this.model.configured) throw new Error("脉冲问答需要配置模型服务");
     const hits = new Map<string, PendingPulseHit>();
     const chunks = new Map<string, Chunk>();
@@ -210,8 +241,9 @@ export class PulseEngine {
     const relations = new Map<string, Relation>();
     const visitedNodeIds = new Set<string>();
 
+    await emitPulse(eventSink, { type: "stage", message: "正在选择脉冲入口节点" });
     const rootNodes = this.db.listPulseRootNodes(libraryId, 24);
-    if (rootNodes.length === 0) return this.createFull(libraryId, question);
+    if (rootNodes.length === 0) return this.createFull(libraryId, question, eventSink);
 
     const rootDecision = await this.model.selectPulseNavigation(
       question,
@@ -225,7 +257,7 @@ export class PulseEngine {
     for (const node of firstFrontier) {
       nodes.set(node.id, node);
       visitedNodeIds.add(node.id);
-      addHit(hits, {
+      await recordHit(hits, {
         targetType: "node",
         targetId: node.id,
         score: 0.84,
@@ -236,16 +268,17 @@ export class PulseEngine {
         rationale: rootDecision.rationale,
         label: node.title,
         excerpt: node.summary.slice(0, 220) || null,
-      });
+      }, eventSink);
     }
 
     let frontier = firstFrontier;
     let stepIndex = 2;
     for (let depth = 0; depth < 3 && frontier.length > 0; depth += 1) {
+      await emitPulse(eventSink, { type: "stage", message: `正在展开第 ${depth + 1} 层脉冲路径` });
       for (const node of frontier) {
         for (const chunk of this.db.getNodeEvidenceChunks(node.id, 2)) {
           chunks.set(chunk.id, chunk);
-          addHit(hits, {
+          await recordHit(hits, {
             targetType: "chunk",
             targetId: chunk.id,
             score: Math.max(0.48, 0.74 - depth * 0.08),
@@ -256,7 +289,7 @@ export class PulseEngine {
             rationale: "该 chunk 是当前节点的来源证据，用来判断节点是否真的能支撑回答。",
             label: chunkLabel(chunk),
             excerpt: chunk.text.slice(0, 220),
-          });
+          }, eventSink);
         }
       }
 
@@ -288,7 +321,7 @@ export class PulseEngine {
           const target = nodes.get(entry.relation.targetNodeId) ?? this.db.getAbstractNode(entry.relation.targetNodeId);
           if (source) nodes.set(source.id, source);
           if (target) nodes.set(target.id, target);
-          addHit(hits, {
+          await recordHit(hits, {
             targetType: "relation",
             targetId: entry.relation.id,
             score: Math.max(0.46, 0.68 - depth * 0.08),
@@ -299,9 +332,9 @@ export class PulseEngine {
             rationale: `沿关系「${relationLabel(entry.relation, nodes)}」展开：${decision.rationale}`,
             label: relationLabel(entry.relation, nodes),
             excerpt: entry.relation.reason,
-          });
+          }, eventSink);
         }
-        addHit(hits, {
+        await recordHit(hits, {
           targetType: "node",
           targetId: node.id,
           score: Math.max(0.5, 0.78 - depth * 0.08),
@@ -312,14 +345,14 @@ export class PulseEngine {
           rationale: decision.rationale,
           label: node.title,
           excerpt: node.summary.slice(0, 220) || null,
-        });
+        }, eventSink);
         nextFrontier.push(node);
       }
       frontier = nextFrontier;
       stepIndex += 1;
     }
 
-    return this.finishPulse(libraryId, question, "progressive", hits, chunks, nodes, relations);
+    return this.finishPulse(libraryId, question, "progressive", hits, chunks, nodes, relations, eventSink);
   }
 
   private nodeCandidate(node: AbstractNode, score: number, relation?: Relation): PulseNavigationCandidate {
@@ -402,6 +435,7 @@ export class PulseEngine {
     chunks: Map<string, Chunk>,
     nodes: Map<string, AbstractNode>,
     relations: Map<string, Relation>,
+    eventSink?: PulseEventSink,
   ): Promise<PulseResponse> {
     const orderedHits = [...hits.values()]
       .sort((left, right) =>
@@ -410,6 +444,7 @@ export class PulseEngine {
         left.label.localeCompare(right.label, "zh-CN"),
       )
       .slice(0, 80);
+    await emitPulse(eventSink, { type: "stage", message: "正在根据脉冲路径生成回答" });
     const answer = await this.model.answerPulse(question, {
       mode,
       navigationTrace: orderedHits.map((hit, index) => ({
@@ -454,6 +489,8 @@ export class PulseEngine {
           }];
         }),
     });
+    await emitPulse(eventSink, { type: "answer", answer: answer.answer, summary: answer.summary });
+    await emitPulse(eventSink, { type: "stage", message: "正在保存脉冲结果" });
     const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits);
     const response = this.db.getPulseResponse(libraryId, pulse.id);
     if (!response) throw new Error("脉冲创建后读取失败");

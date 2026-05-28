@@ -31,6 +31,11 @@ function model(): ModelProvider {
     extract: async () => ({ nodes: [], relations: [] }),
     precheckStatement: async () => ({ status: "supported", reason: "ok", suggestions: [] }),
     answerPulse: async () => ({ answer: "ok", summary: "ok" }),
+    selectPulseNavigation: async (_question, _step, candidates) => ({
+      selectedIds: candidates.slice(0, 1).map((candidate) => candidate.id),
+      observation: "ok",
+      rationale: "ok",
+    }),
     stream: async function* () { yield { type: "content", text: "ok" }; },
     test: async () => ({ ok: true, provider: "test", message: "ok" }),
   };

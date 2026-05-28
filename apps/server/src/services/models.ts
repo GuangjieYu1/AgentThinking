@@ -6,9 +6,11 @@ import type {
   ModelTestResult,
   PulseAnswerContext,
   PulseAnswerOutput,
+  PulseNavigationCandidate,
+  PulseNavigationDecision,
   StatementPrecheckOutput,
 } from "@agent-thinking/contracts";
-import { extractionSchema, pulseAnswerSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
+import { extractionSchema, pulseAnswerSchema, pulseNavigationDecisionSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 
 export interface ModelProvider {
@@ -18,6 +20,7 @@ export interface ModelProvider {
   extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>): Promise<ExtractionOutput>;
   precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput>;
   answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput>;
+  selectPulseNavigation(question: string, step: string, candidates: PulseNavigationCandidate[]): Promise<PulseNavigationDecision>;
   stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }>;
   test(): Promise<ModelTestResult>;
 }
@@ -123,6 +126,29 @@ export class FakeModelProvider implements ModelProvider {
     return {
       answer: `演示脉冲回答：问题“${question}”主要激活了 ${topNodes}。相关证据包括：${topChunks}`,
       summary: `激活 ${context.nodes.length} 个节点、${context.relations.length} 条关系、${context.chunks.length} 个证据片段。`,
+    };
+  }
+
+  async selectPulseNavigation(question: string, step: string, candidates: PulseNavigationCandidate[]): Promise<PulseNavigationDecision> {
+    const terms = question.normalize("NFKC").toLowerCase().split(/\s+/).filter(Boolean);
+    const ranked = candidates
+      .map((candidate) => {
+        const text = `${candidate.label} ${candidate.summary} ${candidate.relationLabel ?? ""} ${candidate.relationReason ?? ""}`
+          .normalize("NFKC")
+          .toLowerCase();
+        const matches = terms.filter((term) => text.includes(term)).length;
+        return { candidate, score: matches * 2 + candidate.score };
+      })
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 2)
+      .map((entry) => entry.candidate);
+    const selected = ranked.length > 0 ? ranked : candidates.slice(0, 1);
+    return {
+      selectedIds: selected.map((candidate) => candidate.id),
+      observation: `演示模式在“${step}”看到 ${candidates.length} 个候选：${candidates.slice(0, 5).map((candidate) => candidate.label).join("、")}。`,
+      rationale: selected.length > 0
+        ? `选择 ${selected.map((candidate) => candidate.label).join("、")}，因为它们与问题词或候选分数更接近。`
+        : "没有足够候选可继续展开。",
     };
   }
 
@@ -302,6 +328,52 @@ export class OpenAICompatibleProvider implements ModelProvider {
     );
     const raw = response.choices[0]?.message.content ?? "{}";
     return pulseAnswerSchema.parse(JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, "")));
+  }
+
+  async selectPulseNavigation(
+    question: string,
+    step: string,
+    candidates: PulseNavigationCandidate[],
+  ): Promise<PulseNavigationDecision> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Choose the next visible knowledge-graph node for a progressive retrieval pulse. " +
+            'Return JSON only: {"selectedIds":["..."],"observation":"...","rationale":"..."}. ' +
+            "selectedIds must come from the supplied candidates and include one to three ids. " +
+            "observation should state what information was visible at this step. " +
+            "rationale should be a concise, user-facing navigation reason based only on visible candidate labels, summaries, relation labels, and relation reasons. " +
+            "Do not reveal hidden chain-of-thought or private scratchpad reasoning; provide an auditable explanation instead.",
+        },
+        { role: "user", content: JSON.stringify({ question, step, candidates }) },
+      ],
+      max_tokens: 700,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const raw = response.choices[0]?.message.content ?? "{}";
+    const parsed = pulseNavigationDecisionSchema.parse(JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, "")));
+    const candidateIds = new Set(candidates.map((candidate) => candidate.id));
+    const selectedIds = parsed.selectedIds.filter((id) => candidateIds.has(id)).slice(0, 3);
+    if (selectedIds.length === 0 && candidates[0]) {
+      return {
+        selectedIds: [candidates[0].id],
+        observation: parsed.observation,
+        rationale: `${parsed.rationale}（模型返回的候选不在当前可见集合中，已回退到最高候选。）`,
+      };
+    }
+    return { ...parsed, selectedIds };
   }
 
   async *stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }> {

@@ -25,6 +25,7 @@ import type {
   OcrMode,
   Pulse,
   PulseHit,
+  PulseInputMode,
   PulseHitTargetType,
   PulsePathRole,
   PulseResponse,
@@ -143,6 +144,7 @@ function pulseFrom(r: Row): Pulse {
     question: String(r.question),
     answer: String(r.answer),
     summary: String(r.summary),
+    inputMode: String(r.input_mode ?? "full") as PulseInputMode,
     status: String(r.status) as PulseStatus,
     createdAt: String(r.created_at),
     reviewedAt: r.reviewed_at === null ? null : String(r.reviewed_at),
@@ -159,6 +161,9 @@ function pulseHitFrom(r: Row): PulseHit {
     score: Number(r.score),
     reason: String(r.reason),
     pathRole: String(r.path_role) as PulsePathRole,
+    stepIndex: r.step_index === null || r.step_index === undefined ? null : Number(r.step_index),
+    observation: r.observation === null || r.observation === undefined ? null : String(r.observation),
+    rationale: r.rationale === null || r.rationale === undefined ? null : String(r.rationale),
     label: String(r.label),
     excerpt: r.excerpt === null ? null : String(r.excerpt),
   };
@@ -376,6 +381,7 @@ export class AgentDatabase {
         question TEXT NOT NULL,
         answer TEXT NOT NULL,
         summary TEXT NOT NULL,
+        input_mode TEXT NOT NULL DEFAULT 'full' CHECK (input_mode IN ('full','progressive')),
         status TEXT NOT NULL CHECK (status IN ('unreviewed','correct','wrong')),
         reviewed_at TEXT,
         created_at TEXT NOT NULL
@@ -389,6 +395,9 @@ export class AgentDatabase {
         score REAL NOT NULL,
         reason TEXT NOT NULL,
         path_role TEXT NOT NULL CHECK (path_role IN ('direct','expanded','bridge')),
+        step_index INTEGER,
+        observation TEXT,
+        rationale TEXT,
         label TEXT NOT NULL,
         excerpt TEXT
       );
@@ -424,6 +433,10 @@ export class AgentDatabase {
     this.addColumn("analysis_statements", "precheck_suggestions_json", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("analysis_statements", "precheck_checked_at", "TEXT");
     this.addColumn("analysis_statements", "precheck_content_updated_at", "TEXT");
+    this.addColumn("pulses", "input_mode", "TEXT NOT NULL DEFAULT 'full'");
+    this.addColumn("pulse_hits", "step_index", "INTEGER");
+    this.addColumn("pulse_hits", "observation", "TEXT");
+    this.addColumn("pulse_hits", "rationale", "TEXT");
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
@@ -442,6 +455,7 @@ export class AgentDatabase {
     }
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (7, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (8, ?)").run(now());
+    this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (9, ?)").run(now());
   }
 
   private addColumn(table: string, column: string, definition: string): void {
@@ -981,6 +995,68 @@ export class AgentDatabase {
     return result;
   }
 
+  listPulseRootNodes(libraryId: string, limit: number): AbstractNode[] {
+    const themes = rows(
+      this.sql.prepare(`
+        SELECT n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+        FROM abstract_nodes n
+        WHERE n.library_id = ? AND n.level = 2
+        ORDER BY member_count DESC, n.updated_at DESC
+        LIMIT ?
+      `),
+      libraryId,
+      limit,
+    ).map((entry) => this.withNodeCitations(nodeFrom(entry)));
+    if (themes.length > 0) return themes;
+    return rows(
+      this.sql.prepare(`
+        SELECT n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+        FROM abstract_nodes n
+        WHERE n.library_id = ? AND n.level = 1
+        ORDER BY n.updated_at DESC
+        LIMIT ?
+      `),
+      libraryId,
+      limit,
+    ).map((entry) => this.withNodeCitations(nodeFrom(entry)));
+  }
+
+  getAbstractionChildren(parentNodeIds: string[]): Map<string, AbstractNode[]> {
+    const result = new Map<string, AbstractNode[]>();
+    if (parentNodeIds.length === 0) return result;
+    const placeholders = parentNodeIds.map(() => "?").join(",");
+    for (const entry of rows(
+      this.sql.prepare(`
+        SELECT m.parent_node_id, n.*, (SELECT COUNT(*) FROM abstraction_memberships child WHERE child.parent_node_id = n.id) AS member_count
+        FROM abstraction_memberships m
+        JOIN abstract_nodes n ON n.id = m.child_node_id
+        WHERE m.parent_node_id IN (${placeholders})
+        ORDER BY n.updated_at DESC
+      `),
+      ...parentNodeIds,
+    )) {
+      const parentId = String(entry.parent_node_id);
+      const children = result.get(parentId) ?? [];
+      children.push(this.withNodeCitations(nodeFrom(entry)));
+      result.set(parentId, children);
+    }
+    return result;
+  }
+
+  getNodeEvidenceChunks(nodeId: string, limit: number): Chunk[] {
+    return rows(
+      this.sql.prepare(`
+        SELECT c.* FROM abstract_node_evidence e
+        JOIN chunks c ON c.id = e.chunk_id
+        WHERE e.node_id = ?
+        ORDER BY c.ordinal
+        LIMIT ?
+      `),
+      nodeId,
+      limit,
+    ).map(chunkFrom);
+  }
+
   getIncidentRelations(libraryId: string, nodeIds: string[]): Relation[] {
     if (nodeIds.length === 0) return [];
     const placeholders = nodeIds.map(() => "?").join(",");
@@ -1271,24 +1347,32 @@ export class AgentDatabase {
     };
   }
 
-  createPulse(libraryId: string, question: string, answer: string, summary: string, hits: PendingPulseHit[]): Pulse {
+  createPulse(
+    libraryId: string,
+    question: string,
+    answer: string,
+    summary: string,
+    inputMode: PulseInputMode,
+    hits: PendingPulseHit[],
+  ): Pulse {
     const id = randomUUID();
     const timestamp = now();
     this.sql.exec("BEGIN");
     try {
       this.sql.prepare(`
-        INSERT INTO pulses (id, library_id, question, answer, summary, status, reviewed_at, created_at)
-        VALUES (?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
-      `).run(id, libraryId, question, answer, summary, timestamp);
+        INSERT INTO pulses (id, library_id, question, answer, summary, input_mode, status, reviewed_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
+      `).run(id, libraryId, question, answer, summary, inputMode, timestamp);
       const insertHit = this.sql.prepare(`
         INSERT INTO pulse_hits
-          (id, pulse_id, library_id, target_type, target_id, score, reason, path_role, label, excerpt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, pulse_id, library_id, target_type, target_id, score, reason, path_role, step_index, observation, rationale, label, excerpt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const hit of hits) {
         insertHit.run(
           randomUUID(), id, libraryId, hit.targetType, hit.targetId, hit.score,
-          hit.reason, hit.pathRole, hit.label, hit.excerpt ?? null,
+          hit.reason, hit.pathRole, hit.stepIndex ?? null, hit.observation ?? null, hit.rationale ?? null,
+          hit.label, hit.excerpt ?? null,
         );
       }
       this.sql.exec("COMMIT");
@@ -1742,6 +1826,28 @@ export class AgentDatabase {
             }
           }
         }
+      }
+    }
+
+    const abstractNodeIds = nodes.flatMap((node) => node.nodeType === "abstract" ? [node.id] : []);
+    if (abstractNodeIds.length > 1) {
+      const placeholders = abstractNodeIds.map(() => "?").join(",");
+      for (const membership of rows(
+        this.sql.prepare(`
+          SELECT parent_node_id, child_node_id FROM abstraction_memberships
+          WHERE parent_node_id IN (${placeholders}) AND child_node_id IN (${placeholders})
+        `),
+        ...abstractNodeIds,
+        ...abstractNodeIds,
+      )) {
+        const parentId = String(membership.parent_node_id);
+        const childId = String(membership.child_node_id);
+        addEdge({
+          id: `membership:${parentId}:${childId}`,
+          source: parentId,
+          target: childId,
+          edgeType: "membership",
+        });
       }
     }
 

@@ -283,6 +283,13 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 }
 .pulse-playback span { flex: 1; min-width: 80px; color: #f5cf6a; font-size: 12px; }
 .pulse-playback button { padding: 5px 7px; font-size: 12px; }
+.pulse-step-reason {
+  display: grid; gap: 6px; padding: 9px 10px; border-left: 3px solid #f5cf6a; border-radius: 7px; background: #161f31;
+  color: #d8e4f4 !important; font-size: 12px; line-height: 1.5;
+}
+.pulse-step-reason strong { color: #f5cf6a; }
+.pulse-step-reason p { margin: 0; color: #d8e4f4 !important; }
+.pulse-step-reason small { color: #aebed5; line-height: 1.45; }
 .pulse-hit-summary span {
   padding: 3px 7px; border-radius: 12px; background: #19263a; color: #9eb0ca; font-size: 11px;
 }

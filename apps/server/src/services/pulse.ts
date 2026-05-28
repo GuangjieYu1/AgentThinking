@@ -1,4 +1,11 @@
-import type { AbstractNode, Chunk, PulseHit, PulseResponse, Relation } from "@agent-thinking/contracts";
+import type {
+  AbstractNode,
+  Chunk,
+  PulseInputMode,
+  PulseNavigationCandidate,
+  PulseResponse,
+  Relation,
+} from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
 import type { VectorStore } from "./vector-store.js";
@@ -24,6 +31,11 @@ function addHit(hits: Map<string, PendingPulseHit>, hit: PendingPulseHit): void 
   if (!previous || hit.score > previous.score) hits.set(key, hit);
 }
 
+function relationTouchesBridge(relation: Relation, directNodeIds: Set<string>, bridgeNodeIds: Set<string>): boolean {
+  return (directNodeIds.has(relation.sourceNodeId) && bridgeNodeIds.has(relation.targetNodeId)) ||
+    (directNodeIds.has(relation.targetNodeId) && bridgeNodeIds.has(relation.sourceNodeId));
+}
+
 export class PulseEngine {
   constructor(
     private readonly db: AgentDatabase,
@@ -31,7 +43,11 @@ export class PulseEngine {
     private readonly model: ModelProvider,
   ) {}
 
-  async create(libraryId: string, question: string): Promise<PulseResponse> {
+  async create(libraryId: string, question: string, mode: PulseInputMode = "full"): Promise<PulseResponse> {
+    return mode === "progressive" ? this.createProgressive(libraryId, question) : this.createFull(libraryId, question);
+  }
+
+  private async createFull(libraryId: string, question: string): Promise<PulseResponse> {
     if (!this.model.configured) throw new Error("脉冲问答需要配置模型服务");
     const hits = new Map<string, PendingPulseHit>();
     const chunks = new Map<string, Chunk>();
@@ -41,6 +57,7 @@ export class PulseEngine {
     const [embedding] = await this.model.embed([question]);
     const semanticChunks = embedding ? this.vectors.search(libraryId, embedding, 8) : [];
     for (const result of semanticChunks) {
+      if (result.score < 0.16) continue;
       const score = clampScore(0.58 + result.score * 0.34);
       chunks.set(result.chunk.id, result.chunk);
       addHit(hits, {
@@ -49,6 +66,9 @@ export class PulseEngine {
         score,
         reason: "语义召回证据 chunk",
         pathRole: "direct",
+        stepIndex: 1,
+        observation: "全量模式先同时查看与问题语义接近的原文片段。",
+        rationale: "该片段的向量相似度超过阈值，因此进入本次回答的证据集合。",
         label: chunkLabel(result.chunk),
         excerpt: result.chunk.text.slice(0, 220),
       });
@@ -63,6 +83,9 @@ export class PulseEngine {
         score,
         reason: "关键词匹配证据 chunk",
         pathRole: "direct",
+        stepIndex: 1,
+        observation: "全量模式同时补充标题、原文中的关键词命中片段。",
+        rationale: "该片段包含问题中的显式词，因此用于补足语义召回可能漏掉的证据。",
         label: chunkLabel(result.chunk),
         excerpt: result.chunk.text.slice(0, 220),
       });
@@ -79,6 +102,9 @@ export class PulseEngine {
           score: Math.min(1, (chunkHit?.score ?? 0.66) + 0.08),
           reason: "节点引用了命中的证据 chunk",
           pathRole: "direct",
+          stepIndex: 2,
+          observation: "系统从已命中的原文证据回溯到引用它的抽象节点。",
+          rationale: "这个节点直接引用了已命中的 chunk，因此它是回答路径中的可追溯概念或命题。",
           label: node.title,
           excerpt: node.summary.slice(0, 220) || null,
         });
@@ -93,6 +119,9 @@ export class PulseEngine {
         score: result.score,
         reason: result.reason,
         pathRole: "direct",
+        stepIndex: 2,
+        observation: "系统额外检查节点标题和摘要是否直接匹配问题。",
+        rationale: "该节点的标题或摘要命中了问题词，因此加入直接激活集合。",
         label: result.node.title,
         excerpt: result.node.summary.slice(0, 220) || null,
       });
@@ -102,25 +131,15 @@ export class PulseEngine {
       [...hits.values()].filter((hit) => hit.targetType === "node" && hit.pathRole === "direct").map((hit) => hit.targetId),
     );
     const adjacentDirects = new Map<string, Set<string>>();
-    for (const relation of this.db.getIncidentRelations(libraryId, [...directNodeIds])) {
-      relations.set(relation.id, relation);
+    const incidentRelations = this.db.getIncidentRelations(libraryId, [...directNodeIds]);
+    for (const relation of incidentRelations) {
+      const sourceDirect = directNodeIds.has(relation.sourceNodeId);
+      const targetDirect = directNodeIds.has(relation.targetNodeId);
+      if (!sourceDirect && !targetDirect) continue;
       const source = this.db.getAbstractNode(relation.sourceNodeId);
       const target = this.db.getAbstractNode(relation.targetNodeId);
       if (source) nodes.set(source.id, source);
       if (target) nodes.set(target.id, target);
-      const sourceDirect = directNodeIds.has(relation.sourceNodeId);
-      const targetDirect = directNodeIds.has(relation.targetNodeId);
-      const role = sourceDirect && targetDirect ? "bridge" : "expanded";
-      const relationScore = role === "bridge" ? 0.72 : 0.42;
-      addHit(hits, {
-        targetType: "relation",
-        targetId: relation.id,
-        score: relationScore,
-        reason: role === "bridge" ? "连接两个直接激活节点" : "由直接激活节点扩展的一跳关系",
-        pathRole: role,
-        label: relationLabel(relation, nodes),
-        excerpt: relation.reason,
-      });
       for (const [nodeId, oppositeId] of [
         [relation.sourceNodeId, relation.targetNodeId],
         [relation.targetNodeId, relation.sourceNodeId],
@@ -132,25 +151,274 @@ export class PulseEngine {
         }
       }
     }
+    const bridgeNodeIds = new Set(
+      [...adjacentDirects.entries()].filter(([, directNeighbors]) => directNeighbors.size > 1).map(([nodeId]) => nodeId),
+    );
+    for (const relation of incidentRelations) {
+      const sourceDirect = directNodeIds.has(relation.sourceNodeId);
+      const targetDirect = directNodeIds.has(relation.targetNodeId);
+      const connectsDirects = sourceDirect && targetDirect;
+      const connectsBridge = relationTouchesBridge(relation, directNodeIds, bridgeNodeIds);
+      if (!connectsDirects && !connectsBridge) continue;
+      relations.set(relation.id, relation);
+      const source = this.db.getAbstractNode(relation.sourceNodeId);
+      const target = this.db.getAbstractNode(relation.targetNodeId);
+      if (source) nodes.set(source.id, source);
+      if (target) nodes.set(target.id, target);
+      addHit(hits, {
+        targetType: "relation",
+        targetId: relation.id,
+        score: connectsDirects ? 0.72 : 0.58,
+        reason: connectsDirects ? "连接两个直接激活节点" : "连接直接激活节点与桥接路径",
+        pathRole: "bridge",
+        stepIndex: 3,
+        observation: "系统检查直接激活节点之间是否存在可见关系或必要桥接路径。",
+        rationale: connectsDirects
+          ? "这条关系直接连接两个已激活节点，能解释它们为什么被同一次脉冲连在一起。"
+          : "这条关系连接直接节点和桥接节点，能把分散命中收束成一条路径。",
+        label: relationLabel(relation, nodes),
+        excerpt: relation.reason,
+      });
+    }
 
-    for (const [nodeId, directNeighbors] of adjacentDirects) {
+    for (const nodeId of bridgeNodeIds) {
       const node = nodes.get(nodeId) ?? this.db.getAbstractNode(nodeId);
       if (!node || directNodeIds.has(node.id)) continue;
       nodes.set(node.id, node);
-      const role = directNeighbors.size > 1 ? "bridge" : "expanded";
       addHit(hits, {
         targetType: "node",
         targetId: node.id,
-        score: role === "bridge" ? 0.62 : 0.36,
-        reason: role === "bridge" ? "位于多个直接激活节点之间的桥接路径" : "由直接激活节点扩展的一跳上下文",
-        pathRole: role,
+        score: 0.62,
+        reason: "位于多个直接激活节点之间的桥接路径",
+        pathRole: "bridge",
+        stepIndex: 3,
+        observation: "系统寻找能把多个直接激活节点连起来的中间节点。",
+        rationale: "该节点同时邻接多个直接激活节点，因此被保留为桥接路径，而不是普通邻居。",
         label: node.title,
         excerpt: node.summary.slice(0, 220) || null,
       });
     }
 
-    const orderedHits = [...hits.values()].sort((left, right) => right.score - left.score).slice(0, 80);
+    return this.finishPulse(libraryId, question, "full", hits, chunks, nodes, relations);
+  }
+
+  private async createProgressive(libraryId: string, question: string): Promise<PulseResponse> {
+    if (!this.model.configured) throw new Error("脉冲问答需要配置模型服务");
+    const hits = new Map<string, PendingPulseHit>();
+    const chunks = new Map<string, Chunk>();
+    const nodes = new Map<string, AbstractNode>();
+    const relations = new Map<string, Relation>();
+    const visitedNodeIds = new Set<string>();
+
+    const rootNodes = this.db.listPulseRootNodes(libraryId, 24);
+    if (rootNodes.length === 0) return this.createFull(libraryId, question);
+
+    const rootDecision = await this.model.selectPulseNavigation(
+      question,
+      "第 1 步：从可见根节点中选择入口",
+      rootNodes.map((node) => this.nodeCandidate(node, 0.72)),
+    );
+    const selectedRoots = rootDecision.selectedIds
+      .flatMap((id) => rootNodes.find((node) => node.id === id) ?? [])
+      .slice(0, 3);
+    const firstFrontier = selectedRoots.length > 0 ? selectedRoots : rootNodes.slice(0, 1);
+    for (const node of firstFrontier) {
+      nodes.set(node.id, node);
+      visitedNodeIds.add(node.id);
+      addHit(hits, {
+        targetType: "node",
+        targetId: node.id,
+        score: 0.84,
+        reason: "渐进式根节点选择",
+        pathRole: "direct",
+        stepIndex: 1,
+        observation: rootDecision.observation,
+        rationale: rootDecision.rationale,
+        label: node.title,
+        excerpt: node.summary.slice(0, 220) || null,
+      });
+    }
+
+    let frontier = firstFrontier;
+    let stepIndex = 2;
+    for (let depth = 0; depth < 3 && frontier.length > 0; depth += 1) {
+      for (const node of frontier) {
+        for (const chunk of this.db.getNodeEvidenceChunks(node.id, 2)) {
+          chunks.set(chunk.id, chunk);
+          addHit(hits, {
+            targetType: "chunk",
+            targetId: chunk.id,
+            score: Math.max(0.48, 0.74 - depth * 0.08),
+            reason: "当前节点的原文证据",
+            pathRole: "direct",
+            stepIndex,
+            observation: `展开「${node.title}」后，系统查看这个节点引用的原文证据。`,
+            rationale: "该 chunk 是当前节点的来源证据，用来判断节点是否真的能支撑回答。",
+            label: chunkLabel(chunk),
+            excerpt: chunk.text.slice(0, 220),
+          });
+        }
+      }
+
+      const childCandidates = this.childCandidates(frontier, visitedNodeIds);
+      const relationCandidates = this.relationCandidates(libraryId, frontier, visitedNodeIds, nodes, relations);
+      const candidates = [...childCandidates, ...relationCandidates]
+        .sort((left, right) => right.candidate.score - left.candidate.score)
+        .slice(0, 24);
+      if (candidates.length === 0) break;
+
+      const decision = await this.model.selectPulseNavigation(
+        question,
+        `第 ${stepIndex + 1} 步：展开 ${frontier.map((node) => node.title).join("、")} 的相邻信息`,
+        candidates.map((entry) => entry.candidate),
+      );
+      const selected = decision.selectedIds
+        .flatMap((id) => candidates.find((entry) => entry.node.id === id) ?? [])
+        .slice(0, 3);
+      if (selected.length === 0) break;
+      stepIndex += 1;
+      const nextFrontier: AbstractNode[] = [];
+      for (const entry of selected) {
+        const node = entry.node;
+        nodes.set(node.id, node);
+        visitedNodeIds.add(node.id);
+        if (entry.relation) {
+          relations.set(entry.relation.id, entry.relation);
+          const source = nodes.get(entry.relation.sourceNodeId) ?? this.db.getAbstractNode(entry.relation.sourceNodeId);
+          const target = nodes.get(entry.relation.targetNodeId) ?? this.db.getAbstractNode(entry.relation.targetNodeId);
+          if (source) nodes.set(source.id, source);
+          if (target) nodes.set(target.id, target);
+          addHit(hits, {
+            targetType: "relation",
+            targetId: entry.relation.id,
+            score: Math.max(0.46, 0.68 - depth * 0.08),
+            reason: "渐进式展开关系",
+            pathRole: "bridge",
+            stepIndex,
+            observation: decision.observation,
+            rationale: `沿关系「${relationLabel(entry.relation, nodes)}」展开：${decision.rationale}`,
+            label: relationLabel(entry.relation, nodes),
+            excerpt: entry.relation.reason,
+          });
+        }
+        addHit(hits, {
+          targetType: "node",
+          targetId: node.id,
+          score: Math.max(0.5, 0.78 - depth * 0.08),
+          reason: entry.relation ? "渐进式邻接节点选择" : "主题下钻成员选择",
+          pathRole: "direct",
+          stepIndex,
+          observation: decision.observation,
+          rationale: decision.rationale,
+          label: node.title,
+          excerpt: node.summary.slice(0, 220) || null,
+        });
+        nextFrontier.push(node);
+      }
+      frontier = nextFrontier;
+      stepIndex += 1;
+    }
+
+    return this.finishPulse(libraryId, question, "progressive", hits, chunks, nodes, relations);
+  }
+
+  private nodeCandidate(node: AbstractNode, score: number, relation?: Relation): PulseNavigationCandidate {
+    return {
+      id: node.id,
+      label: node.title,
+      summary: node.summary.slice(0, 500),
+      score,
+      ...(relation ? {
+        relationLabel: relationLabel(relation, new Map([[node.id, node]])),
+        relationReason: relation.reason,
+      } : {}),
+    };
+  }
+
+  private childCandidates(
+    frontier: AbstractNode[],
+    visitedNodeIds: Set<string>,
+  ): Array<{ candidate: PulseNavigationCandidate; node: AbstractNode; relation?: Relation }> {
+    const childrenByParent = this.db.getAbstractionChildren(frontier.filter((node) => node.level === 2).map((node) => node.id));
+    const candidates: Array<{ candidate: PulseNavigationCandidate; node: AbstractNode; relation?: Relation }> = [];
+    for (const parent of frontier) {
+      for (const child of childrenByParent.get(parent.id) ?? []) {
+        if (visitedNodeIds.has(child.id)) continue;
+        candidates.push({
+          node: child,
+          candidate: {
+            id: child.id,
+            label: child.title,
+            summary: child.summary.slice(0, 500),
+            score: 0.7,
+            relationLabel: `主题「${parent.title}」包含该节点`,
+            relationReason: "该节点是当前主题的成员，可作为下一层细节展开。",
+          },
+        });
+      }
+    }
+    return candidates;
+  }
+
+  private relationCandidates(
+    libraryId: string,
+    frontier: AbstractNode[],
+    visitedNodeIds: Set<string>,
+    nodes: Map<string, AbstractNode>,
+    relations: Map<string, Relation>,
+  ): Array<{ candidate: PulseNavigationCandidate; node: AbstractNode; relation: Relation }> {
+    const candidates: Array<{ candidate: PulseNavigationCandidate; node: AbstractNode; relation: Relation }> = [];
+    for (const relation of this.db.getIncidentRelations(libraryId, frontier.map((node) => node.id))) {
+      const frontierIds = new Set(frontier.map((node) => node.id));
+      const nextId = frontierIds.has(relation.sourceNodeId) ? relation.targetNodeId
+        : frontierIds.has(relation.targetNodeId) ? relation.sourceNodeId
+          : undefined;
+      if (!nextId || visitedNodeIds.has(nextId)) continue;
+      const node = this.db.getAbstractNode(nextId);
+      if (!node || node.libraryId !== libraryId) continue;
+      nodes.set(node.id, node);
+      relations.set(relation.id, relation);
+      candidates.push({
+        node,
+        relation,
+        candidate: {
+          id: node.id,
+          label: node.title,
+          summary: node.summary.slice(0, 500),
+          score: Math.max(0.45, relation.confidence ?? 0.6),
+          relationLabel: relationLabel(relation, nodes),
+          relationReason: relation.reason,
+        },
+      });
+    }
+    return candidates;
+  }
+
+  private async finishPulse(
+    libraryId: string,
+    question: string,
+    mode: PulseInputMode,
+    hits: Map<string, PendingPulseHit>,
+    chunks: Map<string, Chunk>,
+    nodes: Map<string, AbstractNode>,
+    relations: Map<string, Relation>,
+  ): Promise<PulseResponse> {
+    const orderedHits = [...hits.values()]
+      .sort((left, right) =>
+        (left.stepIndex ?? 999) - (right.stepIndex ?? 999) ||
+        right.score - left.score ||
+        left.label.localeCompare(right.label, "zh-CN"),
+      )
+      .slice(0, 80);
     const answer = await this.model.answerPulse(question, {
+      mode,
+      navigationTrace: orderedHits.map((hit, index) => ({
+        stepIndex: hit.stepIndex ?? index + 1,
+        targetType: hit.targetType,
+        label: hit.label,
+        observation: hit.observation ?? hit.reason,
+        rationale: hit.rationale ?? hit.reason,
+      })),
       chunks: orderedHits
         .filter((hit) => hit.targetType === "chunk")
         .flatMap((hit) => {
@@ -186,7 +454,7 @@ export class PulseEngine {
           }];
         }),
     });
-    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, orderedHits);
+    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits);
     const response = this.db.getPulseResponse(libraryId, pulse.id);
     if (!response) throw new Error("脉冲创建后读取失败");
     return response;

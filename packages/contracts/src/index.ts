@@ -22,6 +22,7 @@ export const statementPrecheckStatuses = [
 export const pulseStatuses = ["unreviewed", "correct", "wrong"] as const;
 export const pulseHitTargetTypes = ["node", "relation", "chunk"] as const;
 export const pulsePathRoles = ["direct", "expanded", "bridge"] as const;
+export const pulseInputModes = ["full", "progressive"] as const;
 export const jobStages = [
   "queued",
   "parsing",
@@ -48,6 +49,7 @@ export type StatementPrecheckStatus = (typeof statementPrecheckStatuses)[number]
 export type PulseStatus = (typeof pulseStatuses)[number];
 export type PulseHitTargetType = (typeof pulseHitTargetTypes)[number];
 export type PulsePathRole = (typeof pulsePathRoles)[number];
+export type PulseInputMode = (typeof pulseInputModes)[number];
 export type JobStage = (typeof jobStages)[number];
 export type OcrMode = (typeof ocrModes)[number];
 
@@ -250,6 +252,7 @@ export interface Pulse {
   question: string;
   answer: string;
   summary: string;
+  inputMode: PulseInputMode;
   status: PulseStatus;
   createdAt: string;
   reviewedAt: string | null;
@@ -264,6 +267,9 @@ export interface PulseHit {
   score: number;
   reason: string;
   pathRole: PulsePathRole;
+  stepIndex: number | null;
+  observation: string | null;
+  rationale: string | null;
   label: string;
   excerpt: string | null;
 }
@@ -288,6 +294,14 @@ export interface PulseResponse {
 }
 
 export interface PulseAnswerContext {
+  mode?: PulseInputMode;
+  navigationTrace?: Array<{
+    stepIndex: number;
+    targetType: PulseHitTargetType;
+    label: string;
+    observation: string;
+    rationale: string;
+  }>;
   chunks: Array<{ id: string; text: string; score: number; headingPath: string | null; pageNumber: number | null }>;
   nodes: Array<{ id: string; title: string; summary: string; score: number }>;
   relations: Array<{ id: string; type: RelationType; sourceTitle: string; targetTitle: string; reason: string; score: number }>;
@@ -296,6 +310,21 @@ export interface PulseAnswerContext {
 export interface PulseAnswerOutput {
   answer: string;
   summary: string;
+}
+
+export interface PulseNavigationCandidate {
+  id: string;
+  label: string;
+  summary: string;
+  score: number;
+  relationLabel?: string;
+  relationReason?: string;
+}
+
+export interface PulseNavigationDecision {
+  selectedIds: string[];
+  observation: string;
+  rationale: string;
 }
 
 export interface PublishedAnalysis {
@@ -373,6 +402,7 @@ export type UpdateNodeAspectsInput = z.infer<typeof updateNodeAspectsSchema>;
 
 export const createPulseSchema = z.object({
   question: z.string().trim().min(1).max(1000),
+  mode: z.enum(pulseInputModes).optional().default("full"),
 });
 export type CreatePulseInput = z.infer<typeof createPulseSchema>;
 
@@ -420,6 +450,13 @@ export const pulseAnswerSchema = z.object({
   summary: z.string().trim().min(1).max(1000),
 });
 export type PulseAnswerSchemaOutput = z.infer<typeof pulseAnswerSchema>;
+
+export const pulseNavigationDecisionSchema = z.object({
+  selectedIds: z.array(z.string().trim().min(1)).min(1).max(3),
+  observation: z.string().trim().min(1).max(800),
+  rationale: z.string().trim().min(1).max(800),
+});
+export type PulseNavigationDecisionSchemaOutput = z.infer<typeof pulseNavigationDecisionSchema>;
 
 export const searchSchema = z.object({
   query: z.string().trim().min(1).max(1000),

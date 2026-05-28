@@ -264,8 +264,8 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request, reply) => {
     requireLibrary(db, request.params.libraryId);
-    const { question } = createPulseSchema.parse(request.body);
-    return reply.status(201).send(await pulseEngine.create(request.params.libraryId, question));
+    const { question, mode } = createPulseSchema.parse(request.body);
+    return reply.status(201).send(await pulseEngine.create(request.params.libraryId, question, mode));
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request) => {
     requireLibrary(db, request.params.libraryId);

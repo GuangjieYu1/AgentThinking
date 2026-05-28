@@ -17,6 +17,7 @@ import type {
   ModelStreamEvent,
   ModelTestResult,
   Pulse,
+  PulseInputMode,
   PulseResponse,
   PublishedAnalysis,
   SourceStructure,
@@ -144,10 +145,10 @@ export const api = {
     }),
   pulses: (libraryId: string) => request<Pulse[]>(`/libraries/${libraryId}/pulses`),
   pulse: (libraryId: string, pulseId: string) => request<PulseResponse>(`/libraries/${libraryId}/pulses/${pulseId}`),
-  createPulse: (libraryId: string, question: string) =>
+  createPulse: (libraryId: string, question: string, mode: PulseInputMode = "full") =>
     request<PulseResponse>(`/libraries/${libraryId}/pulses`, {
       method: "POST",
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, mode }),
     }),
   reviewPulse: (pulseId: string, status: "correct" | "wrong") =>
     request<PulseResponse>(`/pulses/${pulseId}/review`, {

@@ -7,6 +7,7 @@ import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
 import {
   createLibrarySchema,
+  createPulseSchema,
   createRelationSchema,
   addStatementEvidenceSchema,
   aspectKinds,
@@ -14,6 +15,7 @@ import {
   modelStreamSchema,
   relationStatuses,
   relationTypes,
+  reviewPulseSchema,
   searchSchema,
   updateAbstractNodeSchema,
   updateNodeAspectsSchema,
@@ -32,6 +34,7 @@ import type { ModelProvider } from "./services/models.js";
 import { IngestionQueue } from "./services/ingestion.js";
 import { VectorStore } from "./services/vector-store.js";
 import { AnalysisPublisher } from "./services/analysis.js";
+import { PulseEngine } from "./services/pulse.js";
 
 export interface AppServices {
   config: AppConfig;
@@ -49,6 +52,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   const app = Fastify({ logger: true, bodyLimit: 4 * 1024 * 1024 });
   const { config, db, vectors, model, queue } = services;
   const publisher = new AnalysisPublisher(db, config);
+  const pulseEngine = new PulseEngine(db, vectors, model);
   await app.register(cors, { origin: true });
   await app.register(multipart, { limits: { files: 100, fileSize: 60 * 1024 * 1024 } });
 
@@ -217,7 +221,17 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
 
   app.get<{
     Params: { libraryId: string };
-    Querystring: { centerId?: string; includeChunks?: string; status?: string; type?: string; limit?: string; view?: string; aspect?: string };
+    Querystring: {
+      centerId?: string;
+      includeChunks?: string;
+      status?: string;
+      type?: string;
+      limit?: string;
+      view?: string;
+      aspect?: string;
+      pulseId?: string;
+      pulseStats?: string;
+    };
   }>("/api/libraries/:libraryId/graph", async (request) => {
     requireLibrary(db, request.params.libraryId);
     const status = relationStatuses.includes(request.query.status as RelationStatus)
@@ -237,6 +251,8 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       limit: Number(request.query.limit ?? 150),
       view: request.query.view === "overview" ? "overview" : "detail",
       ...(aspect ? { aspect } : {}),
+      ...(request.query.pulseId ? { pulseId: request.query.pulseId } : {}),
+      pulseStats: request.query.pulseStats === "true",
     });
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/search", async (request) => {
@@ -245,6 +261,28 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     if (!model.configured) throw new Error("语义搜索需要配置模型服务");
     const [embedding] = await model.embed([query]);
     return vectors.search(request.params.libraryId, embedding ?? [], limit);
+  });
+  app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId);
+    const { question } = createPulseSchema.parse(request.body);
+    return reply.status(201).send(await pulseEngine.create(request.params.libraryId, question));
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request) => {
+    requireLibrary(db, request.params.libraryId);
+    return db.listPulses(request.params.libraryId);
+  });
+  app.get<{ Params: { libraryId: string; pulseId: string } }>("/api/libraries/:libraryId/pulses/:pulseId", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId);
+    const response = db.getPulseResponse(request.params.libraryId, request.params.pulseId);
+    if (!response) return reply.status(404).send({ error: "脉冲不存在" });
+    return response;
+  });
+  app.patch<{ Params: { pulseId: string } }>("/api/pulses/:pulseId/review", async (request, reply) => {
+    const { status } = reviewPulseSchema.parse(request.body);
+    const pulse = db.reviewPulse(request.params.pulseId, status);
+    const response = db.getPulseResponse(pulse.libraryId, pulse.id);
+    if (!response) return reply.status(404).send({ error: "脉冲不存在" });
+    return reply.send(response);
   });
 
   app.patch<{ Params: { nodeId: string } }>("/api/nodes/:nodeId", async (request) => {

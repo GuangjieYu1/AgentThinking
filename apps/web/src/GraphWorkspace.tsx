@@ -26,6 +26,8 @@ import {
   type GraphNode,
   type GraphResponse,
   type GraphView,
+  type Pulse,
+  type PulseResponse,
   type Relation,
   type RelationStatus,
   type RelationType,
@@ -36,6 +38,8 @@ import { api } from "./api";
 type VisualNode = Node<{ label: ReactNode; entity: GraphNode }>;
 type VisualEdge = Edge<{ entity: GraphEdge }>;
 type LayoutMode = "layered" | "network" | "tree";
+type PulseLayerMode = "normal" | "current" | "stats" | "wrong" | "correct";
+type PulseHitRecord = PulseResponse["hits"][number];
 interface LayoutLink {
   source: string;
   target: string;
@@ -60,6 +64,85 @@ function relationColor(status: RelationStatus): string {
   if (status === "accepted") return "#43cca0";
   if (status === "manual") return "#48a9ff";
   return "#64748b";
+}
+
+function pulseTraceClass(record: GraphNode | GraphEdge, mode: PulseLayerMode): string {
+  if (mode === "normal") return "";
+  if (mode === "current") {
+    if (!record.pulseRole) return "flow-pulse-muted";
+    return `flow-pulse-${record.pulseRole}`;
+  }
+  const stats = record.pulseStats;
+  if (!stats) return "flow-pulse-muted";
+  if (mode === "wrong") return stats.wrongCount > 0 ? "flow-pulse-wrong" : "flow-pulse-muted";
+  if (mode === "correct") return stats.correctCount > 0 ? "flow-pulse-correct" : "flow-pulse-muted";
+  if (stats.wrongCount > stats.correctCount) return "flow-pulse-wrong";
+  if (stats.correctCount > stats.wrongCount) return "flow-pulse-correct";
+  return "flow-pulse-mixed";
+}
+
+function pulseTraceColor(record: GraphEdge, mode: PulseLayerMode, fallback: string): string {
+  const className = pulseTraceClass(record, mode);
+  if (className === "flow-pulse-direct") return "#f8d26a";
+  if (className === "flow-pulse-bridge") return "#c6a2ff";
+  if (className === "flow-pulse-expanded") return "#7db8ff";
+  if (className === "flow-pulse-wrong") return "#ef5f7a";
+  if (className === "flow-pulse-correct") return "#4bd493";
+  if (className === "flow-pulse-mixed") return "#e7b84d";
+  return fallback;
+}
+
+const pulseRoleRank = { direct: 0, bridge: 1, expanded: 2 } satisfies Record<NonNullable<GraphNode["pulseRole"]>, number>;
+
+function orderedPulseHits(response: PulseResponse | undefined): PulseHitRecord[] {
+  if (!response) return [];
+  return [...response.hits].sort((left, right) =>
+    pulseRoleRank[left.pathRole] - pulseRoleRank[right.pathRole] ||
+    right.score - left.score ||
+    left.label.localeCompare(right.label, "zh-CN"),
+  );
+}
+
+function pulseHitKey(hit: PulseHitRecord): string {
+  return `${hit.targetType}:${hit.targetId}`;
+}
+
+function graphNodePulseKey(record: GraphNode): string {
+  return `${record.nodeType === "abstract" ? "node" : "chunk"}:${record.id}`;
+}
+
+function graphEdgePulseKeys(record: GraphEdge): string[] {
+  if (record.relation) return [`relation:${record.relation.id}`];
+  return record.aggregate?.relationIds.map((id) => `relation:${id}`) ?? [];
+}
+
+function withoutCurrentPulse<T extends GraphNode | GraphEdge>(record: T): T {
+  const { pulseScore: _pulseScore, pulseRole: _pulseRole, ...rest } = record;
+  return rest as T;
+}
+
+function revealPulseGraph(
+  graphNodes: GraphNode[],
+  graphEdges: GraphEdge[],
+  mode: PulseLayerMode,
+  pulse: PulseResponse | undefined,
+  revealCount: number,
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  if (mode !== "current" || !pulse) return { nodes: graphNodes, edges: graphEdges };
+  const revealed = new Set(orderedPulseHits(pulse).slice(0, revealCount).map(pulseHitKey));
+  const nodes = graphNodes.map((record) =>
+    record.pulseRole && !revealed.has(graphNodePulseKey(record)) ? withoutCurrentPulse(record) : record,
+  );
+  const edges = graphEdges.map((record) => {
+    const keys = graphEdgePulseKeys(record);
+    const edgeIsRevealed = keys.some((key) => revealed.has(key));
+    if (record.pulseRole && !edgeIsRevealed) return withoutCurrentPulse(record);
+    if (!record.pulseRole && record.edgeType === "evidence" && revealed.has(`node:${record.source}`) && revealed.has(`chunk:${record.target}`)) {
+      return { ...record, pulseRole: "expanded" as const, pulseScore: 0.32 };
+    }
+    return record;
+  });
+  return { nodes, edges };
 }
 
 function nodeSortKey(record: GraphNode): string {
@@ -153,6 +236,7 @@ function visualNodes(
   positions: Map<string, { x: number; y: number }>,
   direction?: "horizontal" | "vertical",
   activeAspect?: AspectKind,
+  pulseMode: PulseLayerMode = "normal",
 ): VisualNode[] {
   return records.map((record) => {
     const point = positions.get(record.id);
@@ -171,6 +255,7 @@ function visualNodes(
       className: [
         record.nodeType === "chunk" ? "flow-chunk" : record.data.level === 2 ? "flow-theme" : `flow-${record.data.kind}`,
         record.focusRole === "match" ? "flow-aspect-match" : record.focusRole ? "flow-context" : "",
+        pulseTraceClass(record, pulseMode),
       ].filter(Boolean).join(" "),
       style: {
         width: record.nodeType === "chunk" ? 250 : record.data.level === 2 ? 245 : 210,
@@ -181,7 +266,7 @@ function visualNodes(
   });
 }
 
-function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind): VisualNode[] {
+function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode): VisualNode[] {
   const links: LayoutLink[] = graphEdges.map((edge) => ({
     source: edge.source,
     target: edge.target,
@@ -197,10 +282,10 @@ function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspe
       });
     });
   });
-  return visualNodes(records, positions, "horizontal", activeAspect);
+  return visualNodes(records, positions, "horizontal", activeAspect, pulseMode);
 }
 
-function treeLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind): VisualNode[] {
+function treeLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode): VisualNode[] {
   const links: LayoutLink[] = graphEdges.map((edge) => ({
     source: edge.source,
     target: edge.target,
@@ -216,10 +301,10 @@ function treeLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?
       });
     });
   });
-  return visualNodes(records, positions, "vertical", activeAspect);
+  return visualNodes(records, positions, "vertical", activeAspect, pulseMode);
 }
 
-function networkLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind): VisualNode[] {
+function networkLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode): VisualNode[] {
   const positions: PositionedNode[] = records.map((record) => ({ id: record.id }));
   const links = graphEdges.map((edge) => ({
     source: edge.source,
@@ -243,17 +328,19 @@ function networkLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspe
   return visualNodes(records, new Map(positions.map((position) => [position.id, {
     x: position.x ?? 0,
     y: position.y ?? 0,
-  }])), undefined, activeAspect);
+  }])), undefined, activeAspect, pulseMode);
 }
 
-function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[], layout: LayoutMode, activeAspect?: AspectKind): VisualNode[] {
-  if (layout === "network") return networkLayout(records, graphEdges, activeAspect);
-  return layout === "tree" ? treeLayout(records, graphEdges, activeAspect) : layeredLayout(records, graphEdges, activeAspect);
+function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[], layout: LayoutMode, activeAspect?: AspectKind, pulseMode?: PulseLayerMode): VisualNode[] {
+  if (layout === "network") return networkLayout(records, graphEdges, activeAspect, pulseMode);
+  return layout === "tree" ? treeLayout(records, graphEdges, activeAspect, pulseMode) : layeredLayout(records, graphEdges, activeAspect, pulseMode);
 }
 
-function displayEdges(records: GraphEdge[], layout: LayoutMode): VisualEdge[] {
+function displayEdges(records: GraphEdge[], layout: LayoutMode, pulseMode: PulseLayerMode = "normal"): VisualEdge[] {
   return records.map((record) => {
     const status = record.relation?.status;
+    const baseStroke = record.edgeType === "evidence" ? "#56627c" : record.edgeType === "membership" ? "#557d85" : relationColor(status ?? "manual");
+    const pulseClass = pulseTraceClass(record, pulseMode);
     const edge: VisualEdge = {
       id: record.id,
       source: record.source,
@@ -262,8 +349,9 @@ function displayEdges(records: GraphEdge[], layout: LayoutMode): VisualEdge[] {
       data: { entity: record },
       animated: status === "suggested",
       style: {
-        stroke: record.edgeType === "evidence" ? "#56627c" : record.edgeType === "membership" ? "#557d85" : relationColor(status ?? "manual"),
-        strokeWidth: record.aggregate ? 2.8 : record.edgeType === "evidence" ? 1.5 : 2,
+        stroke: pulseTraceColor(record, pulseMode, baseStroke),
+        strokeWidth: record.pulseRole ? 3.5 : record.pulseStats ? 3 : record.aggregate ? 2.8 : record.edgeType === "evidence" ? 1.5 : 2,
+        opacity: pulseClass === "flow-pulse-muted" ? 0.22 : 1,
         ...(status === "suggested" || record.edgeType !== "relation" ? { strokeDasharray: "5 4" } : {}),
       },
       labelStyle: { fill: "#b5c5dd", fontSize: 12, fontWeight: 600 },
@@ -309,6 +397,34 @@ export function GraphWorkspace({
   const [manualReason, setManualReason] = useState("用户手动建立的关联");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [pulseQuestion, setPulseQuestion] = useState("");
+  const [pulseHistory, setPulseHistory] = useState<Pulse[]>([]);
+  const [currentPulse, setCurrentPulse] = useState<PulseResponse>();
+  const [pulseMode, setPulseMode] = useState<PulseLayerMode>("normal");
+  const [pulseRevealCount, setPulseRevealCount] = useState(0);
+  const [pulsePlaying, setPulsePlaying] = useState(false);
+  const [pulsing, setPulsing] = useState(false);
+  const currentPulseHits = useMemo(() => orderedPulseHits(currentPulse), [currentPulse]);
+  const revealedPulseTargets = useMemo(
+    () => new Set(currentPulseHits.slice(0, pulseRevealCount).map(pulseHitKey)),
+    [currentPulseHits, pulseRevealCount],
+  );
+
+  const applyGraph = (
+    graph: GraphResponse,
+    nextLayout = layout,
+    nextPulseMode = pulseMode,
+    nextRevealCount = pulseRevealCount,
+    nextPulse = currentPulse,
+  ) => {
+    const visibleGraph = revealPulseGraph(graph.nodes, graph.edges, nextPulseMode, nextPulse, nextRevealCount);
+    setRecords(graph.nodes);
+    setEdgeRecords(graph.edges);
+    setAspectFilter(graph.aspectFilter);
+    setSelected((current) => current ? graph.nodes.find((node) => node.id === current.id) : undefined);
+    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, nextPulseMode));
+    setEdges(displayEdges(visibleGraph.edges, nextLayout, nextPulseMode));
+  };
 
   const loadGraph = async (centerId?: string, includeChunks = false, requestedView = view) => {
     try {
@@ -318,14 +434,11 @@ export function GraphWorkspace({
         ...(status ? { status } : {}),
         ...(type ? { type } : {}),
         ...(aspect ? { aspect } : {}),
+        ...(pulseMode === "current" && currentPulse ? { pulseId: currentPulse.pulse.id } : {}),
+        pulseStats: pulseMode !== "normal",
         view: requestedView,
       });
-      setRecords(graph.nodes);
-      setEdgeRecords(graph.edges);
-      setAspectFilter(graph.aspectFilter);
-      setSelected((current) => current ? graph.nodes.find((node) => node.id === current.id) : undefined);
-      setNodes(layoutNodes(graph.nodes, graph.edges, layout, aspect || undefined));
-      setEdges(displayEdges(graph.edges, layout));
+      applyGraph(graph);
     } catch (cause) {
       onError((cause as Error).message);
     }
@@ -337,12 +450,39 @@ export function GraphWorkspace({
   }, [flowInstance, records, layout]);
 
   useEffect(() => {
+    if (pulseMode !== "current" || !currentPulse || !pulsePlaying) return;
+    if (pulseRevealCount >= currentPulseHits.length) {
+      setPulsePlaying(false);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setPulseRevealCount((count) => Math.min(count + 1, currentPulseHits.length));
+    }, pulseRevealCount === 0 ? 260 : 430);
+    return () => window.clearTimeout(timer);
+  }, [pulseMode, currentPulse?.pulse.id, pulsePlaying, pulseRevealCount, currentPulseHits.length]);
+
+  useEffect(() => {
+    if (records.length === 0) return;
+    const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, currentPulse, pulseRevealCount);
+    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, pulseMode));
+    setEdges(displayEdges(visibleGraph.edges, layout, pulseMode));
+  }, [pulseMode, pulseRevealCount, currentPulse?.pulse.id, records, edgeRecords, layout, aspect]);
+
+  useEffect(() => {
+    setCurrentPulse(undefined);
+    setPulseMode("normal");
+    setPulseRevealCount(0);
+    setPulsePlaying(false);
+    void api.pulses(libraryId).then(setPulseHistory).catch((cause: Error) => onError(cause.message));
+  }, [libraryId, refreshKey]);
+
+  useEffect(() => {
     setSelected(undefined);
     setSelectedRelation(undefined);
     setSelectedAggregate(undefined);
     setResults([]);
     void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view);
-  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId]);
+  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, currentPulse?.pulse.id]);
 
   const suggested = useMemo(
     () => edges.flatMap((edge) => edge.data?.entity.relation?.status === "suggested" ? [edge.data.entity.relation] : []),
@@ -358,6 +498,60 @@ export function GraphWorkspace({
     if (!query.trim()) return;
     try {
       setResults(await api.search(libraryId, query));
+    } catch (cause) {
+      onError((cause as Error).message);
+    }
+  };
+
+  const runPulse = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!pulseQuestion.trim() || pulsing) return;
+    setPulsing(true);
+    try {
+      const response = await api.createPulse(libraryId, pulseQuestion);
+      setCurrentPulse(response);
+      setPulseHistory((history) => [response.pulse, ...history.filter((pulse) => pulse.id !== response.pulse.id)]);
+      setPulseMode("current");
+      setPulseRevealCount(0);
+      setPulsePlaying(true);
+      applyGraph(response.graph, layout, "current", 0, response);
+    } catch (cause) {
+      onError((cause as Error).message);
+    } finally {
+      setPulsing(false);
+    }
+  };
+
+  const loadPulse = async (pulseId: string) => {
+    if (!pulseId) {
+      setCurrentPulse(undefined);
+      setPulseMode("normal");
+      return;
+    }
+    try {
+      const response = await api.pulse(libraryId, pulseId);
+      setCurrentPulse(response);
+      setPulseQuestion(response.pulse.question);
+      setPulseMode("current");
+      setPulseRevealCount(0);
+      setPulsePlaying(true);
+      applyGraph(response.graph, layout, "current", 0, response);
+    } catch (cause) {
+      onError((cause as Error).message);
+    }
+  };
+
+  const reviewPulse = async (status: "correct" | "wrong") => {
+    if (!currentPulse) return;
+    try {
+      const response = await api.reviewPulse(currentPulse.pulse.id, status);
+      setCurrentPulse(response);
+      setPulseHistory((history) => history.map((pulse) => pulse.id === response.pulse.id ? response.pulse : pulse));
+      const nextMode = pulseMode === "normal" ? "current" : pulseMode;
+      const nextRevealCount = nextMode === "current" ? response.hits.length : pulseRevealCount;
+      setPulseRevealCount(nextRevealCount);
+      setPulsePlaying(false);
+      applyGraph(response.graph, layout, nextMode, nextRevealCount, response);
     } catch (cause) {
       onError((cause as Error).message);
     }
@@ -395,8 +589,36 @@ export function GraphWorkspace({
 
   const changeLayout = (nextLayout: LayoutMode) => {
     setLayout(nextLayout);
-    setNodes(layoutNodes(records, edgeRecords, nextLayout, aspect || undefined));
-    setEdges(displayEdges(edgeRecords, nextLayout));
+    const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, currentPulse, pulseRevealCount);
+    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, pulseMode));
+    setEdges(displayEdges(visibleGraph.edges, nextLayout, pulseMode));
+  };
+
+  const changePulseMode = (nextMode: PulseLayerMode) => {
+    setPulseMode(nextMode);
+    if (nextMode === "current" && currentPulse) {
+      setPulseRevealCount(0);
+      setPulsePlaying(true);
+    } else {
+      setPulseRevealCount(currentPulseHits.length);
+      setPulsePlaying(false);
+    }
+  };
+
+  const openPulseHit = (hit: PulseResponse["hits"][number]) => {
+    if (hit.targetType === "relation") {
+      const edge = edgeRecords.find((record) => record.relation?.id === hit.targetId || record.aggregate?.relationIds.includes(hit.targetId));
+      setSelected(undefined);
+      setSelectedRelation(edge?.relation);
+      setSelectedAggregate(edge?.aggregate);
+      return;
+    }
+    const node = records.find((record) => record.id === hit.targetId);
+    if (node) {
+      setSelected(node);
+      setSelectedRelation(undefined);
+      setSelectedAggregate(undefined);
+    }
   };
 
   return (
@@ -422,6 +644,27 @@ export function GraphWorkspace({
           <button className={view === "overview" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("overview"); }}>概览</button>
           <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
         </div>
+      </div>
+      <div className="pulse-toolbar">
+        <form onSubmit={(event) => void runPulse(event)}>
+          <input value={pulseQuestion} onChange={(event) => setPulseQuestion(event.target.value)} placeholder="向图谱发起脉冲问题..." />
+          <button type="submit" disabled={pulsing}>{pulsing ? "脉冲中" : "脉冲"}</button>
+        </form>
+        <select value={currentPulse?.pulse.id ?? ""} onChange={(event) => void loadPulse(event.target.value)}>
+          <option value="">历史脉冲</option>
+          {pulseHistory.map((pulse) => (
+            <option key={pulse.id} value={pulse.id}>
+              {pulse.status === "correct" ? "正确" : pulse.status === "wrong" ? "错误" : "待判定"} · {pulse.question.slice(0, 28)}
+            </option>
+          ))}
+        </select>
+        <select value={pulseMode} onChange={(event) => changePulseMode(event.target.value as PulseLayerMode)}>
+          <option value="normal">正常图谱</option>
+          <option value="current">当前脉冲</option>
+          <option value="stats">累计正误</option>
+          <option value="wrong">仅错误路径</option>
+          <option value="correct">仅正确路径</option>
+        </select>
       </div>
       <div className="graph-body">
         <div className="canvas">
@@ -472,6 +715,69 @@ export function GraphWorkspace({
           )}
         </div>
         <aside className="inspector">
+          {currentPulse && (
+            <div className={`pulse-panel pulse-status-${currentPulse.pulse.status}`}>
+              <div className="pulse-panel-heading">
+                <h3>脉冲回答</h3>
+                <small>{currentPulse.pulse.status === "correct" ? "已标记正确" : currentPulse.pulse.status === "wrong" ? "已标记错误" : "待判定"}</small>
+              </div>
+              <p className="pulse-question">{currentPulse.pulse.question}</p>
+              <p>{currentPulse.pulse.answer}</p>
+              <small>{currentPulse.pulse.summary}</small>
+              {pulseMode === "current" && (
+                <div className="pulse-playback">
+                  <span>披露 {Math.min(pulseRevealCount, currentPulseHits.length)} / {currentPulseHits.length}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPulseRevealCount(0);
+                      setPulsePlaying(true);
+                    }}
+                  >
+                    重放
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPulsePlaying((playing) => !playing)}
+                    disabled={pulseRevealCount >= currentPulseHits.length}
+                  >
+                    {pulsePlaying ? "暂停" : "继续"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPulseRevealCount(currentPulseHits.length);
+                      setPulsePlaying(false);
+                    }}
+                  >
+                    全部显示
+                  </button>
+                </div>
+              )}
+              <div className="pulse-review-actions">
+                <button onClick={() => void reviewPulse("correct")}>回答正确</button>
+                <button className="danger" onClick={() => void reviewPulse("wrong")}>回答错误</button>
+              </div>
+              <div className="pulse-hit-summary">
+                <span>节点 {currentPulse.hits.filter((hit) => hit.targetType === "node").length}</span>
+                <span>关系 {currentPulse.hits.filter((hit) => hit.targetType === "relation").length}</span>
+                <span>证据 {currentPulse.hits.filter((hit) => hit.targetType === "chunk").length}</span>
+              </div>
+              <div className="pulse-hits">
+                {currentPulseHits.slice(0, 10).map((hit) => (
+                  <button
+                    className={pulseMode === "current" && !revealedPulseTargets.has(pulseHitKey(hit)) ? "pulse-hit-pending" : ""}
+                    key={hit.id}
+                    onClick={() => openPulseHit(hit)}
+                  >
+                    <strong>{hit.label}</strong>
+                    <span>{hit.reason}</span>
+                    <small>{hit.pathRole} · {hit.score.toFixed(2)}</small>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {view === "detail" ? <div className="manual-edge">
             <h3>连边工具</h3>
             <select value={manualType} onChange={(event) => setManualType(event.target.value as RelationType)}>

@@ -1,5 +1,14 @@
-import type { AspectKind, Chunk, Citation, ExtractionOutput, ModelTestResult, StatementPrecheckOutput } from "@agent-thinking/contracts";
-import { extractionSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
+import type {
+  AspectKind,
+  Chunk,
+  Citation,
+  ExtractionOutput,
+  ModelTestResult,
+  PulseAnswerContext,
+  PulseAnswerOutput,
+  StatementPrecheckOutput,
+} from "@agent-thinking/contracts";
+import { extractionSchema, pulseAnswerSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 
 export interface ModelProvider {
@@ -8,6 +17,7 @@ export interface ModelProvider {
   embed(texts: string[]): Promise<number[][]>;
   extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>): Promise<ExtractionOutput>;
   precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput>;
+  answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput>;
   stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }>;
   test(): Promise<ModelTestResult>;
 }
@@ -104,6 +114,15 @@ export class FakeModelProvider implements ModelProvider {
       status: "supported",
       reason: "演示模式：该陈述已附带可定位来源，请由审核者核对原文后裁决。",
       suggestions: [],
+    };
+  }
+
+  async answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput> {
+    const topNodes = context.nodes.slice(0, 3).map((node) => node.title).join("、") || "暂无节点";
+    const topChunks = context.chunks.slice(0, 2).map((chunk) => chunk.text.slice(0, 80)).join("；") || "暂无证据片段";
+    return {
+      answer: `演示脉冲回答：问题“${question}”主要激活了 ${topNodes}。相关证据包括：${topChunks}`,
+      summary: `激活 ${context.nodes.length} 个节点、${context.relations.length} 条关系、${context.chunks.length} 个证据片段。`,
     };
   }
 
@@ -253,6 +272,36 @@ export class OpenAICompatibleProvider implements ModelProvider {
     );
     const raw = response.choices[0]?.message.content ?? "{}";
     return statementPrecheckSchema.parse(JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, "")));
+  }
+
+  async answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Answer the user's question using only the supplied knowledge graph context. " +
+            'Return JSON only: {"answer":"...","summary":"..."}. ' +
+            "The answer should be concise, grounded in the chunks, nodes, and relations provided, and must mention uncertainty when evidence is thin. " +
+            "The summary should briefly describe which graph areas were activated.",
+        },
+        { role: "user", content: JSON.stringify({ question, context }) },
+      ],
+      max_tokens: 1200,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const raw = response.choices[0]?.message.content ?? "{}";
+    return pulseAnswerSchema.parse(JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, "")));
   }
 
   async *stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }> {

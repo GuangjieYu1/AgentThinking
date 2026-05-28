@@ -23,6 +23,13 @@ import type {
   Library,
   LibrarySettings,
   OcrMode,
+  Pulse,
+  PulseHit,
+  PulseHitTargetType,
+  PulsePathRole,
+  PulseResponse,
+  PulseStats,
+  PulseStatus,
   Relation,
   RelationStatus,
   RelationType,
@@ -37,6 +44,7 @@ import type {
 import type { PendingChunk } from "./domain/chunker.js";
 
 type Row = Record<string, string | number | null | Uint8Array>;
+export type PendingPulseHit = Omit<PulseHit, "id" | "pulseId" | "libraryId">;
 const sqliteModuleName = ["node", "sqlite"].join(":");
 const { DatabaseSync } = await import(sqliteModuleName) as typeof import("node:sqlite");
 
@@ -126,6 +134,61 @@ function parseTextList(value: Row[string] | undefined): string[] {
   } catch {
     return [];
   }
+}
+
+function pulseFrom(r: Row): Pulse {
+  return {
+    id: String(r.id),
+    libraryId: String(r.library_id),
+    question: String(r.question),
+    answer: String(r.answer),
+    summary: String(r.summary),
+    status: String(r.status) as PulseStatus,
+    createdAt: String(r.created_at),
+    reviewedAt: r.reviewed_at === null ? null : String(r.reviewed_at),
+  };
+}
+
+function pulseHitFrom(r: Row): PulseHit {
+  return {
+    id: String(r.id),
+    pulseId: String(r.pulse_id),
+    libraryId: String(r.library_id),
+    targetType: String(r.target_type) as PulseHitTargetType,
+    targetId: String(r.target_id),
+    score: Number(r.score),
+    reason: String(r.reason),
+    pathRole: String(r.path_role) as PulsePathRole,
+    label: String(r.label),
+    excerpt: r.excerpt === null ? null : String(r.excerpt),
+  };
+}
+
+function pulseStatsFrom(r: Row | undefined): PulseStats | undefined {
+  if (!r) return undefined;
+  return {
+    correctCount: Number(r.correct_count ?? 0),
+    wrongCount: Number(r.wrong_count ?? 0),
+    lastCorrectAt: r.last_correct_at === null ? null : String(r.last_correct_at),
+    lastWrongAt: r.last_wrong_at === null ? null : String(r.last_wrong_at),
+  };
+}
+
+function emptyPulseStats(): PulseStats {
+  return { correctCount: 0, wrongCount: 0, lastCorrectAt: null, lastWrongAt: null };
+}
+
+function combinePulseStats(values: Array<PulseStats | undefined>): PulseStats | undefined {
+  const combined = values.reduce<PulseStats>((current, stats) => {
+    if (!stats) return current;
+    return {
+      correctCount: current.correctCount + stats.correctCount,
+      wrongCount: current.wrongCount + stats.wrongCount,
+      lastCorrectAt: [current.lastCorrectAt, stats.lastCorrectAt].filter(Boolean).sort().at(-1) ?? null,
+      lastWrongAt: [current.lastWrongAt, stats.lastWrongAt].filter(Boolean).sort().at(-1) ?? null,
+    };
+  }, emptyPulseStats());
+  return combined.correctCount || combined.wrongCount ? combined : undefined;
 }
 
 export class AgentDatabase {
@@ -307,10 +370,45 @@ export class AgentDatabase {
         aspects_json TEXT NOT NULL DEFAULT '[]',
         PRIMARY KEY(node_id, analyzed_version_id)
       );
+      CREATE TABLE IF NOT EXISTS pulses (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('unreviewed','correct','wrong')),
+        reviewed_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS pulse_hits (
+        id TEXT PRIMARY KEY,
+        pulse_id TEXT NOT NULL REFERENCES pulses(id) ON DELETE CASCADE,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        target_type TEXT NOT NULL CHECK (target_type IN ('node','relation','chunk')),
+        target_id TEXT NOT NULL,
+        score REAL NOT NULL,
+        reason TEXT NOT NULL,
+        path_role TEXT NOT NULL CHECK (path_role IN ('direct','expanded','bridge')),
+        label TEXT NOT NULL,
+        excerpt TEXT
+      );
+      CREATE TABLE IF NOT EXISTS pulse_traces (
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        target_type TEXT NOT NULL CHECK (target_type IN ('node','relation')),
+        target_id TEXT NOT NULL,
+        correct_count INTEGER NOT NULL DEFAULT 0,
+        wrong_count INTEGER NOT NULL DEFAULT 0,
+        last_correct_at TEXT,
+        last_wrong_at TEXT,
+        PRIMARY KEY(library_id, target_type, target_id)
+      );
       CREATE INDEX IF NOT EXISTS idx_source_links_version ON source_links(version_id);
       CREATE INDEX IF NOT EXISTS idx_statements_library_status ON analysis_statements(library_id, status);
       CREATE INDEX IF NOT EXISTS idx_abstraction_child ON abstraction_memberships(child_node_id);
       CREATE INDEX IF NOT EXISTS idx_aspect_contributions_version ON abstract_node_aspect_contributions(analyzed_version_id);
+      CREATE INDEX IF NOT EXISTS idx_pulses_library_created ON pulses(library_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_pulse_hits_pulse ON pulse_hits(pulse_id);
+      CREATE INDEX IF NOT EXISTS idx_pulse_traces_library ON pulse_traces(library_id);
     `);
     this.addColumn("chunks", "start_line", "INTEGER");
     this.addColumn("chunks", "end_line", "INTEGER");
@@ -343,6 +441,7 @@ export class AgentDatabase {
       this.sql.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?)").run(now());
     }
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (7, ?)").run(now());
+    this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (8, ?)").run(now());
   }
 
   private addColumn(table: string, column: string, definition: string): void {
@@ -835,6 +934,69 @@ export class AgentDatabase {
     ).map((entry) => ({ chunk: chunkFrom(entry), score: 1 }));
   }
 
+  searchAbstractNodes(libraryId: string, query: string, limit: number): Array<{ node: AbstractNode; score: number; reason: string }> {
+    const terms = query.normalize("NFKC").toLowerCase().split(/\s+/).filter(Boolean);
+    if (terms.length === 0) return [];
+    return rows(
+      this.sql.prepare(`
+        SELECT n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+        FROM abstract_nodes n WHERE n.library_id = ? ORDER BY n.updated_at DESC LIMIT 400
+      `),
+      libraryId,
+    ).flatMap((entry) => {
+      const node = this.withNodeCitations(nodeFrom(entry));
+      const title = node.title.normalize("NFKC").toLowerCase();
+      const summary = node.summary.normalize("NFKC").toLowerCase();
+      const titleMatches = terms.filter((term) => title.includes(term)).length;
+      const summaryMatches = terms.filter((term) => summary.includes(term)).length;
+      if (titleMatches + summaryMatches === 0) return [];
+      const score = Math.min(1, titleMatches * 0.42 + summaryMatches * 0.18 + (title.includes(query.toLowerCase()) ? 0.2 : 0));
+      return [{
+        node,
+        score: Math.max(score, titleMatches > 0 ? 0.72 : 0.55),
+        reason: titleMatches > 0 ? "节点标题匹配问题关键词" : "节点摘要匹配问题关键词",
+      }];
+    }).sort((left, right) => right.score - left.score).slice(0, limit);
+  }
+
+  getNodesForChunks(libraryId: string, chunkIds: string[]): Map<string, AbstractNode[]> {
+    const result = new Map<string, AbstractNode[]>();
+    if (chunkIds.length === 0) return result;
+    const placeholders = chunkIds.map(() => "?").join(",");
+    for (const entry of rows(
+      this.sql.prepare(`
+        SELECT e.chunk_id, n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+        FROM abstract_node_evidence e
+        JOIN abstract_nodes n ON n.id = e.node_id
+        WHERE n.library_id = ? AND e.chunk_id IN (${placeholders})
+      `),
+      libraryId,
+      ...chunkIds,
+    )) {
+      const chunkId = String(entry.chunk_id);
+      const nodes = result.get(chunkId) ?? [];
+      nodes.push(this.withNodeCitations(nodeFrom(entry)));
+      result.set(chunkId, nodes);
+    }
+    return result;
+  }
+
+  getIncidentRelations(libraryId: string, nodeIds: string[]): Relation[] {
+    if (nodeIds.length === 0) return [];
+    const placeholders = nodeIds.map(() => "?").join(",");
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM relations
+        WHERE library_id = ? AND status != 'rejected'
+          AND (source_node_id IN (${placeholders}) OR target_node_id IN (${placeholders}))
+        ORDER BY updated_at DESC
+      `),
+      libraryId,
+      ...nodeIds,
+      ...nodeIds,
+    ).map((entry) => this.relationFrom(entry));
+  }
+
   saveEmbedding(chunkId: string, dimensions: number, embedding: Uint8Array): void {
     this.sql.prepare(`
       INSERT INTO chunk_embeddings (chunk_id, dimensions, embedding) VALUES (?, ?, ?)
@@ -1109,13 +1271,151 @@ export class AgentDatabase {
     };
   }
 
+  createPulse(libraryId: string, question: string, answer: string, summary: string, hits: PendingPulseHit[]): Pulse {
+    const id = randomUUID();
+    const timestamp = now();
+    this.sql.exec("BEGIN");
+    try {
+      this.sql.prepare(`
+        INSERT INTO pulses (id, library_id, question, answer, summary, status, reviewed_at, created_at)
+        VALUES (?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
+      `).run(id, libraryId, question, answer, summary, timestamp);
+      const insertHit = this.sql.prepare(`
+        INSERT INTO pulse_hits
+          (id, pulse_id, library_id, target_type, target_id, score, reason, path_role, label, excerpt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const hit of hits) {
+        insertHit.run(
+          randomUUID(), id, libraryId, hit.targetType, hit.targetId, hit.score,
+          hit.reason, hit.pathRole, hit.label, hit.excerpt ?? null,
+        );
+      }
+      this.sql.exec("COMMIT");
+      return this.getPulse(id) as Pulse;
+    } catch (error) {
+      this.sql.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listPulses(libraryId: string): Pulse[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM pulses WHERE library_id = ? ORDER BY created_at DESC LIMIT 50"),
+      libraryId,
+    ).map(pulseFrom);
+  }
+
+  getPulse(id: string): Pulse | undefined {
+    const result = row(this.sql.prepare("SELECT * FROM pulses WHERE id = ?"), id);
+    return result ? pulseFrom(result) : undefined;
+  }
+
+  getPulseHits(pulseId: string): PulseHit[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM pulse_hits WHERE pulse_id = ? ORDER BY score DESC, rowid"),
+      pulseId,
+    ).map(pulseHitFrom);
+  }
+
+  getPulseResponse(libraryId: string, pulseId: string): PulseResponse | undefined {
+    const pulse = this.getPulse(pulseId);
+    if (!pulse || pulse.libraryId !== libraryId) return undefined;
+    return {
+      pulse,
+      hits: this.getPulseHits(pulseId),
+      graph: this.getGraph(libraryId, { pulseId, pulseStats: true }),
+    };
+  }
+
+  reviewPulse(id: string, status: "correct" | "wrong"): Pulse {
+    const pulse = this.getPulse(id);
+    if (!pulse) throw new Error("脉冲不存在");
+    const reviewedAt = now();
+    this.sql.exec("BEGIN");
+    try {
+      this.sql.prepare("UPDATE pulses SET status = ?, reviewed_at = ? WHERE id = ?").run(status, reviewedAt, id);
+      const targets = rows(
+        this.sql.prepare(`
+          SELECT DISTINCT target_type, target_id FROM pulse_hits
+          WHERE pulse_id = ? AND target_type IN ('node','relation')
+        `),
+        id,
+      ).map((entry) => ({
+        targetType: String(entry.target_type) as "node" | "relation",
+        targetId: String(entry.target_id),
+      }));
+      for (const target of targets) this.refreshPulseTraceTarget(pulse.libraryId, target.targetType, target.targetId);
+      this.sql.exec("COMMIT");
+      return this.getPulse(id) as Pulse;
+    } catch (error) {
+      this.sql.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private refreshPulseTraceTarget(libraryId: string, targetType: "node" | "relation", targetId: string): void {
+    const correct = row(
+      this.sql.prepare(`
+        SELECT COUNT(DISTINCT p.id) AS count, MAX(p.reviewed_at) AS last_at
+        FROM pulse_hits h JOIN pulses p ON p.id = h.pulse_id
+        WHERE h.library_id = ? AND h.target_type = ? AND h.target_id = ? AND p.status = 'correct'
+      `),
+      libraryId,
+      targetType,
+      targetId,
+    );
+    const wrong = row(
+      this.sql.prepare(`
+        SELECT COUNT(DISTINCT p.id) AS count, MAX(p.reviewed_at) AS last_at
+        FROM pulse_hits h JOIN pulses p ON p.id = h.pulse_id
+        WHERE h.library_id = ? AND h.target_type = ? AND h.target_id = ? AND p.status = 'wrong'
+      `),
+      libraryId,
+      targetType,
+      targetId,
+    );
+    const correctCount = Number(correct?.count ?? 0);
+    const wrongCount = Number(wrong?.count ?? 0);
+    if (correctCount === 0 && wrongCount === 0) {
+      this.sql.prepare("DELETE FROM pulse_traces WHERE library_id = ? AND target_type = ? AND target_id = ?")
+        .run(libraryId, targetType, targetId);
+      return;
+    }
+    this.sql.prepare(`
+      INSERT INTO pulse_traces
+        (library_id, target_type, target_id, correct_count, wrong_count, last_correct_at, last_wrong_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(library_id, target_type, target_id) DO UPDATE SET
+        correct_count = excluded.correct_count,
+        wrong_count = excluded.wrong_count,
+        last_correct_at = excluded.last_correct_at,
+        last_wrong_at = excluded.last_wrong_at
+    `).run(
+      libraryId, targetType, targetId, correctCount, wrongCount,
+      correctCount > 0 && correct?.last_at !== null ? String(correct?.last_at) : null,
+      wrongCount > 0 && wrong?.last_at !== null ? String(wrong?.last_at) : null,
+    );
+  }
+
   getGraph(
     libraryId: string,
-    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; limit?: number; view?: "detail" | "overview"; aspect?: AspectKind },
+    options: {
+      centerId?: string;
+      includeChunks?: boolean;
+      status?: RelationStatus;
+      type?: RelationType;
+      limit?: number;
+      view?: "detail" | "overview";
+      aspect?: AspectKind;
+      pulseId?: string;
+      pulseStats?: boolean;
+    },
   ): GraphResponse {
     if (options.view === "overview") {
       const graph = this.getOverviewGraph(libraryId, options);
-      return options.aspect ? this.focusGraph(libraryId, graph, options.aspect) : graph;
+      const focused = options.aspect ? this.focusGraph(libraryId, graph, options.aspect) : graph;
+      return this.decorateGraphWithPulse(libraryId, focused, options);
     }
     const limit = Math.min(Math.max(options.limit ?? 150, 1), 400);
     const filters = ["library_id = ?"];
@@ -1245,7 +1545,8 @@ export class AgentDatabase {
       }
     }
     const graph = { nodes: graphNodes, edges: graphEdges, truncated };
-    return options.aspect ? this.focusGraph(libraryId, graph, options.aspect) : graph;
+    const focused = options.aspect ? this.focusGraph(libraryId, graph, options.aspect) : graph;
+    return this.decorateGraphWithPulse(libraryId, focused, options);
   }
 
   private getOverviewGraph(
@@ -1374,6 +1675,106 @@ export class AgentDatabase {
       nodes,
       edges: retainedEdges,
       aspectFilter: { selected: aspect, anyLabeled, matchCount: matches.size },
+    };
+  }
+
+  private decorateGraphWithPulse(
+    libraryId: string,
+    graph: GraphResponse,
+    options: { pulseId?: string; pulseStats?: boolean },
+  ): GraphResponse {
+    if (!options.pulseId && !options.pulseStats) return graph;
+    const nodes = [...graph.nodes];
+    const edges = [...graph.edges];
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    const edgeById = new Map(edges.map((edge) => [edge.id, edge]));
+
+    const addNode = (node: GraphNode) => {
+      if (nodeById.has(node.id)) return;
+      nodeById.set(node.id, node);
+      nodes.push(node);
+    };
+    const addEdge = (edge: GraphEdge) => {
+      if (edgeById.has(edge.id)) return;
+      edgeById.set(edge.id, edge);
+      edges.push(edge);
+    };
+
+    const pulseHits = options.pulseId ? this.getPulseHits(options.pulseId).filter((hit) => hit.libraryId === libraryId) : [];
+    const hitByTarget = new Map<string, PulseHit>();
+    for (const hit of pulseHits) {
+      const key = `${hit.targetType}:${hit.targetId}`;
+      const previous = hitByTarget.get(key);
+      if (!previous || hit.score > previous.score) hitByTarget.set(key, hit);
+    }
+
+    if (pulseHits.length > 0) {
+      for (const hit of pulseHits) {
+        if (hit.targetType === "node") {
+          const node = this.getAbstractNode(hit.targetId);
+          if (node && node.libraryId === libraryId) addNode({ id: node.id, nodeType: "abstract", data: node });
+        } else if (hit.targetType === "chunk") {
+          const chunk = this.getChunk(hit.targetId);
+          if (chunk && chunk.libraryId === libraryId) {
+            addNode({ id: chunk.id, nodeType: "chunk", data: chunk });
+            const linked = this.getNodesForChunks(libraryId, [chunk.id]).get(chunk.id) ?? [];
+            for (const node of linked) {
+              addNode({ id: node.id, nodeType: "abstract", data: node });
+              addEdge({ id: `evidence:${node.id}:${chunk.id}`, source: node.id, target: chunk.id, edgeType: "evidence" });
+            }
+          }
+        } else {
+          const relation = this.getRelation(hit.targetId);
+          if (relation && relation.libraryId === libraryId) {
+            const source = this.getAbstractNode(relation.sourceNodeId);
+            const target = this.getAbstractNode(relation.targetNodeId);
+            if (source) addNode({ id: source.id, nodeType: "abstract", data: source });
+            if (target) addNode({ id: target.id, nodeType: "abstract", data: target });
+            const representedByAggregate = edges.some((edge) => edge.aggregate?.relationIds.includes(relation.id));
+            if (!representedByAggregate) {
+              addEdge({
+                id: relation.id,
+                source: relation.sourceNodeId,
+                target: relation.targetNodeId,
+                edgeType: "relation",
+                relation,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    const traceRows = options.pulseStats
+      ? rows(this.sql.prepare("SELECT * FROM pulse_traces WHERE library_id = ?"), libraryId)
+      : [];
+    const statsByTarget = new Map(traceRows.map((entry) => [`${String(entry.target_type)}:${String(entry.target_id)}`, pulseStatsFrom(entry)]));
+    const decorateNode = (node: GraphNode): GraphNode => {
+      const hit = hitByTarget.get(`${node.nodeType === "abstract" ? "node" : "chunk"}:${node.id}`);
+      const stats = node.nodeType === "abstract" ? statsByTarget.get(`node:${node.id}`) : undefined;
+      return {
+        ...node,
+        ...(hit ? { pulseScore: hit.score, pulseRole: hit.pathRole } : {}),
+        ...(stats ? { pulseStats: stats } : {}),
+      } as GraphNode;
+    };
+    const decorateEdge = (edge: GraphEdge): GraphEdge => {
+      const relationIds = edge.aggregate?.relationIds ?? (edge.relation ? [edge.relation.id] : []);
+      const hit = relationIds
+        .map((relationId) => hitByTarget.get(`relation:${relationId}`))
+        .filter((entry): entry is PulseHit => Boolean(entry))
+        .sort((left, right) => right.score - left.score)[0];
+      const stats = combinePulseStats(relationIds.map((relationId) => statsByTarget.get(`relation:${relationId}`)));
+      return {
+        ...edge,
+        ...(hit ? { pulseScore: hit.score, pulseRole: hit.pathRole } : {}),
+        ...(stats ? { pulseStats: stats } : {}),
+      };
+    };
+    return {
+      ...graph,
+      nodes: nodes.map(decorateNode),
+      edges: edges.map(decorateEdge),
     };
   }
 

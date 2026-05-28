@@ -121,6 +121,37 @@ describe("HTTP application", () => {
     expect(manuallyTagged.body).toContain('"aspectSource":"manual"');
     const resetTag = await app.inject({ method: "DELETE", url: `/api/nodes/${claimNode!.id}/aspects` });
     expect(resetTag.body).toContain('"aspectSource":"ai"');
+    const createdPulse = (await app.inject({
+      method: "POST",
+      url: `/api/libraries/${library.id}/pulses`,
+      payload: { question: "claim follows" },
+    })).json<{
+      pulse: { id: string; status: string; answer: string };
+      hits: Array<{ targetType: string; pathRole: string }>;
+      graph: { nodes: Array<{ pulseRole?: string; pulseStats?: { correctCount: number; wrongCount: number } }> };
+    }>();
+    expect(createdPulse.pulse.status).toBe("unreviewed");
+    expect(createdPulse.pulse.answer).toContain("演示脉冲回答");
+    expect(createdPulse.hits.some((hit) => hit.targetType === "node" && hit.pathRole === "direct")).toBe(true);
+    expect(createdPulse.graph.nodes.some((node) => node.pulseRole === "direct")).toBe(true);
+    const listedPulses = (await app.inject({ method: "GET", url: `/api/libraries/${library.id}/pulses` }))
+      .json<Array<{ id: string }>>();
+    expect(listedPulses[0]?.id).toBe(createdPulse.pulse.id);
+    const markedWrong = (await app.inject({
+      method: "PATCH",
+      url: `/api/pulses/${createdPulse.pulse.id}/review`,
+      payload: { status: "wrong" },
+    })).json<{ pulse: { status: string }; graph: { nodes: Array<{ pulseStats?: { correctCount: number; wrongCount: number } }> } }>();
+    expect(markedWrong.pulse.status).toBe("wrong");
+    expect(markedWrong.graph.nodes.some((node) => (node.pulseStats?.wrongCount ?? 0) > 0)).toBe(true);
+    const markedCorrect = (await app.inject({
+      method: "PATCH",
+      url: `/api/pulses/${createdPulse.pulse.id}/review`,
+      payload: { status: "correct" },
+    })).json<{ pulse: { status: string }; graph: { nodes: Array<{ pulseStats?: { correctCount: number; wrongCount: number } }> } }>();
+    expect(markedCorrect.pulse.status).toBe("correct");
+    expect(markedCorrect.graph.nodes.some((node) => (node.pulseStats?.correctCount ?? 0) > 0)).toBe(true);
+    expect(markedCorrect.graph.nodes.every((node) => (node.pulseStats?.wrongCount ?? 0) === 0)).toBe(true);
     await app.inject({
       method: "PATCH",
       url: `/api/relations/${suggested!.id}`,

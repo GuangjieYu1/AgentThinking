@@ -16,6 +16,8 @@ import type {
   SearchResult,
   ModelStreamEvent,
   ModelTestResult,
+  Pulse,
+  PulseResponse,
   PublishedAnalysis,
   SourceStructure,
 } from "@agent-thinking/contracts";
@@ -113,7 +115,16 @@ export const api = {
   },
   graph: (
     id: string,
-    options: { centerId?: string; includeChunks?: boolean; status?: RelationStatus; type?: RelationType; view?: GraphView; aspect?: AspectKind } = {},
+    options: {
+      centerId?: string;
+      includeChunks?: boolean;
+      status?: RelationStatus;
+      type?: RelationType;
+      view?: GraphView;
+      aspect?: AspectKind;
+      pulseId?: string;
+      pulseStats?: boolean;
+    } = {},
   ) => {
     const query = new URLSearchParams();
     if (options.centerId) query.set("centerId", options.centerId);
@@ -122,12 +133,26 @@ export const api = {
     if (options.type) query.set("type", options.type);
     if (options.view) query.set("view", options.view);
     if (options.aspect) query.set("aspect", options.aspect);
+    if (options.pulseId) query.set("pulseId", options.pulseId);
+    if (options.pulseStats) query.set("pulseStats", "true");
     return request<GraphResponse>(`/libraries/${id}/graph?${query}`);
   },
   search: (id: string, query: string) =>
     request<SearchResult[]>(`/libraries/${id}/search`, {
       method: "POST",
       body: JSON.stringify({ query, limit: 10 }),
+    }),
+  pulses: (libraryId: string) => request<Pulse[]>(`/libraries/${libraryId}/pulses`),
+  pulse: (libraryId: string, pulseId: string) => request<PulseResponse>(`/libraries/${libraryId}/pulses/${pulseId}`),
+  createPulse: (libraryId: string, question: string) =>
+    request<PulseResponse>(`/libraries/${libraryId}/pulses`, {
+      method: "POST",
+      body: JSON.stringify({ question }),
+    }),
+  reviewPulse: (pulseId: string, status: "correct" | "wrong") =>
+    request<PulseResponse>(`/pulses/${pulseId}/review`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
     }),
   updateNode: (nodeId: string, title: string, summary: string) =>
     request<AbstractNode>(`/nodes/${nodeId}`, {

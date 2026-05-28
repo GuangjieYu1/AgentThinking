@@ -19,6 +19,9 @@ export const statementPrecheckStatuses = [
   "unsupported",
   "failed",
 ] as const;
+export const pulseStatuses = ["unreviewed", "correct", "wrong"] as const;
+export const pulseHitTargetTypes = ["node", "relation", "chunk"] as const;
+export const pulsePathRoles = ["direct", "expanded", "bridge"] as const;
 export const jobStages = [
   "queued",
   "parsing",
@@ -42,6 +45,9 @@ export type RelationType = (typeof relationTypes)[number];
 export type RelationStatus = (typeof relationStatuses)[number];
 export type StatementStatus = (typeof statementStatuses)[number];
 export type StatementPrecheckStatus = (typeof statementPrecheckStatuses)[number];
+export type PulseStatus = (typeof pulseStatuses)[number];
+export type PulseHitTargetType = (typeof pulseHitTargetTypes)[number];
+export type PulsePathRole = (typeof pulsePathRoles)[number];
 export type JobStage = (typeof jobStages)[number];
 export type OcrMode = (typeof ocrModes)[number];
 
@@ -187,8 +193,24 @@ export interface IngestJob {
 }
 
 export type GraphNode =
-  | { id: string; nodeType: "abstract"; data: AbstractNode; focusRole?: FocusRole }
-  | { id: string; nodeType: "chunk"; data: Chunk; focusRole?: FocusRole };
+  | {
+    id: string;
+    nodeType: "abstract";
+    data: AbstractNode;
+    focusRole?: FocusRole;
+    pulseScore?: number;
+    pulseRole?: PulsePathRole;
+    pulseStats?: PulseStats;
+  }
+  | {
+    id: string;
+    nodeType: "chunk";
+    data: Chunk;
+    focusRole?: FocusRole;
+    pulseScore?: number;
+    pulseRole?: PulsePathRole;
+    pulseStats?: PulseStats;
+  };
 
 export interface GraphEdge {
   id: string;
@@ -201,6 +223,9 @@ export interface GraphEdge {
     count: number;
     relationIds: string[];
   };
+  pulseScore?: number;
+  pulseRole?: PulsePathRole;
+  pulseStats?: PulseStats;
 }
 
 export interface GraphResponse {
@@ -217,6 +242,60 @@ export interface GraphResponse {
 export interface SearchResult {
   chunk: Chunk;
   score: number;
+}
+
+export interface Pulse {
+  id: string;
+  libraryId: string;
+  question: string;
+  answer: string;
+  summary: string;
+  status: PulseStatus;
+  createdAt: string;
+  reviewedAt: string | null;
+}
+
+export interface PulseHit {
+  id: string;
+  pulseId: string;
+  libraryId: string;
+  targetType: PulseHitTargetType;
+  targetId: string;
+  score: number;
+  reason: string;
+  pathRole: PulsePathRole;
+  label: string;
+  excerpt: string | null;
+}
+
+export interface PulseStats {
+  correctCount: number;
+  wrongCount: number;
+  lastCorrectAt: string | null;
+  lastWrongAt: string | null;
+}
+
+export interface PulseTrace extends PulseStats {
+  libraryId: string;
+  targetType: "node" | "relation";
+  targetId: string;
+}
+
+export interface PulseResponse {
+  pulse: Pulse;
+  hits: PulseHit[];
+  graph: GraphResponse;
+}
+
+export interface PulseAnswerContext {
+  chunks: Array<{ id: string; text: string; score: number; headingPath: string | null; pageNumber: number | null }>;
+  nodes: Array<{ id: string; title: string; summary: string; score: number }>;
+  relations: Array<{ id: string; type: RelationType; sourceTitle: string; targetTitle: string; reason: string; score: number }>;
+}
+
+export interface PulseAnswerOutput {
+  answer: string;
+  summary: string;
 }
 
 export interface PublishedAnalysis {
@@ -292,6 +371,16 @@ export const updateNodeAspectsSchema = z.object({
 });
 export type UpdateNodeAspectsInput = z.infer<typeof updateNodeAspectsSchema>;
 
+export const createPulseSchema = z.object({
+  question: z.string().trim().min(1).max(1000),
+});
+export type CreatePulseInput = z.infer<typeof createPulseSchema>;
+
+export const reviewPulseSchema = z.object({
+  status: z.enum(["correct", "wrong"]),
+});
+export type ReviewPulseInput = z.infer<typeof reviewPulseSchema>;
+
 export const createRelationSchema = z.object({
   sourceNodeId: z.string().min(1),
   targetNodeId: z.string().min(1),
@@ -325,6 +414,12 @@ export const statementPrecheckSchema = z.object({
 });
 
 export type StatementPrecheckOutput = z.infer<typeof statementPrecheckSchema>;
+
+export const pulseAnswerSchema = z.object({
+  answer: z.string().trim().min(1).max(4000),
+  summary: z.string().trim().min(1).max(1000),
+});
+export type PulseAnswerSchemaOutput = z.infer<typeof pulseAnswerSchema>;
 
 export const searchSchema = z.object({
   query: z.string().trim().min(1).max(1000),

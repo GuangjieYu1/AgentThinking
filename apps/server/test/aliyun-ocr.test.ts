@@ -35,7 +35,12 @@ describe("Alibaba Cloud OCR", () => {
   });
 
   it("requires RAM credentials before transmitting images", async () => {
-    const config = getConfig({ provider: "fake", ocrProvider: "aliyun" });
+    const config = {
+      ...getConfig({ provider: "fake", ocrProvider: "aliyun" }),
+      aliyunAccessKeyId: undefined,
+      aliyunAccessKeySecret: undefined,
+      aliyunSecurityToken: undefined,
+    };
     await expect(recognizeAliyunImage(Buffer.from("page"), config)).rejects.toThrow(/ALIBABA_CLOUD_ACCESS_KEY_ID/);
   });
 });

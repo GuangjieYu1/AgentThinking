@@ -146,6 +146,8 @@ export const api = {
     }),
   pulses: (libraryId: string) => request<Pulse[]>(`/libraries/${libraryId}/pulses`),
   pulse: (libraryId: string, pulseId: string) => request<PulseResponse>(`/libraries/${libraryId}/pulses/${pulseId}`),
+  clearPulses: (libraryId: string) =>
+    request<{ deleted: number }>(`/libraries/${libraryId}/pulses`, { method: "DELETE" }),
   createPulse: (libraryId: string, question: string, mode: PulseInputMode = "full") =>
     request<PulseResponse>(`/libraries/${libraryId}/pulses`, {
       method: "POST",

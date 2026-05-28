@@ -1390,6 +1390,24 @@ export class AgentDatabase {
     ).map(pulseFrom);
   }
 
+  clearPulses(libraryId: string): number {
+    const count = Number(row(this.sql.prepare("SELECT COUNT(*) AS count FROM pulses WHERE library_id = ?"), libraryId)?.count ?? 0);
+    this.sql.exec("BEGIN");
+    try {
+      this.sql.prepare(`
+        DELETE FROM pulse_hits
+        WHERE pulse_id IN (SELECT id FROM pulses WHERE library_id = ?)
+      `).run(libraryId);
+      this.sql.prepare("DELETE FROM pulses WHERE library_id = ?").run(libraryId);
+      this.sql.prepare("DELETE FROM pulse_traces WHERE library_id = ?").run(libraryId);
+      this.sql.exec("COMMIT");
+      return count;
+    } catch (error) {
+      this.sql.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getPulse(id: string): Pulse | undefined {
     const result = row(this.sql.prepare("SELECT * FROM pulses WHERE id = ?"), id);
     return result ? pulseFrom(result) : undefined;

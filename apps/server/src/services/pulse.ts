@@ -56,6 +56,39 @@ function relationTouchesBridge(relation: Relation, directNodeIds: Set<string>, b
     (directNodeIds.has(relation.targetNodeId) && bridgeNodeIds.has(relation.sourceNodeId));
 }
 
+function summarizeCandidates(candidates: PulseNavigationCandidate[], limit = 12): PulseNavigationCandidate[] {
+  return candidates.slice(0, limit).map((candidate) => ({
+    ...candidate,
+    summary: candidate.summary.slice(0, 220),
+    ...(candidate.relationReason ? { relationReason: candidate.relationReason.slice(0, 220) } : {}),
+  }));
+}
+
+function rejectedCandidatesFor(
+  decision: { rejectedCandidates?: Array<{ id: string; reason: string }> },
+  candidates: PulseNavigationCandidate[],
+  selectedIds: Set<string>,
+): Array<{ id: string; label: string; reason: string }> {
+  const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+  const explicit = (decision.rejectedCandidates ?? [])
+    .filter((candidate) => !selectedIds.has(candidate.id) && byId.has(candidate.id))
+    .slice(0, 4)
+    .map((candidate) => ({
+      id: candidate.id,
+      label: byId.get(candidate.id)!.label,
+      reason: candidate.reason,
+    }));
+  if (explicit.length > 0) return explicit;
+  return candidates
+    .filter((candidate) => !selectedIds.has(candidate.id))
+    .slice(0, 4)
+    .map((candidate) => ({
+      id: candidate.id,
+      label: candidate.label,
+      reason: "模型没有选择该候选；它在当前问题下的直接相关性低于已选路径。",
+    }));
+}
+
 export class PulseEngine {
   constructor(
     private readonly db: AgentDatabase,
@@ -240,19 +273,38 @@ export class PulseEngine {
     const nodes = new Map<string, AbstractNode>();
     const relations = new Map<string, Relation>();
     const visitedNodeIds = new Set<string>();
+    const expandedNodeIds = new Set<string>();
+    const pendingBranches: AbstractNode[] = [];
 
     await emitPulse(eventSink, { type: "stage", message: "正在选择脉冲入口节点" });
     const rootNodes = this.db.listPulseRootNodes(libraryId, 24);
     if (rootNodes.length === 0) return this.createFull(libraryId, question, eventSink);
 
+    const rootCandidates = rootNodes.map((node) => this.nodeCandidate(node, 0.72));
+    await emitPulse(eventSink, {
+      type: "candidates",
+      stepIndex: 1,
+      fromNodeIds: [],
+      fromLabels: ["图谱入口"],
+      candidates: summarizeCandidates(rootCandidates),
+    });
     const rootDecision = await this.model.selectPulseNavigation(
       question,
       "第 1 步：从可见根节点中选择入口",
-      rootNodes.map((node) => this.nodeCandidate(node, 0.72)),
+      rootCandidates,
     );
     const selectedRoots = rootDecision.selectedIds
       .flatMap((id) => rootNodes.find((node) => node.id === id) ?? [])
       .slice(0, 3);
+    const rootSelectedIds = new Set(selectedRoots.map((node) => node.id));
+    await emitPulse(eventSink, {
+      type: "decision",
+      stepIndex: 1,
+      selected: summarizeCandidates(rootCandidates.filter((candidate) => rootSelectedIds.has(candidate.id)), 3),
+      rejected: rejectedCandidatesFor(rootDecision, rootCandidates, rootSelectedIds),
+      observation: rootDecision.observation,
+      rationale: rootDecision.rationale,
+    });
     const firstFrontier = selectedRoots.length > 0 ? selectedRoots : rootNodes.slice(0, 1);
     for (const node of firstFrontier) {
       nodes.set(node.id, node);
@@ -271,11 +323,14 @@ export class PulseEngine {
       }, eventSink);
     }
 
-    let frontier = firstFrontier;
+    pendingBranches.push(...firstFrontier.slice(1));
+    let frontier = firstFrontier.slice(0, 1);
     let stepIndex = 2;
     for (let depth = 0; depth < 3 && frontier.length > 0; depth += 1) {
       await emitPulse(eventSink, { type: "stage", message: `正在展开第 ${depth + 1} 层脉冲路径` });
       for (const node of frontier) {
+        if (expandedNodeIds.has(node.id)) continue;
+        expandedNodeIds.add(node.id);
         for (const chunk of this.db.getNodeEvidenceChunks(node.id, 2)) {
           chunks.set(chunk.id, chunk);
           await recordHit(hits, {
@@ -298,7 +353,35 @@ export class PulseEngine {
       const candidates = [...childCandidates, ...relationCandidates]
         .sort((left, right) => right.candidate.score - left.candidate.score)
         .slice(0, 24);
-      if (candidates.length === 0) break;
+      if (candidates.length === 0) {
+        const from = frontier[0];
+        const retry = pendingBranches.shift();
+        if (from) {
+          await emitPulse(eventSink, {
+            type: "backtrack",
+            stepIndex,
+            fromNodeId: from.id,
+            fromLabel: from.title,
+            ...(retry ? { toNodeId: retry.id, toLabel: retry.title } : {}),
+            reason: retry
+              ? "当前节点没有新的可见候选，回到之前保留的备选分支继续探索。"
+              : "当前节点没有新的可见候选，也没有剩余备选分支。",
+          });
+        }
+        if (retry) {
+          frontier = [retry];
+          depth -= 1;
+          continue;
+        }
+        break;
+      }
+      await emitPulse(eventSink, {
+        type: "candidates",
+        stepIndex: stepIndex + 1,
+        fromNodeIds: frontier.map((node) => node.id),
+        fromLabels: frontier.map((node) => node.title),
+        candidates: summarizeCandidates(candidates.map((entry) => entry.candidate)),
+      });
 
       const decision = await this.model.selectPulseNavigation(
         question,
@@ -308,7 +391,38 @@ export class PulseEngine {
       const selected = decision.selectedIds
         .flatMap((id) => candidates.find((entry) => entry.node.id === id) ?? [])
         .slice(0, 3);
-      if (selected.length === 0) break;
+      const selectedIds = new Set(selected.map((entry) => entry.node.id));
+      const visibleCandidates = candidates.map((entry) => entry.candidate);
+      await emitPulse(eventSink, {
+        type: "decision",
+        stepIndex: stepIndex + 1,
+        selected: summarizeCandidates(selected.map((entry) => entry.candidate), 3),
+        rejected: rejectedCandidatesFor(decision, visibleCandidates, selectedIds),
+        observation: decision.observation,
+        rationale: decision.rationale,
+      });
+      if (selected.length === 0) {
+        const from = frontier[0];
+        const retry = pendingBranches.shift();
+        if (from) {
+          await emitPulse(eventSink, {
+            type: "backtrack",
+            stepIndex,
+            fromNodeId: from.id,
+            fromLabel: from.title,
+            ...(retry ? { toNodeId: retry.id, toLabel: retry.title } : {}),
+            reason: retry
+              ? "模型没有选择当前候选中的有效节点，回到之前保留的备选分支。"
+              : "模型没有选择当前候选中的有效节点，也没有剩余备选分支。",
+          });
+        }
+        if (retry) {
+          frontier = [retry];
+          depth -= 1;
+          continue;
+        }
+        break;
+      }
       stepIndex += 1;
       const nextFrontier: AbstractNode[] = [];
       for (const entry of selected) {
@@ -348,7 +462,8 @@ export class PulseEngine {
         }, eventSink);
         nextFrontier.push(node);
       }
-      frontier = nextFrontier;
+      pendingBranches.push(...nextFrontier.slice(1).filter((node) => !expandedNodeIds.has(node.id)));
+      frontier = nextFrontier.slice(0, 1);
       stepIndex += 1;
     }
 

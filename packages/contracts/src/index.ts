@@ -287,6 +287,15 @@ export interface PulseStreamHit {
   excerpt: string | null;
 }
 
+export interface PulseNavigationRejection {
+  id: string;
+  reason: string;
+}
+
+export interface PulseStreamRejectedCandidate extends PulseNavigationRejection {
+  label: string;
+}
+
 export interface PulseStats {
   correctCount: number;
   wrongCount: number;
@@ -309,6 +318,30 @@ export interface PulseResponse {
 export type PulseStreamEvent =
   | { type: "start"; mode: PulseInputMode; question: string }
   | { type: "stage"; message: string }
+  | {
+    type: "candidates";
+    stepIndex: number;
+    fromNodeIds: string[];
+    fromLabels: string[];
+    candidates: PulseNavigationCandidate[];
+  }
+  | {
+    type: "decision";
+    stepIndex: number;
+    selected: PulseNavigationCandidate[];
+    rejected: PulseStreamRejectedCandidate[];
+    observation: string;
+    rationale: string;
+  }
+  | {
+    type: "backtrack";
+    stepIndex: number;
+    fromNodeId: string;
+    fromLabel: string;
+    toNodeId?: string;
+    toLabel?: string;
+    reason: string;
+  }
   | { type: "hit"; hit: PulseStreamHit }
   | { type: "answer"; answer: string; summary: string }
   | { type: "done"; response: PulseResponse }
@@ -346,6 +379,7 @@ export interface PulseNavigationDecision {
   selectedIds: string[];
   observation: string;
   rationale: string;
+  rejectedCandidates?: PulseNavigationRejection[];
 }
 
 export interface PublishedAnalysis {
@@ -476,6 +510,10 @@ export const pulseNavigationDecisionSchema = z.object({
   selectedIds: z.array(z.string().trim().min(1)).min(1).max(3),
   observation: z.string().trim().min(1).max(800),
   rationale: z.string().trim().min(1).max(800),
+  rejectedCandidates: z.array(z.object({
+    id: z.string().trim().min(1),
+    reason: z.string().trim().min(1).max(500),
+  })).max(8).default([]),
 });
 export type PulseNavigationDecisionSchemaOutput = z.infer<typeof pulseNavigationDecisionSchema>;
 

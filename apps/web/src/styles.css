@@ -241,6 +241,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .pulse-toolbar form { display: flex; gap: 7px; flex: 1; min-width: 260px; }
 .pulse-toolbar form input { flex: 1; }
 .pulse-toolbar select { min-width: 132px; }
+.pulse-clear-history { white-space: nowrap; padding: 7px 9px; }
 .aspect-filter { min-width: 112px; }
 .graph-depth { display: flex; gap: 4px; padding: 3px; background: #0d1728; border: 1px solid #25334c; border-radius: 9px; }
 .graph-depth button { padding: 6px 10px; border: 0; background: transparent; color: #8d9db7; }
@@ -292,6 +293,19 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 }
 .pulse-draft-answer strong { color: #7edac3; font-size: 12px; }
 .pulse-draft-answer p { max-height: 120px; overflow-y: auto; }
+.pulse-navigation-log {
+  display: grid; gap: 7px; max-height: 250px; overflow-y: auto;
+  padding: 8px; border: 1px solid #26364d; border-radius: 8px; background: #0d1728;
+}
+.pulse-navigation-log > strong { color: #f5cf6a; font-size: 12px; }
+.pulse-navigation-event {
+  display: grid; gap: 4px; padding: 7px 8px; border-left: 3px solid #35506d;
+  border-radius: 6px; background: #121e31; font-size: 12px;
+}
+.pulse-navigation-event span { color: #dce7f6; }
+.pulse-navigation-event small { color: #98a9c1; line-height: 1.4; }
+.pulse-navigation-decision { border-left-color: #f5cf6a; }
+.pulse-navigation-backtrack { border-left-color: #ef8fa5; }
 .pulse-playback {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 7px; border: 1px solid #223047;
   border-radius: 8px; background: #0d1728;
@@ -390,6 +404,13 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 }
 .react-flow__edge.flow-pulse-active-edge path {
   animation: pulseCurrentEdge .72s ease-out;
+}
+.flow-pulse-orb {
+  fill: #fff3a0;
+  stroke: #f8d26a;
+  stroke-width: 2;
+  filter: drop-shadow(0 0 7px #f8d26a) drop-shadow(0 0 14px #f8d26a);
+  pointer-events: none;
 }
 .flow-pulse-correct { box-shadow: 0 0 0 2px #4bd493, 0 0 24px #4bd49355 !important; }
 .flow-pulse-wrong { box-shadow: 0 0 0 2px #ef5f7a, 0 0 24px #ef5f7a66 !important; }

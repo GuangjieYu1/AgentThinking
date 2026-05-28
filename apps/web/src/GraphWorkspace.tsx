@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import {
+  BaseEdge,
   Background,
   ControlButton,
   Controls,
+  getBezierPath,
+  getSmoothStepPath,
   MarkerType,
   MiniMap,
   Position,
@@ -11,6 +14,8 @@ import {
   useNodesState,
   type Connection,
   type Edge,
+  type EdgeProps,
+  type EdgeTypes,
   type Node,
   type ReactFlowInstance,
 } from "@xyflow/react";
@@ -29,6 +34,7 @@ import {
   type Pulse,
   type PulseInputMode,
   type PulseResponse,
+  type PulseStreamEvent,
   type PulseStreamHit,
   type Relation,
   type RelationStatus,
@@ -43,7 +49,9 @@ type LayoutMode = "layered" | "network" | "tree";
 type PulseLayerMode = "normal" | "current" | "stats" | "wrong" | "correct";
 type PulseHitRecord = PulseResponse["hits"][number];
 type PulseStreamHitRecord = PulseStreamHit;
-type PulseDecorated = { pulseActive?: boolean };
+type PulseNavigationEvent = Extract<PulseStreamEvent, { type: "candidates" | "decision" | "backtrack" }>;
+type PulseDecorated = { pulseActive?: boolean; pulseReverse?: boolean; pulseTransitKey?: string };
+type PulseVisualHit = Pick<PulseHitRecord, "targetType" | "targetId">;
 interface LayoutLink {
   source: string;
   target: string;
@@ -51,6 +59,71 @@ interface LayoutLink {
 interface PositionedNode extends SimulationNodeDatum {
   id: string;
 }
+
+function PulseBezierEdge(props: EdgeProps): ReactNode {
+  return <PulseOrbEdge {...props} pathKind="bezier" />;
+}
+
+function PulseSmoothStepEdge(props: EdgeProps): ReactNode {
+  return <PulseOrbEdge {...props} pathKind="smoothstep" />;
+}
+
+function PulseOrbEdge({
+  id,
+  sourceX,
+  sourceY,
+  sourcePosition,
+  targetX,
+  targetY,
+  targetPosition,
+  markerEnd,
+  style,
+  label,
+  labelStyle,
+  interactionWidth,
+  data,
+  pathKind,
+}: EdgeProps & { pathKind: "bezier" | "smoothstep" }): ReactNode {
+  const [edgePath, labelX, labelY] = pathKind === "smoothstep"
+    ? getSmoothStepPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
+    : getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
+  const pulseMeta = (data as { entity?: PulseDecorated } | undefined)?.entity;
+  const reverse = Boolean(pulseMeta?.pulseReverse);
+  const transitKey = pulseMeta?.pulseTransitKey ?? id;
+  const edgeProps = {
+    ...(markerEnd ? { markerEnd } : {}),
+    ...(style ? { style } : {}),
+    ...(label !== undefined ? { label } : {}),
+    labelX,
+    labelY,
+    ...(labelStyle ? { labelStyle } : {}),
+    ...(interactionWidth !== undefined ? { interactionWidth } : {}),
+  };
+  return (
+    <>
+      <BaseEdge
+        id={id}
+        path={edgePath}
+        {...edgeProps}
+      />
+      <circle className="flow-pulse-orb" r="5" key={transitKey}>
+        <animateMotion
+          dur="1.05s"
+          fill="freeze"
+          repeatCount="1"
+          path={edgePath}
+          calcMode="linear"
+          {...(reverse ? { keyPoints: "1;0", keyTimes: "0;1" } : {})}
+        />
+      </circle>
+    </>
+  );
+}
+
+const edgeTypes = {
+  pulseBezier: PulseBezierEdge,
+  pulseSmoothStep: PulseSmoothStepEdge,
+} satisfies EdgeTypes;
 
 const aspectLabels: Record<AspectKind, string> = {
   person: "人物",
@@ -103,8 +176,16 @@ function isPulseActive(record: GraphNode | GraphEdge): boolean {
   return Boolean((record as PulseDecorated).pulseActive);
 }
 
-function withPulseActive<T extends GraphNode | GraphEdge>(record: T): T {
-  return { ...record, pulseActive: true } as T;
+function withPulseActive<T extends GraphNode | GraphEdge>(
+  record: T,
+  options: { reverse?: boolean; transitKey?: string } = {},
+): T {
+  return {
+    ...record,
+    pulseActive: true,
+    ...(options.reverse ? { pulseReverse: true } : {}),
+    ...(options.transitKey ? { pulseTransitKey: options.transitKey } : {}),
+  } as T;
 }
 
 const pulseRoleRank = { direct: 0, bridge: 1, expanded: 2 } satisfies Record<NonNullable<GraphNode["pulseRole"]>, number>;
@@ -192,6 +273,10 @@ function pulseStepExplanation(hit: PulseHitRecord | undefined, total: number): s
   return `第 ${hit.stepIndex ?? "?"} 步点亮${target}「${hit.label}」。看到的信息：${observation} 选择理由：${rationale}`;
 }
 
+function pulseHitReason(hit: { rationale: string | null; reason: string }): string {
+  return hit.rationale?.trim() || hit.reason;
+}
+
 function pulseHitKey(hit: Pick<PulseHitRecord, "targetType" | "targetId">): string {
   return `${hit.targetType}:${hit.targetId}`;
 }
@@ -208,11 +293,60 @@ function graphEdgePulseKeys(record: GraphEdge): string[] {
 function withoutCurrentPulse<T extends GraphNode | GraphEdge>(record: T): T {
   const {
     pulseActive: _pulseActive,
+    pulseReverse: _pulseReverse,
+    pulseTransitKey: _pulseTransitKey,
     pulseScore: _pulseScore,
     pulseRole: _pulseRole,
     ...rest
   } = record as T & PulseDecorated;
   return rest as T;
+}
+
+function lastNodeBefore(hits: PulseVisualHit[], endIndex: number): string | undefined {
+  for (let index = endIndex - 1; index >= 0; index -= 1) {
+    if (hits[index]?.targetType === "node") return hits[index]!.targetId;
+  }
+  return undefined;
+}
+
+function activeEdgeState(
+  edge: GraphEdge,
+  hits: PulseVisualHit[],
+): { active: boolean; reverse: boolean; transitKey: string } {
+  const activeIndex = hits.length - 1;
+  const activeHit = hits[activeIndex];
+  if (!activeHit) return { active: false, reverse: false, transitKey: "" };
+  const activeKey = pulseHitKey(activeHit);
+  const edgeKeys = graphEdgePulseKeys(edge);
+
+  if (activeHit.targetType === "relation" && edgeKeys.includes(activeKey)) {
+    const fromNodeId = lastNodeBefore(hits, activeIndex);
+    return {
+      active: true,
+      reverse: Boolean(fromNodeId && edge.target === fromNodeId && edge.source !== fromNodeId),
+      transitKey: `${activeKey}:${fromNodeId ?? "unknown"}`,
+    };
+  }
+
+  if (activeHit.targetType === "node") {
+    for (let index = activeIndex - 1; index >= 0; index -= 1) {
+      const previous = hits[index]!;
+      if (previous.targetType !== "relation" || !edgeKeys.includes(pulseHitKey(previous))) continue;
+      const edgeTouchesActiveNode = edge.source === activeHit.targetId || edge.target === activeHit.targetId;
+      if (!edgeTouchesActiveNode) continue;
+      return {
+        active: true,
+        reverse: edge.source === activeHit.targetId,
+        transitKey: `${pulseHitKey(previous)}:${activeHit.targetId}`,
+      };
+    }
+  }
+
+  if (activeHit.targetType === "chunk" && edge.edgeType === "evidence" && edge.target === activeHit.targetId) {
+    return { active: true, reverse: false, transitKey: activeKey };
+  }
+
+  return { active: false, reverse: false, transitKey: "" };
 }
 
 function revealPulseGraph(
@@ -230,7 +364,9 @@ function revealPulseGraph(
   const activeKey = activeHit ? pulseHitKey(activeHit) : "";
   const nodes = graphNodes.map((record) => {
     const visible = record.pulseRole && !revealed.has(graphNodePulseKey(record)) ? withoutCurrentPulse(record) : record;
-    return activeKey === graphNodePulseKey(record) && visible.pulseRole ? withPulseActive(visible) : visible;
+    return activeKey === graphNodePulseKey(record) && visible.pulseRole
+      ? withPulseActive(visible, { transitKey: activeKey })
+      : visible;
   });
   const edges = graphEdges.map((record) => {
     const keys = graphEdgePulseKeys(record);
@@ -242,7 +378,55 @@ function revealPulseGraph(
     }
     const relationIsActive = graphEdgePulseKeys(next).some((key) => key === activeKey);
     const evidenceIsActive = next.edgeType === "evidence" && activeKey === `chunk:${next.target}` && revealed.has(`node:${next.source}`);
-    return (relationIsActive || evidenceIsActive) && next.pulseRole ? withPulseActive(next) : next;
+    const travel = activeEdgeState(next, revealedHits);
+    return (travel.active || relationIsActive || evidenceIsActive) && next.pulseRole
+      ? withPulseActive(next, { reverse: travel.reverse, transitKey: travel.transitKey || activeKey })
+      : next;
+  });
+  return { nodes, edges };
+}
+
+function decoratePulseStreamGraph(
+  graphNodes: GraphNode[],
+  graphEdges: GraphEdge[],
+  hits: PulseStreamHitRecord[],
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  const hitByKey = new Map(hits.map((hit) => [pulseHitKey(hit), hit]));
+  const activeHit = hits.at(-1);
+  const activeKey = activeHit ? pulseHitKey(activeHit) : "";
+  const nodes = graphNodes.map((record) => {
+    const base = withoutCurrentPulse(record);
+    const hit = hitByKey.get(graphNodePulseKey(base));
+    if (!hit) return base;
+    const next = {
+      ...base,
+      pulseRole: hit.pathRole,
+      pulseScore: hit.score,
+    };
+    return activeKey === graphNodePulseKey(base) ? withPulseActive(next, { transitKey: activeKey }) : next;
+  });
+  const edges = graphEdges.map((record) => {
+    const base = withoutCurrentPulse(record);
+    const relationHit = graphEdgePulseKeys(base).flatMap((key) => hitByKey.get(key) ?? []);
+    if (relationHit[0]) {
+      const next = {
+        ...base,
+        pulseRole: relationHit[0].pathRole,
+        pulseScore: relationHit[0].score,
+      };
+      const travel = activeEdgeState(next, hits);
+      return travel.active || graphEdgePulseKeys(base).includes(activeKey)
+        ? withPulseActive(next, { reverse: travel.reverse, transitKey: travel.transitKey || activeKey })
+        : next;
+    }
+    if (base.edgeType === "evidence" && hitByKey.has(`node:${base.source}`) && hitByKey.has(`chunk:${base.target}`)) {
+      const next = { ...base, pulseRole: "expanded" as const, pulseScore: 0.32 };
+      const travel = activeEdgeState(next, hits);
+      return travel.active || activeKey === `chunk:${base.target}`
+        ? withPulseActive(next, { reverse: travel.reverse, transitKey: travel.transitKey || activeKey })
+        : next;
+    }
+    return base;
   });
   return { nodes, edges };
 }
@@ -449,15 +633,15 @@ function displayEdges(records: GraphEdge[], layout: LayoutMode, pulseMode: Pulse
       id: record.id,
       source: record.source,
       target: record.target,
-      type: layout === "network" ? "default" : "smoothstep",
+      type: active ? layout === "network" ? "pulseBezier" : "pulseSmoothStep" : layout === "network" ? "default" : "smoothstep",
       data: { entity: record },
-      animated: status === "suggested" || active,
+      animated: status === "suggested",
       ...(active ? { className: "flow-pulse-active-edge" } : {}),
       style: {
         stroke: pulseTraceColor(record, pulseMode, baseStroke),
         strokeWidth: active ? 4.8 : record.pulseRole ? 3.5 : record.pulseStats ? 3 : record.aggregate ? 2.8 : record.edgeType === "evidence" ? 1.5 : 2,
         opacity: pulseClass === "flow-pulse-muted" ? 0.22 : 1,
-        ...(active ? { strokeDasharray: "10 6", filter: "drop-shadow(0 0 7px #f8d26a)" } : {}),
+        ...(active ? { filter: "drop-shadow(0 0 7px #f8d26a)" } : {}),
         ...(!active && (status === "suggested" || record.edgeType !== "relation") ? { strokeDasharray: "5 4" } : {}),
       },
       labelStyle: { fill: "#b5c5dd", fontSize: 12, fontWeight: 600 },
@@ -513,6 +697,7 @@ export function GraphWorkspace({
   const [pulsing, setPulsing] = useState(false);
   const [pulseStreamMessage, setPulseStreamMessage] = useState("");
   const [pulseStreamHits, setPulseStreamHits] = useState<PulseStreamHitRecord[]>([]);
+  const [pulseNavigationEvents, setPulseNavigationEvents] = useState<PulseNavigationEvent[]>([]);
   const [pulseDraftAnswer, setPulseDraftAnswer] = useState("");
   const currentPulseHits = useMemo(() => orderedPulseHits(currentPulse), [currentPulse]);
   const currentPulseStep = currentPulseHits[Math.max(0, Math.min(pulseRevealCount, currentPulseHits.length) - 1)];
@@ -580,12 +765,20 @@ export function GraphWorkspace({
   }, [pulseMode, pulseRevealCount, currentPulse?.pulse.id, records, edgeRecords, layout, aspect]);
 
   useEffect(() => {
+    if (!pulsing || currentPulse || pulseStreamHits.length === 0 || records.length === 0) return;
+    const visibleGraph = decoratePulseStreamGraph(records, edgeRecords, pulseStreamHits);
+    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, "current"));
+    setEdges(displayEdges(visibleGraph.edges, layout, "current"));
+  }, [pulsing, currentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect]);
+
+  useEffect(() => {
     setCurrentPulse(undefined);
     setPulseMode("normal");
     setPulseRevealCount(0);
     setPulsePlaying(false);
     setPulseStreamMessage("");
     setPulseStreamHits([]);
+    setPulseNavigationEvents([]);
     setPulseDraftAnswer("");
     void api.pulses(libraryId).then(setPulseHistory).catch((cause: Error) => onError(cause.message));
   }, [libraryId, refreshKey]);
@@ -628,6 +821,7 @@ export function GraphWorkspace({
     setPulsePlaying(false);
     setPulseStreamMessage("正在启动脉冲...");
     setPulseStreamHits([]);
+    setPulseNavigationEvents([]);
     setPulseDraftAnswer("");
     try {
       await api.streamPulse(libraryId, question, pulseInputMode, (update) => {
@@ -644,8 +838,19 @@ export function GraphWorkspace({
             const key = pulseHitKey(update.hit);
             const existing = hits.findIndex((hit) => pulseHitKey(hit) === key);
             const next = existing >= 0 ? [...hits.slice(0, existing), update.hit, ...hits.slice(existing + 1)] : [...hits, update.hit];
-            return next.sort(sortPulseHits);
+            return next;
           });
+          return;
+        }
+        if (update.type === "candidates" || update.type === "decision" || update.type === "backtrack") {
+          setPulseNavigationEvents((events) => [...events, update].slice(-18));
+          if (update.type === "candidates") {
+            setPulseStreamMessage(`模型看到 ${update.candidates.length} 个候选节点，正在选择下一步...`);
+          } else if (update.type === "decision") {
+            setPulseStreamMessage(`模型选择了 ${update.selected.map((candidate) => candidate.label).join("、") || "无有效节点"}。`);
+          } else {
+            setPulseStreamMessage(update.toLabel ? `走到死胡同，回退到 ${update.toLabel}` : "当前路径走到死胡同。");
+          }
           return;
         }
         if (update.type === "answer") {
@@ -662,6 +867,7 @@ export function GraphWorkspace({
           setPulsePlaying(true);
           setPulseStreamMessage("");
           setPulseStreamHits([]);
+          setPulseNavigationEvents([]);
           setPulseDraftAnswer("");
           applyGraph(response.graph, layout, "current", 0, response);
           return;
@@ -681,6 +887,7 @@ export function GraphWorkspace({
       setPulseMode("normal");
       setPulseStreamMessage("");
       setPulseStreamHits([]);
+      setPulseNavigationEvents([]);
       setPulseDraftAnswer("");
       return;
     }
@@ -689,6 +896,7 @@ export function GraphWorkspace({
       setCurrentPulse(response);
       setPulseStreamMessage("");
       setPulseStreamHits([]);
+      setPulseNavigationEvents([]);
       setPulseDraftAnswer("");
       setPulseQuestion(response.pulse.question);
       setPulseInputMode(response.pulse.inputMode);
@@ -696,6 +904,29 @@ export function GraphWorkspace({
       setPulseRevealCount(0);
       setPulsePlaying(true);
       applyGraph(response.graph, layout, "current", 0, response);
+    } catch (cause) {
+      onError((cause as Error).message);
+    }
+  };
+
+  const clearPulseHistory = async () => {
+    if (pulsing || pulseHistory.length === 0) return;
+    try {
+      await api.clearPulses(libraryId);
+      setPulseHistory([]);
+      setCurrentPulse(undefined);
+      setPulseMode("normal");
+      setPulseRevealCount(0);
+      setPulsePlaying(false);
+      const graph = await api.graph(libraryId, {
+        ...(focusedNodeId ? { centerId: focusedNodeId } : {}),
+        includeChunks: view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1,
+        ...(status ? { status } : {}),
+        ...(type ? { type } : {}),
+        ...(aspect ? { aspect } : {}),
+        view,
+      });
+      applyGraph(graph, layout, "normal", 0, undefined);
     } catch (cause) {
       onError((cause as Error).message);
     }
@@ -822,6 +1053,14 @@ export function GraphWorkspace({
             </option>
           ))}
         </select>
+        <button
+          type="button"
+          className="ghost pulse-clear-history"
+          disabled={pulsing || pulseHistory.length === 0}
+          onClick={() => void clearPulseHistory()}
+        >
+          清空历史
+        </button>
         <select value={pulseMode} onChange={(event) => changePulseMode(event.target.value as PulseLayerMode)}>
           <option value="normal">正常图谱</option>
           <option value="current">当前脉冲</option>
@@ -835,6 +1074,7 @@ export function GraphWorkspace({
           <ReactFlow
             nodes={nodes}
             edges={edges}
+            edgeTypes={edgeTypes}
             onInit={setFlowInstance}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
@@ -890,6 +1130,36 @@ export function GraphWorkspace({
                 <span className="pulse-live-dot" />
                 <span>{pulseStreamMessage || "正在等待首个脉冲事件..."}</span>
               </div>
+              {pulseNavigationEvents.length > 0 && (
+                <div className="pulse-navigation-log">
+                  <strong>模型导航过程</strong>
+                  {pulseNavigationEvents.slice(-6).map((event, index) => (
+                    <div className={`pulse-navigation-event pulse-navigation-${event.type}`} key={`${event.type}-${event.stepIndex}-${index}`}>
+                      {event.type === "candidates" && (
+                        <>
+                          <span>第 {event.stepIndex} 步：从 {event.fromLabels.join("、")} 看到了 {event.candidates.length} 个候选</span>
+                          <small>{event.candidates.slice(0, 4).map((candidate) => `${candidate.label} ${candidate.score.toFixed(2)}`).join(" / ")}</small>
+                        </>
+                      )}
+                      {event.type === "decision" && (
+                        <>
+                          <span>选择：{event.selected.map((candidate) => candidate.label).join("、") || "无有效节点"}</span>
+                          <small>{event.rationale}</small>
+                          {event.rejected.length > 0 && (
+                            <small>未选：{event.rejected.slice(0, 3).map((candidate) => `${candidate.label}：${candidate.reason}`).join("；")}</small>
+                          )}
+                        </>
+                      )}
+                      {event.type === "backtrack" && (
+                        <>
+                          <span>回退：{event.fromLabel}{event.toLabel ? ` → ${event.toLabel}` : ""}</span>
+                          <small>{event.reason}</small>
+                        </>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
               {pulseDraftAnswer && (
                 <div className="pulse-draft-answer">
                   <strong>已生成回答草稿</strong>
@@ -903,10 +1173,10 @@ export function GraphWorkspace({
                 <span>证据 {pulseStreamHits.filter((hit) => hit.targetType === "chunk").length}</span>
               </div>
               <div className="pulse-hits pulse-stream-hits">
-                {pulseStreamHits.slice(0, 10).map((hit) => (
+                {pulseStreamHits.slice(-10).reverse().map((hit) => (
                   <button type="button" key={pulseHitKey(hit)} disabled>
                     <strong>{hit.label}</strong>
-                    <span>{hit.reason}</span>
+                    <span>{pulseHitReason(hit)}</span>
                     <small>{hit.pathRole} · {hit.score.toFixed(2)}</small>
                   </button>
                 ))}
@@ -980,7 +1250,7 @@ export function GraphWorkspace({
                     onClick={() => openPulseHit(hit)}
                   >
                     <strong>{hit.label}</strong>
-                    <span>{hit.reason}</span>
+                    <span>{pulseHitReason(hit)}</span>
                     <small>{hit.pathRole} · {hit.score.toFixed(2)}</small>
                   </button>
                 ))}

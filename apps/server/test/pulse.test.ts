@@ -61,9 +61,12 @@ describe("pulse activation", () => {
   it("records progressive input mode and visible navigation explanations", async () => {
     const db = await database();
     const { library } = seedPulseGraph(db);
+    const streamedEvents: string[] = [];
 
     const pulse = await new PulseEngine(db, new VectorStore(db), new FakeModelProvider())
-      .create(library.id, "alpha beta", "progressive");
+      .create(library.id, "alpha beta", "progressive", (event) => {
+        streamedEvents.push(event.type);
+      });
 
     expect(pulse.pulse.inputMode).toBe("progressive");
     expect(pulse.hits.length).toBeGreaterThan(0);
@@ -71,6 +74,7 @@ describe("pulse activation", () => {
     expect(pulse.hits.some((hit) => hit.observation?.length)).toBe(true);
     expect(pulse.hits.some((hit) => hit.rationale?.length)).toBe(true);
     expect(pulse.hits.map((hit) => hit.label)).toContain("Bridge");
+    expect(streamedEvents).toEqual(expect.arrayContaining(["candidates", "decision", "backtrack"]));
     db.close();
   });
 });

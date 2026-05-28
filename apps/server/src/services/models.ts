@@ -345,10 +345,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
           role: "system",
           content:
             "Choose the next visible knowledge-graph node for a progressive retrieval pulse. " +
-            'Return JSON only: {"selectedIds":["..."],"observation":"...","rationale":"..."}. ' +
+            'Return JSON only: {"selectedIds":["..."],"observation":"...","rationale":"...","rejectedCandidates":[{"id":"...","reason":"..."}]}. ' +
             "selectedIds must come from the supplied candidates and include one to three ids. " +
             "observation should state what information was visible at this step. " +
             "rationale should be a concise, user-facing navigation reason based only on visible candidate labels, summaries, relation labels, and relation reasons. " +
+            "rejectedCandidates should briefly explain why up to four visible but unselected candidates were less useful than the selected ones. " +
             "Do not reveal hidden chain-of-thought or private scratchpad reasoning; provide an auditable explanation instead.",
         },
         { role: "user", content: JSON.stringify({ question, step, candidates }) },

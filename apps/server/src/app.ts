@@ -296,6 +296,10 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     requireLibrary(db, request.params.libraryId);
     return db.listPulses(request.params.libraryId);
   });
+  app.delete<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request) => {
+    requireLibrary(db, request.params.libraryId);
+    return { deleted: db.clearPulses(request.params.libraryId) };
+  });
   app.get<{ Params: { libraryId: string; pulseId: string } }>("/api/libraries/:libraryId/pulses/:pulseId", async (request, reply) => {
     requireLibrary(db, request.params.libraryId);
     const response = db.getPulseResponse(request.params.libraryId, request.params.pulseId);

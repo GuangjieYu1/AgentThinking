@@ -164,6 +164,19 @@ describe("HTTP application", () => {
     expect(markedCorrect.pulse.status).toBe("correct");
     expect(markedCorrect.graph.nodes.some((node) => (node.pulseStats?.correctCount ?? 0) > 0)).toBe(true);
     expect(markedCorrect.graph.nodes.every((node) => (node.pulseStats?.wrongCount ?? 0) === 0)).toBe(true);
+    const clearedPulses = (await app.inject({
+      method: "DELETE",
+      url: `/api/libraries/${library.id}/pulses`,
+    })).json<{ deleted: number }>();
+    expect(clearedPulses.deleted).toBeGreaterThanOrEqual(2);
+    const pulsesAfterClear = (await app.inject({ method: "GET", url: `/api/libraries/${library.id}/pulses` }))
+      .json<Array<{ id: string }>>();
+    expect(pulsesAfterClear).toHaveLength(0);
+    const graphAfterPulseClear = (await app.inject({
+      method: "GET",
+      url: `/api/libraries/${library.id}/graph?pulseStats=true`,
+    })).json<{ nodes: Array<{ pulseStats?: { correctCount: number; wrongCount: number } }> }>();
+    expect(graphAfterPulseClear.nodes.every((node) => !node.pulseStats)).toBe(true);
     await app.inject({
       method: "PATCH",
       url: `/api/relations/${suggested!.id}`,

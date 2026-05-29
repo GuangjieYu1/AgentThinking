@@ -60,6 +60,17 @@ export interface Library {
   updatedAt: string;
 }
 
+export interface AuthUser {
+  id: string;
+  username: string;
+  createdAt: string;
+}
+
+export interface AuthSession {
+  authRequired: boolean;
+  user: AuthUser | null;
+}
+
 export interface LibrarySettings {
   libraryId: string;
   ocrMode: OcrMode;
@@ -440,6 +451,19 @@ export type ModelStreamEvent =
 export const createLibrarySchema = z.object({
   name: z.string().trim().min(1).max(120),
 });
+
+export const registerSchema = z.object({
+  username: z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_-]+$/, "用户名只能包含字母、数字、下划线和连字符"),
+  password: z.string().min(8).max(200),
+  registrationKey: z.string().trim().min(1).max(200),
+});
+export type RegisterInput = z.infer<typeof registerSchema>;
+
+export const loginSchema = z.object({
+  username: z.string().trim().min(1).max(40),
+  password: z.string().min(1).max(200),
+});
+export type LoginInput = z.infer<typeof loginSchema>;
 
 export const updateLibrarySettingsSchema = z.object({
   ocrMode: z.enum(ocrModes),

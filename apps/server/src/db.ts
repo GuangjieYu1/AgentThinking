@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync as NativeDatabaseSync } from "node:sqlite";
@@ -7,6 +7,7 @@ import type {
   AbstractNode,
   AbstractNodeKind,
   AspectKind,
+  AuthUser,
   AnalysisDraft,
   AnalysisStatement,
   Citation,
@@ -53,6 +54,28 @@ function now(): string {
   return new Date().toISOString();
 }
 
+function sessionExpiry(days: number): string {
+  return new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function tokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function hashPassword(password: string): string {
+  const salt = randomBytes(16).toString("base64url");
+  const hash = scryptSync(password, salt, 64).toString("base64url");
+  return `scrypt$${salt}$${hash}`;
+}
+
+function verifyPassword(password: string, stored: string): boolean {
+  const [scheme, salt, expected] = stored.split("$");
+  if (scheme !== "scrypt" || !salt || !expected) return false;
+  const expectedBuffer = Buffer.from(expected, "base64url");
+  const actualBuffer = scryptSync(password, salt, expectedBuffer.length);
+  return expectedBuffer.length === actualBuffer.length && timingSafeEqual(expectedBuffer, actualBuffer);
+}
+
 function rows(statement: ReturnType<NativeDatabaseSync["prepare"]>, ...params: any[]): Row[] {
   return statement.all(...params) as unknown as Row[];
 }
@@ -67,6 +90,14 @@ function libraryFrom(r: Row): Library {
     name: String(r.name),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
+  };
+}
+
+function authUserFrom(r: Row): AuthUser {
+  return {
+    id: String(r.id),
+    username: String(r.username),
+    createdAt: String(r.created_at),
   };
 }
 
@@ -215,6 +246,19 @@ export class AgentDatabase {
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
         applied_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS auth_sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS libraries (
         id TEXT PRIMARY KEY,
@@ -418,7 +462,9 @@ export class AgentDatabase {
       CREATE INDEX IF NOT EXISTS idx_pulses_library_created ON pulses(library_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_pulse_hits_pulse ON pulse_hits(pulse_id);
       CREATE INDEX IF NOT EXISTS idx_pulse_traces_library ON pulse_traces(library_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON auth_sessions(user_id);
     `);
+    this.addColumn("libraries", "owner_user_id", "TEXT REFERENCES users(id) ON DELETE CASCADE");
     this.addColumn("chunks", "start_line", "INTEGER");
     this.addColumn("chunks", "end_line", "INTEGER");
     this.addColumn("chunks", "block_id", "TEXT");
@@ -465,7 +511,61 @@ export class AgentDatabase {
     }
   }
 
-  listLibraries(): Library[] {
+  createUser(username: string, password: string): AuthUser {
+    const trimmed = username.trim();
+    const existing = row(this.sql.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE"), trimmed);
+    if (existing) throw new Error("用户名已存在");
+    const id = randomUUID();
+    const timestamp = now();
+    this.sql.prepare(`
+      INSERT INTO users (id, username, password_hash, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(id, trimmed, hashPassword(password), timestamp, timestamp);
+    return { id, username: trimmed, createdAt: timestamp };
+  }
+
+  verifyUser(username: string, password: string): AuthUser | undefined {
+    const result = row(this.sql.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE"), username.trim());
+    if (!result || !verifyPassword(password, String(result.password_hash))) return undefined;
+    return authUserFrom(result);
+  }
+
+  createSession(userId: string, days: number): string {
+    const token = randomBytes(32).toString("base64url");
+    const timestamp = now();
+    this.sql.prepare(`
+      INSERT INTO auth_sessions (token_hash, user_id, created_at, expires_at)
+      VALUES (?, ?, ?, ?)
+    `).run(tokenHash(token), userId, timestamp, sessionExpiry(days));
+    return token;
+  }
+
+  getUserForSession(token: string | undefined): AuthUser | undefined {
+    if (!token) return undefined;
+    const result = row(
+      this.sql.prepare(`
+        SELECT u.*
+        FROM auth_sessions s JOIN users u ON u.id = s.user_id
+        WHERE s.token_hash = ? AND s.expires_at > ?
+      `),
+      tokenHash(token),
+      now(),
+    );
+    return result ? authUserFrom(result) : undefined;
+  }
+
+  deleteSession(token: string | undefined): void {
+    if (!token) return;
+    this.sql.prepare("DELETE FROM auth_sessions WHERE token_hash = ?").run(tokenHash(token));
+  }
+
+  listLibraries(ownerUserId?: string): Library[] {
+    if (ownerUserId) {
+      return rows(
+        this.sql.prepare("SELECT * FROM libraries WHERE owner_user_id = ? ORDER BY updated_at DESC"),
+        ownerUserId,
+      ).map(libraryFrom);
+    }
     return rows(this.sql.prepare("SELECT * FROM libraries ORDER BY updated_at DESC")).map(libraryFrom);
   }
 
@@ -474,12 +574,38 @@ export class AgentDatabase {
     return result ? libraryFrom(result) : undefined;
   }
 
-  createLibrary(name: string): Library {
+  getLibraryOwnerUserId(id: string): string | null | undefined {
+    const result = row(this.sql.prepare("SELECT owner_user_id FROM libraries WHERE id = ?"), id);
+    if (!result) return undefined;
+    return result.owner_user_id === null ? null : String(result.owner_user_id);
+  }
+
+  getLibraryIdForNode(nodeId: string): string | undefined {
+    const result = row(this.sql.prepare("SELECT library_id FROM abstract_nodes WHERE id = ?"), nodeId);
+    return result ? String(result.library_id) : undefined;
+  }
+
+  getLibraryIdForRelation(relationId: string): string | undefined {
+    const result = row(this.sql.prepare("SELECT library_id FROM relations WHERE id = ?"), relationId);
+    return result ? String(result.library_id) : undefined;
+  }
+
+  getLibraryIdForStatement(statementId: string): string | undefined {
+    const result = row(this.sql.prepare("SELECT library_id FROM analysis_statements WHERE id = ?"), statementId);
+    return result ? String(result.library_id) : undefined;
+  }
+
+  getLibraryIdForChunk(chunkId: string): string | undefined {
+    const result = row(this.sql.prepare("SELECT library_id FROM chunks WHERE id = ?"), chunkId);
+    return result ? String(result.library_id) : undefined;
+  }
+
+  createLibrary(name: string, ownerUserId?: string): Library {
     const id = randomUUID();
     const timestamp = now();
     this.sql.prepare(
-      "INSERT INTO libraries (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
-    ).run(id, name, timestamp, timestamp);
+      "INSERT INTO libraries (id, name, owner_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(id, name, ownerUserId ?? null, timestamp, timestamp);
     this.sql.prepare(
       "INSERT INTO library_settings (library_id, ocr_mode) VALUES (?, 'local')",
     ).run(id);

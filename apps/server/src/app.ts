@@ -12,9 +12,11 @@ import {
   addStatementEvidenceSchema,
   aspectKinds,
   evidenceQuerySchema,
+  loginSchema,
   modelStreamSchema,
   relationStatuses,
   relationTypes,
+  registerSchema,
   reviewPulseSchema,
   searchSchema,
   updateAbstractNodeSchema,
@@ -22,6 +24,7 @@ import {
   updateLibrarySettingsSchema,
   updateAnalysisStatementSchema,
   updateRelationSchema,
+  type AuthUser,
   type RelationStatus,
   type RelationType,
   type AspectKind,
@@ -45,8 +48,66 @@ export interface AppServices {
   queue: IngestionQueue;
 }
 
-function requireLibrary(db: AgentDatabase, id: string): void {
+declare module "fastify" {
+  interface FastifyRequest {
+    user?: AuthUser;
+  }
+}
+
+const sessionCookieName = "agent_session";
+
+function parseCookies(header: string | undefined): Record<string, string> {
+  if (!header) return {};
+  return Object.fromEntries(header.split(";").flatMap((part) => {
+    const index = part.indexOf("=");
+    if (index < 0) return [];
+    return [[part.slice(0, index).trim(), decodeURIComponent(part.slice(index + 1).trim())]];
+  }));
+}
+
+function sessionTokenFrom(request: { headers: { cookie?: string | undefined } }): string | undefined {
+  return parseCookies(request.headers.cookie)[sessionCookieName];
+}
+
+function sessionCookie(token: string, config: AppConfig): string {
+  const maxAge = Math.max(1, config.sessionDays) * 24 * 60 * 60;
+  return [
+    `${sessionCookieName}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${maxAge}`,
+    ...(config.secureCookies ? ["Secure"] : []),
+  ].join("; ");
+}
+
+function clearSessionCookie(config: AppConfig): string {
+  return [
+    `${sessionCookieName}=`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    "Max-Age=0",
+    ...(config.secureCookies ? ["Secure"] : []),
+  ].join("; ");
+}
+
+function requireLibrary(db: AgentDatabase, id: string, user?: AuthUser): void {
   if (!db.getLibrary(id)) throw new Error("知识库不存在");
+  if (user && db.getLibraryOwnerUserId(id) !== user.id) throw new Error("知识库不存在");
+}
+
+function requireLibraryAccess(db: AgentDatabase, libraryId: string | undefined, user?: AuthUser): string {
+  if (!libraryId) throw new Error("知识库不存在");
+  requireLibrary(db, libraryId, user);
+  return libraryId;
+}
+
+function isPublicApi(method: string, url: string): boolean {
+  const path = url.split("?")[0] ?? url;
+  if (path === "/api/health" || path === "/api/auth/session") return true;
+  if (method === "POST" && ["/api/auth/register", "/api/auth/login", "/api/auth/logout"].includes(path)) return true;
+  return false;
 }
 
 export async function createApp(services: AppServices): Promise<FastifyInstance> {
@@ -54,13 +115,28 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   const { config, db, vectors, model, queue } = services;
   const publisher = new AnalysisPublisher(db, config);
   const pulseEngine = new PulseEngine(db, vectors, model);
-  await app.register(cors, { origin: true });
+  await app.register(cors, { origin: true, credentials: true });
   await app.register(multipart, { limits: { files: 100, fileSize: 60 * 1024 * 1024 } });
 
   app.setErrorHandler((error, _request, reply) => {
     const message = error instanceof Error ? error.message : "请求处理失败";
-    const statusCode = message.includes("不存在") ? 404 : message.includes("仍有待审核") ? 409 : 400;
+    const statusCode = message.includes("请先登录")
+      ? 401
+      : message.includes("注册密钥")
+        ? 403
+        : message.includes("不存在")
+          ? 404
+          : message.includes("仍有待审核")
+            ? 409
+            : 400;
     void reply.status(statusCode).send({ error: message });
+  });
+
+  app.addHook("preHandler", async (request, reply) => {
+    const user = db.getUserForSession(sessionTokenFrom(request));
+    if (user) request.user = user;
+    if (!config.authRequired || isPublicApi(request.method, request.url) || !request.url.startsWith("/api/")) return;
+    if (!user) return reply.status(401).send({ error: "请先登录" });
   });
 
   app.get("/api/health", async () => ({
@@ -70,7 +146,35 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     ocrProvider: config.ocrProvider,
     ocrConfigured: hasConfiguredOcr(config),
     vectorEngine: vectors.usesSqliteVec ? "sqlite-vec" : "javascript-fallback",
+    authRequired: config.authRequired,
   }));
+
+  app.get("/api/auth/session", async (request) => ({
+    authRequired: config.authRequired,
+    user: request.user ?? null,
+  }));
+  app.post("/api/auth/register", async (request, reply) => {
+    if (!config.authRequired) throw new Error("当前未启用注册");
+    const body = registerSchema.parse(request.body);
+    if (!config.registrationKeys.includes(body.registrationKey)) throw new Error("注册密钥无效");
+    const user = db.createUser(body.username, body.password);
+    const token = db.createSession(user.id, config.sessionDays);
+    reply.header("Set-Cookie", sessionCookie(token, config));
+    return reply.status(201).send({ authRequired: true, user });
+  });
+  app.post("/api/auth/login", async (request, reply) => {
+    const body = loginSchema.parse(request.body);
+    const user = db.verifyUser(body.username, body.password);
+    if (!user) throw new Error("用户名或密码错误");
+    const token = db.createSession(user.id, config.sessionDays);
+    reply.header("Set-Cookie", sessionCookie(token, config));
+    return { authRequired: config.authRequired, user };
+  });
+  app.post("/api/auth/logout", async (request, reply) => {
+    db.deleteSession(sessionTokenFrom(request));
+    reply.header("Set-Cookie", clearSessionCookie(config));
+    return { authRequired: config.authRequired, user: null };
+  });
 
   app.post("/api/model/test", async () => {
     try {
@@ -106,20 +210,23 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     }
   });
 
-  app.get("/api/libraries", async () => db.listLibraries());
+  app.get("/api/libraries", async (request) => db.listLibraries(request.user?.id));
   app.post("/api/libraries", async (request, reply) => {
     const body = createLibrarySchema.parse(request.body);
-    return reply.status(201).send(db.createLibrary(body.name));
+    return reply.status(201).send(db.createLibrary(body.name, request.user?.id));
   });
   app.delete<{ Params: { libraryId: string } }>("/api/libraries/:libraryId", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId, request.user);
     if (!db.deleteLibrary(request.params.libraryId)) return reply.status(404).send({ error: "知识库不存在" });
     await rm(join(config.filesDir, request.params.libraryId), { recursive: true, force: true });
     return reply.status(204).send();
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/settings", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
     return db.getSettings(request.params.libraryId);
   });
   app.patch<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/settings", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
     const settings = updateLibrarySettingsSchema.parse(request.body);
     if (settings.ocrMode === "cloud" && (config.ocrProvider !== "aliyun" || !hasConfiguredOcr(config))) {
       throw new Error("阿里云 OCR 需要配置 OCR_PROVIDER=aliyun 及 ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET");
@@ -128,12 +235,12 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   });
 
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/documents", async (request) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     return db.listDocuments(request.params.libraryId);
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/import", async (request, reply) => {
     const libraryId = request.params.libraryId;
-    requireLibrary(db, libraryId);
+    requireLibrary(db, libraryId, request.user);
     const imported: Array<{ fileName: string; duplicate: boolean; jobId?: string }> = [];
     for await (const part of request.files()) {
       validateFileName(part.filename);
@@ -165,6 +272,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     async (request, reply) => {
       const source = db.getVersionSource(request.params.versionId);
       if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+      requireLibrary(db, source.libraryId, request.user);
       const buffer = await readFile(source.version.storagePath);
       reply.type(source.mediaType);
       if (request.query.download === "true") {
@@ -174,11 +282,15 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     },
   );
   app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/structure", async (request) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
     return db.getSourceStructure(request.params.versionId);
   });
   app.post<{ Params: { versionId: string } }>("/api/versions/:versionId/reanalyze", async (request, reply) => {
     const source = db.getVersionSource(request.params.versionId);
     if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+    requireLibrary(db, source.libraryId, request.user);
     db.updateVersionStatus(source.version.id, "queued");
     const job = db.createJob(source.libraryId, source.version.id);
     queue.enqueue(job.id);
@@ -186,13 +298,17 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   });
 
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/jobs", async (request) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     return db.listJobs(request.params.libraryId);
   });
   app.post<{ Params: { jobId: string } }>("/api/jobs/:jobId/retry", async (request) => {
+    const job = db.getJob(request.params.jobId);
+    requireLibraryAccess(db, job?.libraryId, request.user);
     return queue.retry(request.params.jobId);
   });
   app.delete<{ Params: { jobId: string } }>("/api/jobs/:jobId", async (request, reply) => {
+    const job = db.getJob(request.params.jobId);
+    requireLibraryAccess(db, job?.libraryId, request.user);
     const deleted = db.deleteFailedJob(request.params.jobId);
     if (!deleted) return reply.status(404).send({ error: "处理任务不存在" });
     await rm(deleted.storagePath, { force: true });
@@ -200,7 +316,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/events", async (request, reply) => {
     const { libraryId } = request.params;
-    requireLibrary(db, libraryId);
+    requireLibrary(db, libraryId, request.user);
     reply.hijack();
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -234,7 +350,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       pulseStats?: string;
     };
   }>("/api/libraries/:libraryId/graph", async (request) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     const status = relationStatuses.includes(request.query.status as RelationStatus)
       ? request.query.status as RelationStatus
       : undefined;
@@ -258,18 +374,18 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/search", async (request) => {
     const { query, limit } = searchSchema.parse(request.body);
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     if (!model.configured) throw new Error("语义搜索需要配置模型服务");
     const [embedding] = await model.embed([query]);
     return vectors.search(request.params.libraryId, embedding ?? [], limit);
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request, reply) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     const { question, mode } = createPulseSchema.parse(request.body);
     return reply.status(201).send(await pulseEngine.create(request.params.libraryId, question, mode));
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses/stream", async (request, reply) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     const { question, mode } = createPulseSchema.parse(request.body);
     reply.hijack();
     reply.raw.writeHead(200, {
@@ -293,21 +409,23 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     }
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     return db.listPulses(request.params.libraryId);
   });
   app.delete<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     return { deleted: db.clearPulses(request.params.libraryId) };
   });
   app.get<{ Params: { libraryId: string; pulseId: string } }>("/api/libraries/:libraryId/pulses/:pulseId", async (request, reply) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     const response = db.getPulseResponse(request.params.libraryId, request.params.pulseId);
     if (!response) return reply.status(404).send({ error: "脉冲不存在" });
     return response;
   });
   app.patch<{ Params: { pulseId: string } }>("/api/pulses/:pulseId/review", async (request, reply) => {
     const { status } = reviewPulseSchema.parse(request.body);
+    const existing = db.getPulse(request.params.pulseId);
+    requireLibraryAccess(db, existing?.libraryId, request.user);
     const pulse = db.reviewPulse(request.params.pulseId, status);
     const response = db.getPulseResponse(pulse.libraryId, pulse.id);
     if (!response) return reply.status(404).send({ error: "脉冲不存在" });
@@ -315,6 +433,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   });
 
   app.patch<{ Params: { nodeId: string } }>("/api/nodes/:nodeId", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
     const body = updateAbstractNodeSchema.parse(request.body);
     return db.updateAbstractNode(request.params.nodeId, {
       ...(body.title !== undefined ? { title: body.title } : {}),
@@ -322,46 +441,52 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     });
   });
   app.patch<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/aspects", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
     const body = updateNodeAspectsSchema.parse(request.body);
     return db.updateNodeAspects(request.params.nodeId, body.aspects);
   });
   app.delete<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/aspects", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
     return db.resetNodeAspects(request.params.nodeId);
   });
   app.delete<{ Params: { nodeId: string } }>("/api/nodes/:nodeId", async (request, reply) => {
+    requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
     if (!db.deleteAbstractNode(request.params.nodeId)) return reply.status(404).send({ error: "抽象节点不存在" });
     return reply.status(204).send();
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/relations", async (request, reply) => {
     const body = createRelationSchema.parse(request.body);
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     return reply.status(201).send(db.createRelation(request.params.libraryId, body));
   });
   app.patch<{ Params: { relationId: string } }>("/api/relations/:relationId", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForRelation(request.params.relationId), request.user);
     const { status } = updateRelationSchema.parse(request.body);
     return db.updateRelationStatus(request.params.relationId, status);
   });
   app.delete<{ Params: { relationId: string } }>("/api/relations/:relationId", async (request, reply) => {
+    requireLibraryAccess(db, db.getLibraryIdForRelation(request.params.relationId), request.user);
     if (!db.deleteRelation(request.params.relationId)) return reply.status(404).send({ error: "关系不存在" });
     return reply.status(204).send();
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/draft", async (request) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     return db.generateAnalysisDraft(request.params.libraryId);
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/draft", async (request) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     return db.getAnalysisDraft(request.params.libraryId);
   });
   app.get<{ Params: { libraryId: string }; Querystring: { q?: string; versionId?: string; limit?: string } }>(
     "/api/libraries/:libraryId/evidence",
     async (request) => {
-      requireLibrary(db, request.params.libraryId);
+      requireLibrary(db, request.params.libraryId, request.user);
       const query = evidenceQuerySchema.parse(request.query);
       return db.listEvidenceChunks(request.params.libraryId, query.q, query.versionId, query.limit);
     },
   );
   app.patch<{ Params: { statementId: string } }>("/api/analysis/statements/:statementId", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForStatement(request.params.statementId), request.user);
     const body = updateAnalysisStatementSchema.parse(request.body);
     return db.updateAnalysisStatement(request.params.statementId, {
       ...(body.text !== undefined ? { text: body.text } : {}),
@@ -369,14 +494,21 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     });
   });
   app.post<{ Params: { statementId: string } }>("/api/analysis/statements/:statementId/evidence", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForStatement(request.params.statementId), request.user);
     const body = addStatementEvidenceSchema.parse(request.body);
+    requireLibraryAccess(db, db.getLibraryIdForChunk(body.chunkId), request.user);
     return db.addStatementEvidence(request.params.statementId, body.chunkId);
   });
   app.delete<{ Params: { statementId: string; chunkId: string } }>(
     "/api/analysis/statements/:statementId/evidence/:chunkId",
-    async (request) => db.deleteStatementEvidence(request.params.statementId, request.params.chunkId),
+    async (request) => {
+      requireLibraryAccess(db, db.getLibraryIdForStatement(request.params.statementId), request.user);
+      requireLibraryAccess(db, db.getLibraryIdForChunk(request.params.chunkId), request.user);
+      return db.deleteStatementEvidence(request.params.statementId, request.params.chunkId);
+    },
   );
   app.post<{ Params: { statementId: string } }>("/api/analysis/statements/:statementId/precheck", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForStatement(request.params.statementId), request.user);
     const statement = db.getAnalysisStatement(request.params.statementId);
     if (!statement) throw new Error("分析陈述不存在");
     try {
@@ -390,17 +522,17 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     }
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/publish", async (request, reply) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     return reply.status(201).send(await publisher.publish(request.params.libraryId));
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis", async (request, reply) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     const analysis = db.getPublishedAnalysis(request.params.libraryId);
     if (!analysis) return reply.status(404).send({ error: "尚未发布分析笔记" });
     return analysis;
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/analysis/download", async (request, reply) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     const analysis = db.getPublishedAnalysis(request.params.libraryId);
     if (!analysis) return reply.status(404).send({ error: "尚未发布分析笔记" });
     reply.type("text/markdown; charset=utf-8");
@@ -408,7 +540,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     return reply.send(analysis.content);
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/export", async (request, reply) => {
-    requireLibrary(db, request.params.libraryId);
+    requireLibrary(db, request.params.libraryId, request.user);
     reply.type("application/zip");
     reply.header("Content-Disposition", 'attachment; filename="agent-thinking-export.zip"');
     return reply.send(await publisher.exportArchive(request.params.libraryId));

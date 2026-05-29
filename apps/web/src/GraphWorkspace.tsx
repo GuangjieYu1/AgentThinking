@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   BaseEdge,
   Background,
@@ -52,6 +52,9 @@ type PulseStreamHitRecord = PulseStreamHit;
 type PulseNavigationEvent = Extract<PulseStreamEvent, { type: "candidates" | "decision" | "backtrack" }>;
 type PulseDecorated = { pulseActive?: boolean; pulseReverse?: boolean; pulseTransitKey?: string };
 type PulseVisualHit = Pick<PulseHitRecord, "targetType" | "targetId">;
+type PulsePlaybackStep =
+  | { kind: "hit"; hit: PulseHitRecord }
+  | { kind: "backtrack"; fromNodeId: string; toNodeId: string; edgeId: string; label: string; transitKey: string };
 interface LayoutLink {
   source: string;
   target: string;
@@ -261,6 +264,97 @@ function orderedPulseHits(response: PulseResponse | undefined): PulseHitRecord[]
   return ordered;
 }
 
+function pulsePlaybackSteps(hits: PulseHitRecord[], graphEdges: GraphEdge[]): PulsePlaybackStep[] {
+  const edgeByRelationKey = new Map<string, GraphEdge>();
+  for (const edge of graphEdges) {
+    for (const key of graphEdgePulseKeys(edge)) edgeByRelationKey.set(key, edge);
+  }
+  const traversedEdgeIds = new Set<string>();
+  const steps: PulsePlaybackStep[] = [];
+  let currentNodeId: string | undefined;
+
+  for (const hit of hits) {
+    if (hit.targetType === "relation") {
+      const edge = edgeByRelationKey.get(pulseHitKey(hit));
+      if (edge && currentNodeId && edge.source !== currentNodeId && edge.target !== currentNodeId) {
+        const backtrackPath = shortestRevealedPath(currentNodeId, [edge.source, edge.target], graphEdges, traversedEdgeIds);
+        for (const segment of backtrackPath) {
+          steps.push({
+            kind: "backtrack",
+            fromNodeId: segment.from,
+            toNodeId: segment.to,
+            edgeId: segment.edge.id,
+            label: `回溯 ${segment.fromLabel} → ${segment.toLabel}`,
+            transitKey: `backtrack:${segment.edge.id}:${segment.from}:${segment.to}:${steps.length}`,
+          });
+          currentNodeId = segment.to;
+        }
+      }
+      steps.push({ kind: "hit", hit });
+      if (edge) traversedEdgeIds.add(edge.id);
+      continue;
+    }
+
+    steps.push({ kind: "hit", hit });
+    if (hit.targetType === "node") currentNodeId = hit.targetId;
+  }
+
+  return steps;
+}
+
+function shortestRevealedPath(
+  fromNodeId: string,
+  targetNodeIds: string[],
+  graphEdges: GraphEdge[],
+  traversedEdgeIds: Set<string>,
+): Array<{ edge: GraphEdge; from: string; to: string; fromLabel: string; toLabel: string }> {
+  const targets = new Set(targetNodeIds);
+  if (targets.has(fromNodeId)) return [];
+  const traversedEdges = graphEdges.filter((edge) => traversedEdgeIds.has(edge.id));
+  const adjacency = new Map<string, Array<{ edge: GraphEdge; to: string }>>();
+  for (const edge of traversedEdges) {
+    const fromList = adjacency.get(edge.source) ?? [];
+    fromList.push({ edge, to: edge.target });
+    adjacency.set(edge.source, fromList);
+    const toList = adjacency.get(edge.target) ?? [];
+    toList.push({ edge, to: edge.source });
+    adjacency.set(edge.target, toList);
+  }
+
+  const queue = [fromNodeId];
+  const previous = new Map<string, { nodeId: string; edge: GraphEdge }>();
+  const visited = new Set([fromNodeId]);
+  let found: string | undefined;
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    for (const next of adjacency.get(current) ?? []) {
+      if (visited.has(next.to)) continue;
+      visited.add(next.to);
+      previous.set(next.to, { nodeId: current, edge: next.edge });
+      if (targets.has(next.to)) {
+        found = next.to;
+        queue.length = 0;
+        break;
+      }
+      queue.push(next.to);
+    }
+  }
+  if (!found) return [];
+
+  const reversed: Array<{ edge: GraphEdge; from: string; to: string }> = [];
+  for (let cursor = found; cursor !== fromNodeId;) {
+    const step = previous.get(cursor);
+    if (!step) return [];
+    reversed.push({ edge: step.edge, from: step.nodeId, to: cursor });
+    cursor = step.nodeId;
+  }
+  return reversed.reverse().map((segment) => ({
+    ...segment,
+    fromLabel: segment.from,
+    toLabel: segment.to,
+  }));
+}
+
 function pulseStepExplanation(hit: PulseHitRecord | undefined, total: number): string {
   if (!hit || total === 0) return "等待脉冲路径开始披露。";
   const target = hit.targetType === "chunk" ? "证据" : hit.targetType === "relation" ? "关系" : "节点";
@@ -271,6 +365,12 @@ function pulseStepExplanation(hit: PulseHitRecord | undefined, total: number): s
   );
   const rationale = hit.rationale ?? hit.reason;
   return `第 ${hit.stepIndex ?? "?"} 步点亮${target}「${hit.label}」。看到的信息：${observation} 选择理由：${rationale}`;
+}
+
+function pulsePlaybackStepExplanation(step: PulsePlaybackStep | undefined, total: number): string {
+  if (!step) return pulseStepExplanation(undefined, total);
+  if (step.kind === "hit") return pulseStepExplanation(step.hit, total);
+  return `${step.label}。下一条脉冲路径不在当前节点上，所以光球先沿已走过的边退回分叉点，再继续前往新的分支。`;
 }
 
 function pulseHitReason(hit: { rationale: string | null; reason: string }): string {
@@ -312,6 +412,7 @@ function lastNodeBefore(hits: PulseVisualHit[], endIndex: number): string | unde
 function activeEdgeState(
   edge: GraphEdge,
   hits: PulseVisualHit[],
+  fromNodeOverride?: string,
 ): { active: boolean; reverse: boolean; transitKey: string } {
   const activeIndex = hits.length - 1;
   const activeHit = hits[activeIndex];
@@ -320,7 +421,7 @@ function activeEdgeState(
   const edgeKeys = graphEdgePulseKeys(edge);
 
   if (activeHit.targetType === "relation" && edgeKeys.includes(activeKey)) {
-    const fromNodeId = lastNodeBefore(hits, activeIndex);
+    const fromNodeId = fromNodeOverride ?? lastNodeBefore(hits, activeIndex);
     return {
       active: true,
       reverse: Boolean(fromNodeId && edge.target === fromNodeId && edge.source !== fromNodeId),
@@ -358,10 +459,16 @@ function revealPulseGraph(
 ): { nodes: GraphNode[]; edges: GraphEdge[] } {
   if (mode !== "current" || !pulse) return { nodes: graphNodes, edges: graphEdges };
   const ordered = orderedPulseHits(pulse);
-  const revealedHits = ordered.slice(0, revealCount);
+  const playback = pulsePlaybackSteps(ordered, pulse.graph.edges);
+  const revealedSteps = playback.slice(0, revealCount);
+  const revealedHits = revealedSteps.flatMap((step) => step.kind === "hit" ? [step.hit] : []);
   const revealed = new Set(revealedHits.map(pulseHitKey));
-  const activeHit = revealedHits.at(-1);
+  const activeStep = revealedSteps.at(-1);
+  const activeHit = activeStep?.kind === "hit" ? activeStep.hit : undefined;
   const activeKey = activeHit ? pulseHitKey(activeHit) : "";
+  const relationFromNode = activeHit?.targetType === "relation" && revealedSteps.at(-2)?.kind === "backtrack"
+    ? (revealedSteps.at(-2) as Extract<PulsePlaybackStep, { kind: "backtrack" }>).toNodeId
+    : undefined;
   const nodes = graphNodes.map((record) => {
     const visible = record.pulseRole && !revealed.has(graphNodePulseKey(record)) ? withoutCurrentPulse(record) : record;
     return activeKey === graphNodePulseKey(record) && visible.pulseRole
@@ -378,7 +485,14 @@ function revealPulseGraph(
     }
     const relationIsActive = graphEdgePulseKeys(next).some((key) => key === activeKey);
     const evidenceIsActive = next.edgeType === "evidence" && activeKey === `chunk:${next.target}` && revealed.has(`node:${next.source}`);
-    const travel = activeEdgeState(next, revealedHits);
+    const travel = activeEdgeState(next, revealedHits, relationFromNode);
+    if (activeStep?.kind === "backtrack" && next.id === activeStep.edgeId) {
+      const pulseEdge = next.pulseRole ? next : { ...next, pulseRole: "bridge" as const, pulseScore: 0.44 };
+      return withPulseActive(pulseEdge, {
+        reverse: next.target === activeStep.fromNodeId && next.source === activeStep.toNodeId,
+        transitKey: activeStep.transitKey,
+      });
+    }
     return (travel.active || relationIsActive || evidenceIsActive) && next.pulseRole
       ? withPulseActive(next, { reverse: travel.reverse, transitKey: travel.transitKey || activeKey })
       : next;
@@ -699,11 +813,24 @@ export function GraphWorkspace({
   const [pulseStreamHits, setPulseStreamHits] = useState<PulseStreamHitRecord[]>([]);
   const [pulseNavigationEvents, setPulseNavigationEvents] = useState<PulseNavigationEvent[]>([]);
   const [pulseDraftAnswer, setPulseDraftAnswer] = useState("");
-  const currentPulseHits = useMemo(() => orderedPulseHits(currentPulse), [currentPulse]);
-  const currentPulseStep = currentPulseHits[Math.max(0, Math.min(pulseRevealCount, currentPulseHits.length) - 1)];
+  const activeLibraryIdRef = useRef(libraryId);
+  const graphRequestSeqRef = useRef(0);
+  activeLibraryIdRef.current = libraryId;
+  const visibleCurrentPulse = currentPulse?.pulse.libraryId === libraryId ? currentPulse : undefined;
+  const activePulseHistory = useMemo(
+    () => pulseHistory.filter((pulse) => pulse.libraryId === libraryId),
+    [pulseHistory, libraryId],
+  );
+  const currentPulseHits = useMemo(() => orderedPulseHits(visibleCurrentPulse), [visibleCurrentPulse]);
+  const currentPulsePlaybackSteps = useMemo(
+    () => pulsePlaybackSteps(currentPulseHits, visibleCurrentPulse?.graph.edges ?? []),
+    [currentPulseHits, visibleCurrentPulse?.graph.edges],
+  );
+  const currentPulsePlaybackStep = currentPulsePlaybackSteps[Math.max(0, Math.min(pulseRevealCount, currentPulsePlaybackSteps.length) - 1)];
+  const currentPulseStep = currentPulsePlaybackStep?.kind === "hit" ? currentPulsePlaybackStep.hit : undefined;
   const revealedPulseTargets = useMemo(
-    () => new Set(currentPulseHits.slice(0, pulseRevealCount).map(pulseHitKey)),
-    [currentPulseHits, pulseRevealCount],
+    () => new Set(currentPulsePlaybackSteps.slice(0, pulseRevealCount).flatMap((step) => step.kind === "hit" ? [pulseHitKey(step.hit)] : [])),
+    [currentPulsePlaybackSteps, pulseRevealCount],
   );
 
   const applyGraph = (
@@ -711,7 +838,7 @@ export function GraphWorkspace({
     nextLayout = layout,
     nextPulseMode = pulseMode,
     nextRevealCount = pulseRevealCount,
-    nextPulse = currentPulse,
+    nextPulse = visibleCurrentPulse,
   ) => {
     const visibleGraph = revealPulseGraph(graph.nodes, graph.edges, nextPulseMode, nextPulse, nextRevealCount);
     setRecords(graph.nodes);
@@ -723,19 +850,24 @@ export function GraphWorkspace({
   };
 
   const loadGraph = async (centerId?: string, includeChunks = false, requestedView = view) => {
+    const requestLibraryId = libraryId;
+    const requestSeq = graphRequestSeqRef.current + 1;
+    graphRequestSeqRef.current = requestSeq;
     try {
-      const graph = await api.graph(libraryId, {
+      const graph = await api.graph(requestLibraryId, {
         ...(centerId ? { centerId } : {}),
         includeChunks,
         ...(status ? { status } : {}),
         ...(type ? { type } : {}),
         ...(aspect ? { aspect } : {}),
-        ...(pulseMode === "current" && currentPulse ? { pulseId: currentPulse.pulse.id } : {}),
+        ...(pulseMode === "current" && visibleCurrentPulse ? { pulseId: visibleCurrentPulse.pulse.id } : {}),
         pulseStats: pulseMode !== "normal",
         view: requestedView,
       });
+      if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return;
       applyGraph(graph);
     } catch (cause) {
+      if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return;
       onError((cause as Error).message);
     }
   };
@@ -746,41 +878,67 @@ export function GraphWorkspace({
   }, [flowInstance, records, layout]);
 
   useEffect(() => {
-    if (pulseMode !== "current" || !currentPulse || !pulsePlaying) return;
-    if (pulseRevealCount >= currentPulseHits.length) {
+    if (pulseMode !== "current" || !visibleCurrentPulse || !pulsePlaying) return;
+    if (pulseRevealCount >= currentPulsePlaybackSteps.length) {
       setPulsePlaying(false);
       return;
     }
     const timer = window.setTimeout(() => {
-      setPulseRevealCount((count) => Math.min(count + 1, currentPulseHits.length));
+      setPulseRevealCount((count) => Math.min(count + 1, currentPulsePlaybackSteps.length));
     }, pulseRevealCount === 0 ? pulseInitialRevealDelayMs : pulseRevealDelayMs);
     return () => window.clearTimeout(timer);
-  }, [pulseMode, currentPulse?.pulse.id, pulsePlaying, pulseRevealCount, currentPulseHits.length]);
+  }, [pulseMode, visibleCurrentPulse?.pulse.id, pulsePlaying, pulseRevealCount, currentPulsePlaybackSteps.length]);
 
   useEffect(() => {
     if (records.length === 0) return;
-    const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, currentPulse, pulseRevealCount);
+    const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, visibleCurrentPulse, pulseRevealCount);
     setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, pulseMode));
     setEdges(displayEdges(visibleGraph.edges, layout, pulseMode));
-  }, [pulseMode, pulseRevealCount, currentPulse?.pulse.id, records, edgeRecords, layout, aspect]);
+  }, [pulseMode, pulseRevealCount, visibleCurrentPulse?.pulse.id, records, edgeRecords, layout, aspect]);
 
   useEffect(() => {
-    if (!pulsing || currentPulse || pulseStreamHits.length === 0 || records.length === 0) return;
+    if (!pulsing || visibleCurrentPulse || pulseStreamHits.length === 0 || records.length === 0) return;
     const visibleGraph = decoratePulseStreamGraph(records, edgeRecords, pulseStreamHits);
     setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, "current"));
     setEdges(displayEdges(visibleGraph.edges, layout, "current"));
-  }, [pulsing, currentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect]);
+  }, [pulsing, visibleCurrentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect]);
 
   useEffect(() => {
+    const requestLibraryId = libraryId;
+    let cancelled = false;
     setCurrentPulse(undefined);
+    setPulseHistory([]);
+    setPulseQuestion("");
     setPulseMode("normal");
     setPulseRevealCount(0);
     setPulsePlaying(false);
+    setPulsing(false);
     setPulseStreamMessage("");
     setPulseStreamHits([]);
     setPulseNavigationEvents([]);
     setPulseDraftAnswer("");
-    void api.pulses(libraryId).then(setPulseHistory).catch((cause: Error) => onError(cause.message));
+    setFocusedNodeId(undefined);
+    setSelected(undefined);
+    setSelectedRelation(undefined);
+    setSelectedAggregate(undefined);
+    setResults([]);
+    setRecords([]);
+    setEdgeRecords([]);
+    setAspectFilter(undefined);
+    setNodes([]);
+    setEdges([]);
+    void api.pulses(requestLibraryId)
+      .then((history) => {
+        if (cancelled || activeLibraryIdRef.current !== requestLibraryId) return;
+        setPulseHistory(history.filter((pulse) => pulse.libraryId === requestLibraryId));
+      })
+      .catch((cause: Error) => {
+        if (cancelled || activeLibraryIdRef.current !== requestLibraryId) return;
+        onError(cause.message);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [libraryId, refreshKey]);
 
   useEffect(() => {
@@ -789,7 +947,7 @@ export function GraphWorkspace({
     setSelectedAggregate(undefined);
     setResults([]);
     void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view);
-  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, currentPulse?.pulse.id]);
+  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, visibleCurrentPulse?.pulse.id]);
 
   const suggested = useMemo(
     () => edges.flatMap((edge) => edge.data?.entity.relation?.status === "suggested" ? [edge.data.entity.relation] : []),
@@ -813,6 +971,7 @@ export function GraphWorkspace({
   const runPulse = async (event: FormEvent) => {
     event.preventDefault();
     if (!pulseQuestion.trim() || pulsing) return;
+    const requestLibraryId = libraryId;
     const question = pulseQuestion.trim();
     setPulsing(true);
     setCurrentPulse(undefined);
@@ -824,7 +983,8 @@ export function GraphWorkspace({
     setPulseNavigationEvents([]);
     setPulseDraftAnswer("");
     try {
-      await api.streamPulse(libraryId, question, pulseInputMode, (update) => {
+      await api.streamPulse(requestLibraryId, question, pulseInputMode, (update) => {
+        if (activeLibraryIdRef.current !== requestLibraryId) return;
         if (update.type === "start") {
           setPulseStreamMessage(update.mode === "progressive" ? "正在渐进式点亮图谱..." : "正在全量召回图谱...");
           return;
@@ -860,8 +1020,12 @@ export function GraphWorkspace({
         }
         if (update.type === "done") {
           const response = update.response;
+          if (response.pulse.libraryId !== requestLibraryId) return;
           setCurrentPulse(response);
-          setPulseHistory((history) => [response.pulse, ...history.filter((pulse) => pulse.id !== response.pulse.id)]);
+          setPulseHistory((history) => [
+            response.pulse,
+            ...history.filter((pulse) => pulse.libraryId === requestLibraryId && pulse.id !== response.pulse.id),
+          ]);
           setPulseMode("current");
           setPulseRevealCount(0);
           setPulsePlaying(true);
@@ -875,9 +1039,10 @@ export function GraphWorkspace({
         if (update.type === "error") throw new Error(update.message);
       });
     } catch (cause) {
+      if (activeLibraryIdRef.current !== requestLibraryId) return;
       onError((cause as Error).message);
     } finally {
-      setPulsing(false);
+      if (activeLibraryIdRef.current === requestLibraryId) setPulsing(false);
     }
   };
 
@@ -891,8 +1056,10 @@ export function GraphWorkspace({
       setPulseDraftAnswer("");
       return;
     }
+    const requestLibraryId = libraryId;
     try {
-      const response = await api.pulse(libraryId, pulseId);
+      const response = await api.pulse(requestLibraryId, pulseId);
+      if (activeLibraryIdRef.current !== requestLibraryId || response.pulse.libraryId !== requestLibraryId) return;
       setCurrentPulse(response);
       setPulseStreamMessage("");
       setPulseStreamHits([]);
@@ -910,15 +1077,17 @@ export function GraphWorkspace({
   };
 
   const clearPulseHistory = async () => {
-    if (pulsing || pulseHistory.length === 0) return;
+    if (pulsing || activePulseHistory.length === 0) return;
+    const requestLibraryId = libraryId;
     try {
-      await api.clearPulses(libraryId);
+      await api.clearPulses(requestLibraryId);
+      if (activeLibraryIdRef.current !== requestLibraryId) return;
       setPulseHistory([]);
       setCurrentPulse(undefined);
       setPulseMode("normal");
       setPulseRevealCount(0);
       setPulsePlaying(false);
-      const graph = await api.graph(libraryId, {
+      const graph = await api.graph(requestLibraryId, {
         ...(focusedNodeId ? { centerId: focusedNodeId } : {}),
         includeChunks: view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1,
         ...(status ? { status } : {}),
@@ -926,24 +1095,31 @@ export function GraphWorkspace({
         ...(aspect ? { aspect } : {}),
         view,
       });
+      if (activeLibraryIdRef.current !== requestLibraryId) return;
       applyGraph(graph, layout, "normal", 0, undefined);
     } catch (cause) {
+      if (activeLibraryIdRef.current !== requestLibraryId) return;
       onError((cause as Error).message);
     }
   };
 
   const reviewPulse = async (status: "correct" | "wrong") => {
-    if (!currentPulse) return;
+    if (!visibleCurrentPulse) return;
+    const requestLibraryId = visibleCurrentPulse.pulse.libraryId;
     try {
-      const response = await api.reviewPulse(currentPulse.pulse.id, status);
+      const response = await api.reviewPulse(visibleCurrentPulse.pulse.id, status);
+      if (activeLibraryIdRef.current !== requestLibraryId || response.pulse.libraryId !== requestLibraryId) return;
       setCurrentPulse(response);
-      setPulseHistory((history) => history.map((pulse) => pulse.id === response.pulse.id ? response.pulse : pulse));
+      setPulseHistory((history) => history.map((pulse) => pulse.id === response.pulse.id && pulse.libraryId === requestLibraryId ? response.pulse : pulse));
       const nextMode = pulseMode === "normal" ? "current" : pulseMode;
-      const nextRevealCount = nextMode === "current" ? response.hits.length : pulseRevealCount;
+      const nextRevealCount = nextMode === "current"
+        ? pulsePlaybackSteps(orderedPulseHits(response), response.graph.edges).length
+        : pulseRevealCount;
       setPulseRevealCount(nextRevealCount);
       setPulsePlaying(false);
       applyGraph(response.graph, layout, nextMode, nextRevealCount, response);
     } catch (cause) {
+      if (activeLibraryIdRef.current !== requestLibraryId) return;
       onError((cause as Error).message);
     }
   };
@@ -980,18 +1156,18 @@ export function GraphWorkspace({
 
   const changeLayout = (nextLayout: LayoutMode) => {
     setLayout(nextLayout);
-    const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, currentPulse, pulseRevealCount);
+    const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, visibleCurrentPulse, pulseRevealCount);
     setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, pulseMode));
     setEdges(displayEdges(visibleGraph.edges, nextLayout, pulseMode));
   };
 
   const changePulseMode = (nextMode: PulseLayerMode) => {
     setPulseMode(nextMode);
-    if (nextMode === "current" && currentPulse) {
+    if (nextMode === "current" && visibleCurrentPulse) {
       setPulseRevealCount(0);
       setPulsePlaying(true);
     } else {
-      setPulseRevealCount(currentPulseHits.length);
+      setPulseRevealCount(currentPulsePlaybackSteps.length);
       setPulsePlaying(false);
     }
   };
@@ -1015,59 +1191,74 @@ export function GraphWorkspace({
   return (
     <section className="graph-panel card">
       <div className="graph-toolbar">
-        <form onSubmit={(event) => void search(event)}>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="语义搜索 chunk..." />
-          <button type="submit">搜索</button>
-        </form>
-        <select value={status} onChange={(event) => setStatus(event.target.value as RelationStatus | "")}>
-          <option value="">可见关系</option>
-          {relationStatuses.map((item) => <option key={item} value={item}>{item}</option>)}
-        </select>
-        <select value={type} onChange={(event) => setType(event.target.value as RelationType | "")}>
-          <option value="">所有类型</option>
-          {relationTypes.map((item) => <option key={item} value={item}>{item}</option>)}
+        <div className="toolbar-group toolbar-search">
+          <span className="toolbar-label">检索</span>
+          <form onSubmit={(event) => void search(event)}>
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="语义搜索 chunk..." />
+            <button type="submit">搜索</button>
+          </form>
+        </div>
+        <div className="toolbar-group">
+          <span className="toolbar-label">筛选</span>
+          <select value={status} onChange={(event) => setStatus(event.target.value as RelationStatus | "")}>
+            <option value="">可见关系</option>
+            {relationStatuses.map((item) => <option key={item} value={item}>{item}</option>)}
           </select>
-        <select className="aspect-filter" value={aspect} onChange={(event) => setAspect(event.target.value as AspectKind | "")}>
-          <option value="">全部切面</option>
-          {aspectKinds.map((item) => <option key={item} value={item}>{aspectLabels[item]}</option>)}
-        </select>
-        <div className="graph-depth" aria-label="图谱层级">
-          <button className={view === "overview" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("overview"); }}>概览</button>
-          <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
+          <select value={type} onChange={(event) => setType(event.target.value as RelationType | "")}>
+            <option value="">所有类型</option>
+            {relationTypes.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+          <select className="aspect-filter" value={aspect} onChange={(event) => setAspect(event.target.value as AspectKind | "")}>
+            <option value="">全部切面</option>
+            {aspectKinds.map((item) => <option key={item} value={item}>{aspectLabels[item]}</option>)}
+          </select>
+        </div>
+        <div className="toolbar-group toolbar-right">
+          <span className="toolbar-label">视图</span>
+          <div className="graph-depth" aria-label="图谱层级">
+            <button className={view === "overview" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("overview"); }}>概览</button>
+            <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
+          </div>
         </div>
       </div>
       <div className="pulse-toolbar">
-        <form onSubmit={(event) => void runPulse(event)}>
-          <input value={pulseQuestion} onChange={(event) => setPulseQuestion(event.target.value)} placeholder="向图谱发起脉冲问题..." />
-          <select value={pulseInputMode} onChange={(event) => setPulseInputMode(event.target.value as PulseInputMode)}>
-            <option value="full">全量输入</option>
-            <option value="progressive">渐进输入</option>
+        <div className="toolbar-group pulse-query">
+          <span className="toolbar-label">脉冲</span>
+          <form onSubmit={(event) => void runPulse(event)}>
+            <input value={pulseQuestion} onChange={(event) => setPulseQuestion(event.target.value)} placeholder="向图谱发起问题..." />
+            <select value={pulseInputMode} onChange={(event) => setPulseInputMode(event.target.value as PulseInputMode)}>
+              <option value="full">全量输入</option>
+              <option value="progressive">渐进输入</option>
+            </select>
+            <button type="submit" disabled={pulsing}>{pulsing ? "脉冲中" : "脉冲"}</button>
+          </form>
+        </div>
+        <div className="toolbar-group pulse-history-group">
+          <span className="toolbar-label">诊断层</span>
+          <select value={visibleCurrentPulse?.pulse.id ?? ""} onChange={(event) => void loadPulse(event.target.value)}>
+            <option value="">历史脉冲</option>
+            {activePulseHistory.map((pulse) => (
+              <option key={pulse.id} value={pulse.id}>
+                {pulse.status === "correct" ? "正确" : pulse.status === "wrong" ? "错误" : "待判定"} · {pulse.question.slice(0, 28)}
+              </option>
+            ))}
           </select>
-          <button type="submit" disabled={pulsing}>{pulsing ? "脉冲中" : "脉冲"}</button>
-        </form>
-        <select value={currentPulse?.pulse.id ?? ""} onChange={(event) => void loadPulse(event.target.value)}>
-          <option value="">历史脉冲</option>
-          {pulseHistory.map((pulse) => (
-            <option key={pulse.id} value={pulse.id}>
-              {pulse.status === "correct" ? "正确" : pulse.status === "wrong" ? "错误" : "待判定"} · {pulse.question.slice(0, 28)}
-            </option>
-          ))}
-        </select>
-        <button
-          type="button"
-          className="ghost pulse-clear-history"
-          disabled={pulsing || pulseHistory.length === 0}
-          onClick={() => void clearPulseHistory()}
-        >
-          清空历史
-        </button>
-        <select value={pulseMode} onChange={(event) => changePulseMode(event.target.value as PulseLayerMode)}>
-          <option value="normal">正常图谱</option>
-          <option value="current">当前脉冲</option>
-          <option value="stats">累计正误</option>
-          <option value="wrong">仅错误路径</option>
-          <option value="correct">仅正确路径</option>
-        </select>
+          <select value={pulseMode} onChange={(event) => changePulseMode(event.target.value as PulseLayerMode)}>
+            <option value="normal">正常图谱</option>
+            <option value="current">当前脉冲</option>
+            <option value="stats">累计正误</option>
+            <option value="wrong">仅错误路径</option>
+            <option value="correct">仅正确路径</option>
+          </select>
+          <button
+            type="button"
+            className="ghost pulse-clear-history"
+            disabled={pulsing || activePulseHistory.length === 0}
+            onClick={() => void clearPulseHistory()}
+          >
+            清空
+          </button>
+        </div>
       </div>
       <div className="graph-body">
         <div className="canvas">
@@ -1119,7 +1310,7 @@ export function GraphWorkspace({
           )}
         </div>
         <aside className="inspector">
-          {!currentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
+          {!visibleCurrentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
             <div className="pulse-panel pulse-stream-panel">
               <div className="pulse-panel-heading">
                 <h3>脉冲生成中</h3>
@@ -1183,21 +1374,27 @@ export function GraphWorkspace({
               </div>
             </div>
           )}
-          {currentPulse && (
-            <div className={`pulse-panel pulse-status-${currentPulse.pulse.status}`}>
+          {visibleCurrentPulse && (
+            <div className={`pulse-panel pulse-status-${visibleCurrentPulse.pulse.status}`}>
               <div className="pulse-panel-heading">
                 <h3>脉冲回答</h3>
                 <small>
-                  {currentPulse.pulse.inputMode === "progressive" ? "渐进输入" : "全量输入"} · {" "}
-                  {currentPulse.pulse.status === "correct" ? "已标记正确" : currentPulse.pulse.status === "wrong" ? "已标记错误" : "待判定"}
+                  {visibleCurrentPulse.pulse.inputMode === "progressive" ? "渐进输入" : "全量输入"} · {" "}
+                  {visibleCurrentPulse.pulse.status === "correct" ? "已标记正确" : visibleCurrentPulse.pulse.status === "wrong" ? "已标记错误" : "待判定"}
                 </small>
               </div>
-              <p className="pulse-question">{currentPulse.pulse.question}</p>
-              <p>{currentPulse.pulse.answer}</p>
-              <small>{currentPulse.pulse.summary}</small>
+              <p className="pulse-question">{visibleCurrentPulse.pulse.question}</p>
+              <p>{visibleCurrentPulse.pulse.answer}</p>
+              <small>{visibleCurrentPulse.pulse.summary}</small>
               {pulseMode === "current" && (
                 <div className="pulse-playback">
-                  <span>披露 {Math.min(pulseRevealCount, currentPulseHits.length)} / {currentPulseHits.length}</span>
+                  <span>
+                    动画 {Math.min(pulseRevealCount, currentPulsePlaybackSteps.length)} / {currentPulsePlaybackSteps.length}
+                    {" · "}命中 {Math.min(
+                      currentPulsePlaybackSteps.slice(0, pulseRevealCount).filter((step) => step.kind === "hit").length,
+                      currentPulseHits.length,
+                    )} / {currentPulseHits.length}
+                  </span>
                   <button
                     type="button"
                     onClick={() => {
@@ -1210,14 +1407,14 @@ export function GraphWorkspace({
                   <button
                     type="button"
                     onClick={() => setPulsePlaying((playing) => !playing)}
-                    disabled={pulseRevealCount >= currentPulseHits.length}
+                    disabled={pulseRevealCount >= currentPulsePlaybackSteps.length}
                   >
                     {pulsePlaying ? "暂停" : "继续"}
                   </button>
                   <button
                     type="button"
                     onClick={() => {
-                      setPulseRevealCount(currentPulseHits.length);
+                      setPulseRevealCount(currentPulsePlaybackSteps.length);
                       setPulsePlaying(false);
                     }}
                   >
@@ -1227,8 +1424,12 @@ export function GraphWorkspace({
               )}
               {pulseMode === "current" && (
                 <div className="pulse-step-reason">
-                  <strong>{currentPulseStep ? `当前披露：${currentPulseStep.label}` : "等待披露"}</strong>
-                  <p>{pulseStepExplanation(currentPulseStep, currentPulseHits.length)}</p>
+                  <strong>
+                    {currentPulsePlaybackStep?.kind === "backtrack"
+                      ? currentPulsePlaybackStep.label
+                      : currentPulseStep ? `当前披露：${currentPulseStep.label}` : "等待披露"}
+                  </strong>
+                  <p>{pulsePlaybackStepExplanation(currentPulsePlaybackStep, currentPulsePlaybackSteps.length)}</p>
                   {currentPulseStep?.observation && <small>看到的信息：{currentPulseStep.observation}</small>}
                   {currentPulseStep?.rationale && <small>选择理由：{currentPulseStep.rationale}</small>}
                 </div>
@@ -1238,9 +1439,9 @@ export function GraphWorkspace({
                 <button className="danger" onClick={() => void reviewPulse("wrong")}>回答错误</button>
               </div>
               <div className="pulse-hit-summary">
-                <span>节点 {currentPulse.hits.filter((hit) => hit.targetType === "node").length}</span>
-                <span>关系 {currentPulse.hits.filter((hit) => hit.targetType === "relation").length}</span>
-                <span>证据 {currentPulse.hits.filter((hit) => hit.targetType === "chunk").length}</span>
+                <span>节点 {visibleCurrentPulse.hits.filter((hit) => hit.targetType === "node").length}</span>
+                <span>关系 {visibleCurrentPulse.hits.filter((hit) => hit.targetType === "relation").length}</span>
+                <span>证据 {visibleCurrentPulse.hits.filter((hit) => hit.targetType === "chunk").length}</span>
               </div>
               <div className="pulse-hits">
                 {currentPulseHits.slice(0, 10).map((hit) => (

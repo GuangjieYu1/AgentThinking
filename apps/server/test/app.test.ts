@@ -15,6 +15,89 @@ afterEach(async () => {
 });
 
 describe("HTTP application", () => {
+  it("requires an invite key for registration and isolates libraries by user", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-auth-"));
+    dirs.push(dir);
+    const config = getConfig({
+      dataDir: dir,
+      filesDir: join(dir, "files"),
+      ocrCacheDir: join(dir, "ocr"),
+      provider: "fake",
+      authRequired: true,
+      registrationKeys: ["invite-alpha"],
+    });
+    const db = new AgentDatabase(dir);
+    const vectors = new VectorStore(db);
+    const model = new FakeModelProvider();
+    const queue = new IngestionQueue(db, vectors, model, config);
+    const app = await createApp({ config, db, vectors, model, queue });
+
+    const blocked = await app.inject({ method: "GET", url: "/api/libraries" });
+    expect(blocked.statusCode).toBe(401);
+
+    const badRegister = await app.inject({
+      method: "POST",
+      url: "/api/auth/register",
+      payload: { username: "alice", password: "password123", registrationKey: "wrong-key" },
+    });
+    expect(badRegister.statusCode).toBe(403);
+
+    const aliceRegister = await app.inject({
+      method: "POST",
+      url: "/api/auth/register",
+      payload: { username: "alice", password: "password123", registrationKey: "invite-alpha" },
+    });
+    expect(aliceRegister.statusCode).toBe(201);
+    const aliceCookie = String(aliceRegister.headers["set-cookie"]).split(";")[0]!;
+
+    const aliceLibrary = (await app.inject({
+      method: "POST",
+      url: "/api/libraries",
+      headers: { cookie: aliceCookie },
+      payload: { name: "Alice Research" },
+    })).json<{ id: string }>();
+
+    const bobRegister = await app.inject({
+      method: "POST",
+      url: "/api/auth/register",
+      payload: { username: "bob", password: "password123", registrationKey: "invite-alpha" },
+    });
+    expect(bobRegister.statusCode).toBe(201);
+    const bobCookie = String(bobRegister.headers["set-cookie"]).split(";")[0]!;
+
+    const bobLibraries = (await app.inject({
+      method: "GET",
+      url: "/api/libraries",
+      headers: { cookie: bobCookie },
+    })).json<Array<{ id: string }>>();
+    expect(bobLibraries).toHaveLength(0);
+
+    const bobDirectAccess = await app.inject({
+      method: "GET",
+      url: `/api/libraries/${aliceLibrary.id}/documents`,
+      headers: { cookie: bobCookie },
+    });
+    expect(bobDirectAccess.statusCode).toBe(404);
+
+    const aliceLogin = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { username: "alice", password: "password123" },
+    });
+    expect(aliceLogin.statusCode).toBe(200);
+    const aliceLoginCookie = String(aliceLogin.headers["set-cookie"]).split(";")[0]!;
+    const remembered = (await app.inject({
+      method: "GET",
+      url: "/api/libraries",
+      headers: { cookie: aliceLoginCookie },
+    })).json<Array<{ id: string; name: string }>>();
+    expect(remembered.map((library) => library.id)).toEqual([aliceLibrary.id]);
+    expect(remembered[0]?.name).toBe("Alice Research");
+
+    await app.close();
+    db.close();
+  });
+
   it("imports a document through the API without disclosing server credentials", async () => {
     const dir = await mkdtemp(join(tmpdir(), "agent-thinking-api-"));
     dirs.push(dir);

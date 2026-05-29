@@ -25,6 +25,10 @@ export interface AppConfig {
   aliyunAccessKeyId: string | undefined;
   aliyunAccessKeySecret: string | undefined;
   aliyunSecurityToken: string | undefined;
+  authRequired: boolean;
+  registrationKeys: string[];
+  sessionDays: number;
+  secureCookies: boolean;
 }
 
 export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -60,6 +64,12 @@ export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     aliyunAccessKeyId: overrides.aliyunAccessKeyId ?? process.env.ALIBABA_CLOUD_ACCESS_KEY_ID,
     aliyunAccessKeySecret: overrides.aliyunAccessKeySecret ?? process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET,
     aliyunSecurityToken: overrides.aliyunSecurityToken ?? process.env.ALIBABA_CLOUD_SECURITY_TOKEN,
+    authRequired: overrides.authRequired ??
+      (process.env.AUTH_REQUIRED === "true" || Boolean(process.env.REGISTRATION_KEYS?.trim())),
+    registrationKeys: overrides.registrationKeys ??
+      (process.env.REGISTRATION_KEYS ?? "").split(",").map((key) => key.trim()).filter(Boolean),
+    sessionDays: overrides.sessionDays ?? Number(process.env.AUTH_SESSION_DAYS ?? 30),
+    secureCookies: overrides.secureCookies ?? process.env.AUTH_COOKIE_SECURE === "true",
   };
 }
 

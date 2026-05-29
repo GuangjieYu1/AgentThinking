@@ -1,6 +1,6 @@
 # AgentThinking
 
-AgentThinking is a local, single-user knowledge graph studio. It imports Markdown, text, and PDF material, breaks it into traceable chunks, derives reviewable concepts and claims, and displays their relationships in an explorable force-directed graph.
+AgentThinking is a private knowledge graph studio. It imports Markdown, text, Word, and PDF material, breaks it into traceable chunks, derives reviewable concepts and claims, and displays their relationships in an explorable graph.
 
 ## Quick Start
 
@@ -29,9 +29,23 @@ For an entirely offline demonstration without sending document text, set `AI_PRO
 
 Run a production build with `npm run build && npm start`; the server then hosts the built UI at `http://127.0.0.1:4310`.
 
+## Authentication
+
+For a hosted deployment, enable registration-gated authentication in `.env`:
+
+```dotenv
+AUTH_REQUIRED=true
+REGISTRATION_KEYS=your-private-invite-key
+AUTH_SESSION_DAYS=30
+# Use true only behind HTTPS:
+AUTH_COOKIE_SECURE=false
+```
+
+Users register with username, password, and one of your registration keys. Libraries are owned by the creating user; other users cannot list or access them directly. A returning user keeps their imported files, graph reviews, pulse history, and published analysis notes.
+
 ## MVP Capabilities
 
-- Multiple local knowledge libraries with versioned document imports and SHA-256 deduplication.
+- Multiple private knowledge libraries with versioned document imports and SHA-256 deduplication.
 - Structured Markdown/TXT chunking and PDF text extraction; scanned PDF pages use local Tesseract OCR by default.
 - Optional Alibaba Cloud OCR per library for scanned PDF pages.
 - DeepSeek V4 JSON graph extraction plus local retrieval vectors by default; a separate OpenAI-compatible embeddings endpoint remains configurable.
@@ -86,4 +100,4 @@ npm run build        # Production assets and server bundle
 
 ## Boundaries
 
-This first release does not include authentication, collaboration, question answering, DOCX/web imports, local inference, watched folders, or full-graph rendering for large libraries. The default graph is an abstract overview and loads evidence chunks on demand.
+This first release does not include collaboration, watched folders, or full-graph rendering for large libraries. The default graph is an abstract overview and loads evidence chunks on demand.

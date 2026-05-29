@@ -3,6 +3,7 @@ import type {
   AspectKind,
   AnalysisDraft,
   AnalysisStatement,
+  AuthSession,
   Document,
   GraphResponse,
   GraphView,
@@ -48,7 +49,20 @@ export const api = {
     vectorEngine: string;
     ocrProvider: "local" | "aliyun";
     ocrConfigured: boolean;
+    authRequired: boolean;
   }>("/health"),
+  session: () => request<AuthSession>("/auth/session"),
+  register: (username: string, password: string, registrationKey: string) =>
+    request<AuthSession>("/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, password, registrationKey }),
+    }),
+  login: (username: string, password: string) =>
+    request<AuthSession>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  logout: () => request<AuthSession>("/auth/logout", { method: "POST", body: JSON.stringify({}) }),
   testModel: () => request<ModelTestResult>("/model/test", {
     method: "POST",
     body: JSON.stringify({}),

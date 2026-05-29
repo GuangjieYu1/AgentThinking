@@ -1,5 +1,15 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import type { Citation, Document, IngestJob, Library, LibrarySettings, OcrMode, PublishedAnalysis, SourceStructure } from "@agent-thinking/contracts";
+import type {
+  AuthSession,
+  Citation,
+  Document,
+  IngestJob,
+  Library,
+  LibrarySettings,
+  OcrMode,
+  PublishedAnalysis,
+  SourceStructure,
+} from "@agent-thinking/contracts";
 import { api } from "./api";
 import { AnalysisWorkspace } from "./AnalysisWorkspace";
 import { GraphWorkspace } from "./GraphWorkspace";
@@ -11,12 +21,15 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string>();
   const [newName, setNewName] = useState("");
   const [error, setError] = useState<string>();
+  const [session, setSession] = useState<AuthSession>();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [health, setHealth] = useState<{
     provider: string;
     aiConfigured: boolean;
     vectorEngine: string;
     ocrProvider: "local" | "aliyun";
     ocrConfigured: boolean;
+    authRequired: boolean;
   }>();
 
   const loadLibraries = async () => {
@@ -26,8 +39,23 @@ export function App() {
   };
 
   useEffect(() => {
-    void Promise.all([loadLibraries(), api.health().then(setHealth)]).catch((cause: Error) => setError(cause.message));
+    void Promise.all([api.session(), api.health()])
+      .then(([nextSession, nextHealth]) => {
+        setSession(nextSession);
+        setHealth(nextHealth);
+      })
+      .catch((cause: Error) => setError(cause.message));
   }, []);
+
+  useEffect(() => {
+    if (!session) return;
+    if (session.authRequired && !session.user) {
+      setLibraries([]);
+      setSelectedId(undefined);
+      return;
+    }
+    void loadLibraries().catch((cause: Error) => setError(cause.message));
+  }, [session?.authRequired, session?.user?.id]);
 
   const selected = libraries.find((library) => library.id === selectedId);
   const createLibrary = async (event: FormEvent) => {
@@ -43,12 +71,58 @@ export function App() {
     }
   };
 
+  const logout = async () => {
+    try {
+      const nextSession = await api.logout();
+      setSession(nextSession);
+      setLibraries([]);
+      setSelectedId(undefined);
+      setNewName("");
+    } catch (cause) {
+      setError((cause as Error).message);
+    }
+  };
+
+  if (!session) {
+    return (
+      <div className="auth-shell">
+        {error && <div className="banner error" onClick={() => setError(undefined)}>{error}</div>}
+        <section className="auth-card card">
+          <span className="brand-mark" />
+          <h1>AgentThinking</h1>
+          <p>正在连接服务...</p>
+        </section>
+      </div>
+    );
+  }
+
+  if (session.authRequired && !session.user) {
+    return (
+      <AuthGate
+        error={error}
+        onError={setError}
+        onAuthenticated={(nextSession) => {
+          setError(undefined);
+          setSession(nextSession);
+        }}
+      />
+    );
+  }
+
   return (
-    <div className="shell">
+    <div className={sidebarCollapsed ? "shell sidebar-collapsed" : "shell"}>
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-mark" />
-          <div><strong>AgentThinking</strong><small>Knowledge Graph Studio</small></div>
+          <div className="brand-copy"><strong>AgentThinking</strong><small>Knowledge Graph Studio</small></div>
+          <button
+            className="sidebar-toggle"
+            type="button"
+            title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+            onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+          >
+            {sidebarCollapsed ? "›" : "‹"}
+          </button>
         </div>
         <form className="create-library" onSubmit={(event) => void createLibrary(event)}>
           <input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="新建知识库" />
@@ -67,6 +141,15 @@ export function App() {
           ))}
           {libraries.length === 0 && <p className="muted">创建一个知识库后导入资料。</p>}
         </nav>
+        {session.user && (
+          <div className="user-card">
+            <div>
+              <small>当前用户</small>
+              <strong>{session.user.username}</strong>
+            </div>
+            <button type="button" className="ghost" onClick={() => void logout()}>退出</button>
+          </div>
+        )}
         <ModelTools
           provider={health?.provider ?? "model"}
           onHealthChange={() => void api.health().then(setHealth).catch((cause: Error) => setError(cause.message))}
@@ -91,6 +174,78 @@ export function App() {
   );
 }
 
+function AuthGate({
+  error,
+  onError,
+  onAuthenticated,
+}: {
+  error: string | undefined;
+  onError: (message: string | undefined) => void;
+  onAuthenticated: (session: AuthSession) => void;
+}) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [registrationKey, setRegistrationKey] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setSubmitting(true);
+    try {
+      const nextSession = mode === "register"
+        ? await api.register(username, password, registrationKey)
+        : await api.login(username, password);
+      onAuthenticated(nextSession);
+    } catch (cause) {
+      onError((cause as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="auth-shell">
+      {error && <div className="banner error" onClick={() => onError(undefined)}>{error}</div>}
+      <section className="auth-card card">
+        <div className="auth-brand">
+          <span className="brand-mark" />
+          <div>
+            <h1>AgentThinking</h1>
+            <p>登录后进入你的私有知识库。注册需要部署者发放的密钥。</p>
+          </div>
+        </div>
+        <div className="auth-tabs">
+          <button type="button" className={mode === "login" ? "selected" : ""} onClick={() => setMode("login")}>登录</button>
+          <button type="button" className={mode === "register" ? "selected" : ""} onClick={() => setMode("register")}>注册</button>
+        </div>
+        <form className="auth-form" onSubmit={(event) => void submit(event)}>
+          <label>
+            用户名
+            <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" placeholder="your_name" />
+          </label>
+          <label>
+            密码
+            <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete={mode === "register" ? "new-password" : "current-password"} placeholder="至少 8 位" />
+          </label>
+          {mode === "register" && (
+            <label>
+              注册密钥
+              <input value={registrationKey} onChange={(event) => setRegistrationKey(event.target.value)} type="password" autoComplete="off" placeholder="由管理员提供" />
+            </label>
+          )}
+          <button type="submit" disabled={submitting}>
+            {submitting ? "处理中..." : mode === "register" ? "创建账户" : "登录"}
+          </button>
+        </form>
+        <p className="auth-note">
+          不同用户只能看到自己创建的知识库；同一用户再次登录会保留历史资料、图谱、脉冲与分析笔记。
+        </p>
+      </section>
+    </div>
+  );
+}
+
 function LibraryWorkspace({ library, onError }: { library: Library; onError: (message: string) => void }) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [jobs, setJobs] = useState<IngestJob[]>([]);
@@ -99,6 +254,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const [activeWorkspace, setActiveWorkspace] = useState<"graph" | "timeline" | "analysis">("graph");
   const [analysis, setAnalysis] = useState<PublishedAnalysis>();
   const [sourceView, setSourceView] = useState<{ structure: SourceStructure; text?: string; focus?: Citation }>();
+  const [resourcePanelCollapsed, setResourcePanelCollapsed] = useState(false);
   const activeJobs = useMemo(() => jobs.filter((job) => !["completed", "failed"].includes(job.stage)), [jobs]);
 
   const reload = async () => {
@@ -183,62 +339,102 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   return (
     <div className="workspace">
       <header className="workspace-header">
-        <div>
+        <div className="workspace-title">
+          <span className="eyebrow">当前知识库</span>
           <h1>{library.name}</h1>
-          <p>{documents.length} 个文档 / {activeJobs.length} 个处理中任务</p>
+          <div className="workspace-meta">
+            <span>{documents.length} 个文档</span>
+            <span>{activeJobs.length} 个处理中任务</span>
+            {analysis && <span>已有发布报告</span>}
+          </div>
         </div>
-        <label className="upload">
-          导入 Markdown / TXT / PDF / Word
-          <input type="file" multiple accept=".md,.markdown,.txt,.pdf,.doc,.docx" onChange={(event) => void upload(event.target.files)} />
-        </label>
       </header>
-      <div className="panels">
-        <section className="ingest-panel card">
-          <h2>材料与处理</h2>
-          <label className="setting">
-            扫描 PDF OCR
-            <select value={settings?.ocrMode ?? "local"} onChange={(event) => void setOcrMode(event.target.value as OcrMode)}>
-              <option value="local">本地 OCR</option>
-              <option value="cloud">阿里云 OCR</option>
-            </select>
-          </label>
-          <div className="document-list">
-            {documents.map((document) => (
-              <div className="document" key={document.id}>
-                <span>{document.name}</span><small>{document.latestVersion?.status ?? "等待"}</small>
-                {document.latestVersion && <div className="document-actions">
-                  <button onClick={() => void openSource(document.latestVersion!.id, document.mediaType)}>查看</button>
-                  <a href={api.sourceUrl(document.latestVersion.id, true)}>下载</a>
-                  <button onClick={() => void reanalyze(document.latestVersion!.id)}>重新分析</button>
-                </div>}
+      <div className={resourcePanelCollapsed ? "panels resource-collapsed" : "panels"}>
+        <section className={resourcePanelCollapsed ? "ingest-panel card collapsed" : "ingest-panel card"}>
+          {resourcePanelCollapsed ? (
+            <button
+              className="resource-rail-button"
+              type="button"
+              title="展开资料面板"
+              onClick={() => setResourcePanelCollapsed(false)}
+            >
+              <span>资料</span>
+              <small>展开</small>
+            </button>
+          ) : <>
+          <div className="ingest-panel-top">
+            <strong>资料面板</strong>
+            <button className="ghost panel-collapse-button" type="button" onClick={() => setResourcePanelCollapsed(true)}>收起</button>
+          </div>
+          <div className="panel-section">
+            <div className="panel-section-heading">
+              <h2>材料与处理</h2>
+              <div className="panel-heading-actions">
+                <span>{documents.length}</span>
+                <label className="upload compact-upload">
+                  导入
+                  <input type="file" multiple accept=".md,.markdown,.txt,.pdf,.doc,.docx" onChange={(event) => void upload(event.target.files)} />
+                </label>
               </div>
-            ))}
+            </div>
+            <label className="setting">
+              扫描 PDF OCR
+              <select value={settings?.ocrMode ?? "local"} onChange={(event) => void setOcrMode(event.target.value as OcrMode)}>
+                <option value="local">本地 OCR</option>
+                <option value="cloud">阿里云 OCR</option>
+              </select>
+            </label>
+            <div className="document-list">
+              {documents.map((document) => (
+                <div className="document" key={document.id}>
+                  <span>{document.name}</span><small>{document.latestVersion?.status ?? "等待"}</small>
+                  {document.latestVersion && <div className="document-actions">
+                    <button onClick={() => void openSource(document.latestVersion!.id, document.mediaType)}>查看</button>
+                    <a href={api.sourceUrl(document.latestVersion.id, true)}>下载</a>
+                    <button onClick={() => void reanalyze(document.latestVersion!.id)}>重新分析</button>
+                  </div>}
+                </div>
+              ))}
+              {documents.length === 0 && <p className="muted empty-panel-note">还没有导入材料。</p>}
+            </div>
           </div>
-          <h2>分析笔记</h2>
-          <div className="analysis-actions">
-            <button onClick={() => setActiveWorkspace("analysis")}>进入分析审核</button>
-            {analysis && <>
-              <a href={api.analysisDownloadUrl(library.id)}>下载 Markdown</a>
-              <a href={api.exportUrl(library.id)}>导出归档</a>
-            </>}
+          <div className="panel-section">
+            <div className="panel-section-heading">
+              <h2>分析笔记</h2>
+              <span>{analysis ? "已发布" : "未发布"}</span>
+            </div>
+            <div className="analysis-actions">
+              <button onClick={() => setActiveWorkspace("analysis")}>进入分析审核</button>
+              {analysis && <>
+                <a href={api.analysisDownloadUrl(library.id)}>下载 Markdown</a>
+                <a href={api.exportUrl(library.id)}>导出归档</a>
+              </>}
+            </div>
+            {analysis && <details className="analysis-preview"><summary>预览最新报告</summary><pre>{analysis.content}</pre></details>}
           </div>
-          {analysis && <details className="analysis-preview"><summary>预览最新报告</summary><pre>{analysis.content}</pre></details>}
-          <h2>后台任务</h2>
-          <div className="job-list">
-            {jobs.slice(0, 8).map((job) => (
-              <div className="job" key={job.id}>
-                <div><span>{job.stage}</span><small>{Math.round(job.progress * 100)}%</small></div>
-                <progress max={1} value={job.progress} />
-                {job.error && <p>{job.error}</p>}
-                {job.stage === "failed" && (
-                  <div className="job-actions">
-                    <button onClick={() => void api.retry(job.id).catch((cause: Error) => onError(cause.message))}>重试</button>
-                    <button className="danger" onClick={() => void deleteFailedJob(job.id)}>删除</button>
-                  </div>
-                )}
-              </div>
-            ))}
+          <div className="panel-section">
+            <div className="panel-section-heading">
+              <h2>后台任务</h2>
+              <span>{jobs.length}</span>
+            </div>
+            <div className="job-list">
+              {jobs.slice(0, 8).map((job) => (
+                <div className="job" key={job.id}>
+                  <div><span>{job.stage}</span><small>{Math.round(job.progress * 100)}%</small></div>
+                  <progress max={1} value={job.progress} />
+                  {job.error && <p>{job.error}</p>}
+                  {job.stage === "failed" && (
+                    <div className="job-actions">
+                      <button onClick={() => void api.retry(job.id).catch((cause: Error) => onError(cause.message))}>重试</button>
+                      <button className="danger" onClick={() => void deleteFailedJob(job.id)}>删除</button>
+                    </div>
+                  )}
+                </div>
+              ))}
+              {jobs.length === 0 && <p className="muted empty-panel-note">暂无后台任务。</p>}
+            </div>
           </div>
+          </>}
         </section>
         <div className="work-surface">
           <nav className="workspace-tabs">
@@ -247,7 +443,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
             <button className={activeWorkspace === "analysis" ? "selected" : ""} onClick={() => setActiveWorkspace("analysis")}>分析笔记审核</button>
           </nav>
           {activeWorkspace === "graph" ? (
-            <GraphWorkspace libraryId={library.id} refreshKey={refreshGraph} onError={onError} onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)} />
+            <GraphWorkspace key={library.id} libraryId={library.id} refreshKey={refreshGraph} onError={onError} onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)} />
           ) : activeWorkspace === "timeline" ? (
             <TimelineWorkspace
               libraryId={library.id}

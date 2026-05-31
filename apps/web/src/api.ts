@@ -10,6 +10,7 @@ import type {
   IngestJob,
   Library,
   LibrarySettings,
+  MappingAudit,
   OcrMode,
   Relation,
   RelationStatus,
@@ -118,6 +119,10 @@ export const api = {
   },
   structure: (versionId: string) => request<SourceStructure>(`/versions/${versionId}/structure`),
   reanalyze: (versionId: string) => request<IngestJob>(`/versions/${versionId}/reanalyze`, { method: "POST" }),
+  runMappingAudit: (versionId: string) =>
+    request<MappingAudit>(`/versions/${versionId}/mapping-audit`, { method: "POST" }),
+  mappingAudit: (versionId: string) =>
+    request<MappingAudit>(`/versions/${versionId}/mapping-audit`),
   jobs: (id: string) => request<IngestJob[]>(`/libraries/${id}/jobs`),
   retry: (id: string) => request<IngestJob>(`/jobs/${id}/retry`, { method: "POST" }),
   deleteJob: (id: string) => request<void>(`/jobs/${id}`, { method: "DELETE" }),

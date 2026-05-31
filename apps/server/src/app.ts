@@ -29,6 +29,7 @@ import {
   type RelationType,
   type AspectKind,
   type PulseStreamEvent,
+  type SearchResult,
 } from "@agent-thinking/contracts";
 import type { AppConfig } from "./config.js";
 import { hasConfiguredModels, hasConfiguredOcr } from "./config.js";
@@ -38,6 +39,7 @@ import type { ModelProvider } from "./services/models.js";
 import { IngestionQueue } from "./services/ingestion.js";
 import { VectorStore } from "./services/vector-store.js";
 import { AnalysisPublisher } from "./services/analysis.js";
+import { MappingAuditService } from "./services/mapping-audit.js";
 import { PulseEngine } from "./services/pulse.js";
 
 export interface AppServices {
@@ -55,6 +57,17 @@ declare module "fastify" {
 }
 
 const sessionCookieName = "agent_session";
+
+function mergeSearchResults(limit: number, ...groups: SearchResult[][]): SearchResult[] {
+  const merged = new Map<string, SearchResult>();
+  for (const result of groups.flat()) {
+    const existing = merged.get(result.chunk.id);
+    if (!existing || result.score > existing.score) merged.set(result.chunk.id, result);
+  }
+  return [...merged.values()]
+    .sort((left, right) => right.score - left.score || left.chunk.ordinal - right.chunk.ordinal)
+    .slice(0, limit);
+}
 
 function parseCookies(header: string | undefined): Record<string, string> {
   if (!header) return {};
@@ -115,6 +128,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   const { config, db, vectors, model, queue } = services;
   const publisher = new AnalysisPublisher(db, config);
   const pulseEngine = new PulseEngine(db, vectors, model);
+  const mappingAudit = new MappingAuditService(db, model);
   await app.register(cors, { origin: true, credentials: true });
   await app.register(multipart, { limits: { files: 100, fileSize: 60 * 1024 * 1024 } });
 
@@ -287,6 +301,22 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     requireLibrary(db, source.libraryId, request.user);
     return db.getSourceStructure(request.params.versionId);
   });
+  app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/mapping-audit", async (request, reply) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+    requireLibrary(db, source.libraryId, request.user);
+    const audit = db.getMappingAudit(request.params.versionId);
+    if (!audit) return reply.status(404).send({ error: "尚未运行映射审计" });
+    return audit;
+  });
+  app.post<{ Params: { versionId: string } }>("/api/versions/:versionId/mapping-audit", async (request, reply) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+    requireLibrary(db, source.libraryId, request.user);
+    if (source.version.status !== "completed") return reply.status(409).send({ error: "文档尚未完成分析，无法运行映射审计" });
+    if (!model.configured) return reply.status(400).send({ error: "映射审计需要配置模型服务" });
+    return mappingAudit.run(request.params.versionId);
+  });
   app.post<{ Params: { versionId: string } }>("/api/versions/:versionId/reanalyze", async (request, reply) => {
     const source = db.getVersionSource(request.params.versionId);
     if (!source) return reply.status(404).send({ error: "导入版本不存在" });
@@ -375,9 +405,17 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/search", async (request) => {
     const { query, limit } = searchSchema.parse(request.body);
     requireLibrary(db, request.params.libraryId, request.user);
-    if (!model.configured) throw new Error("语义搜索需要配置模型服务");
-    const [embedding] = await model.embed([query]);
-    return vectors.search(request.params.libraryId, embedding ?? [], limit);
+    const fuzzy = db.searchChunksFuzzy(request.params.libraryId, query, limit);
+    const fullText = db.searchText(request.params.libraryId, query, limit);
+    if (!model.configured) return mergeSearchResults(limit, fuzzy, fullText);
+    try {
+      const [embedding] = await model.embed([query]);
+      const semantic = embedding ? vectors.search(request.params.libraryId, embedding, limit) : [];
+      return mergeSearchResults(limit, fuzzy, fullText, semantic);
+    } catch (cause) {
+      request.log.warn({ err: cause }, "semantic search failed; returning fuzzy chunk matches");
+      return mergeSearchResults(limit, fuzzy, fullText);
+    }
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/pulses", async (request, reply) => {
     requireLibrary(db, request.params.libraryId, request.user);

@@ -23,6 +23,9 @@ import type {
   JobStage,
   Library,
   LibrarySettings,
+  MappingAudit,
+  MappingAuditFinding,
+  MappingAuditResult,
   OcrMode,
   Pulse,
   PulseHit,
@@ -44,6 +47,7 @@ import type {
   PublishedAnalysis,
 } from "@agent-thinking/contracts";
 import type { PendingChunk } from "./domain/chunker.js";
+import type { MappingAuditContext, MappingAuditNodeContext, MappingAuditRelationContext } from "./services/models.js";
 
 type Row = Record<string, string | number | null | Uint8Array>;
 export type PendingPulseHit = Omit<PulseHit, "id" | "pulseId" | "libraryId">;
@@ -158,6 +162,40 @@ function normalizeAspects(aspects: readonly AspectKind[]): AspectKind[] {
   return aspectKinds.filter((aspect) => selected.has(aspect));
 }
 
+function normalizeSearchText(value: string): string {
+  return value.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function searchTokens(query: string): string[] {
+  return normalizeSearchText(query).split(" ").filter(Boolean);
+}
+
+function scoreChunkMatch(chunk: Chunk, query: string): number {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) return 0;
+  const tokens = searchTokens(query);
+  const title = normalizeSearchText(chunk.headingPath ?? `chunk ${chunk.ordinal + 1}`);
+  const text = normalizeSearchText(chunk.text);
+  const preview = text.slice(0, 1200);
+  let score = 0;
+
+  if (title === normalizedQuery) score += 1;
+  else if (title.startsWith(normalizedQuery)) score += 0.88;
+  else if (title.includes(normalizedQuery)) score += 0.78;
+  if (preview.includes(normalizedQuery)) score += 0.44;
+
+  if (tokens.length > 0) {
+    const titleHits = tokens.filter((token) => title.includes(token)).length;
+    const textHits = tokens.filter((token) => preview.includes(token)).length;
+    score += (titleHits / tokens.length) * 0.34;
+    score += (textHits / tokens.length) * 0.18;
+  }
+
+  const earlyTextHit = preview.indexOf(normalizedQuery);
+  if (earlyTextHit >= 0) score += Math.max(0.02, 0.08 - earlyTextHit / 16000);
+  return Math.min(1, score);
+}
+
 function parseTextList(value: Row[string] | undefined): string[] {
   if (typeof value !== "string") return [];
   try {
@@ -166,6 +204,35 @@ function parseTextList(value: Row[string] | undefined): string[] {
   } catch {
     return [];
   }
+}
+
+function parseMappingAuditFindings(value: Row[string] | undefined): MappingAuditFinding[] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry): entry is MappingAuditFinding => (
+      typeof entry === "object" && entry !== null
+      && typeof (entry as MappingAuditFinding).kind === "string"
+      && typeof (entry as MappingAuditFinding).severity === "string"
+      && typeof (entry as MappingAuditFinding).title === "string"
+    ));
+  } catch {
+    return [];
+  }
+}
+
+function mappingAuditFrom(r: Row): MappingAudit {
+  return {
+    id: String(r.id),
+    libraryId: String(r.library_id),
+    versionId: String(r.version_id),
+    status: String(r.status) as MappingAudit["status"],
+    summary: String(r.summary),
+    reconstruction: String(r.reconstruction),
+    findings: parseMappingAuditFindings(r.findings_json),
+    createdAt: String(r.created_at),
+  };
 }
 
 function pulseFrom(r: Row): Pulse {
@@ -403,6 +470,17 @@ export class AgentDatabase {
         chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
         PRIMARY KEY(statement_id, chunk_id)
       );
+      CREATE TABLE IF NOT EXISTS mapping_audits (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL UNIQUE REFERENCES document_versions(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('clean','minor_issues','major_issues','failed')),
+        summary TEXT NOT NULL,
+        reconstruction TEXT NOT NULL,
+        findings_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mapping_audits_library ON mapping_audits(library_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS abstraction_memberships (
         parent_node_id TEXT NOT NULL REFERENCES abstract_nodes(id) ON DELETE CASCADE,
         child_node_id TEXT NOT NULL REFERENCES abstract_nodes(id) ON DELETE CASCADE,
@@ -822,6 +900,146 @@ export class AgentDatabase {
     return { metadata, links, chunks };
   }
 
+  getMappingAuditContext(versionId: string): MappingAuditContext | undefined {
+    const source = this.getVersionSource(versionId);
+    if (!source) return undefined;
+    const chunks = rows(
+      this.sql.prepare("SELECT * FROM chunks WHERE version_id = ? ORDER BY ordinal"),
+      versionId,
+    ).map(chunkFrom);
+    const nodeRows = rows(
+      this.sql.prepare(`
+        SELECT DISTINCT n.*, (SELECT COUNT(*) FROM abstraction_memberships m WHERE m.parent_node_id = n.id) AS member_count
+        FROM abstract_nodes n
+        JOIN abstract_node_evidence e ON e.node_id = n.id
+        JOIN chunks c ON c.id = e.chunk_id
+        WHERE n.library_id = ? AND n.source = 'ai' AND c.version_id = ?
+        ORDER BY n.level, n.updated_at DESC
+      `),
+      source.libraryId,
+      versionId,
+    );
+    const nodes: MappingAuditNodeContext[] = nodeRows.map((entry) => {
+      const node = nodeFrom(entry);
+      const evidenceChunkIds = rows(
+        this.sql.prepare(`
+          SELECT e.chunk_id FROM abstract_node_evidence e
+          JOIN chunks c ON c.id = e.chunk_id
+          WHERE e.node_id = ? AND c.version_id = ?
+          ORDER BY c.ordinal
+        `),
+        node.id,
+        versionId,
+      ).map((result) => String(result.chunk_id));
+      return {
+        id: node.id,
+        kind: node.kind,
+        title: node.title,
+        summary: node.summary,
+        level: node.level,
+        evidenceChunkIds,
+      };
+    });
+
+    const versionNodeIds = nodes.map((node) => node.id);
+    const relationConditions = ["rc.version_id = ?"];
+    const relationParams: unknown[] = [source.libraryId, versionId];
+    if (versionNodeIds.length > 0) {
+      const placeholders = versionNodeIds.map(() => "?").join(",");
+      relationConditions.push(`r.source_node_id IN (${placeholders}) OR r.target_node_id IN (${placeholders})`);
+      relationParams.push(...versionNodeIds, ...versionNodeIds);
+    }
+    const relationRows = rows(
+      this.sql.prepare(`
+        SELECT DISTINCT r.*
+        FROM relations r
+        LEFT JOIN relation_evidence re ON re.relation_id = r.id
+        LEFT JOIN chunks rc ON rc.id = re.chunk_id
+        WHERE r.library_id = ? AND r.created_by = 'ai' AND r.status != 'rejected'
+          AND (${relationConditions.join(" OR ")})
+        ORDER BY r.updated_at DESC
+      `),
+      ...relationParams,
+    );
+    const endpointIds = [...new Set(relationRows.flatMap((entry) => [String(entry.source_node_id), String(entry.target_node_id)]))];
+    const endpointTitles = new Map<string, string>();
+    if (endpointIds.length > 0) {
+      const placeholders = endpointIds.map(() => "?").join(",");
+      for (const entry of rows(
+        this.sql.prepare(`SELECT id, title FROM abstract_nodes WHERE id IN (${placeholders})`),
+        ...endpointIds,
+      )) {
+        endpointTitles.set(String(entry.id), String(entry.title));
+      }
+    }
+    const relations: MappingAuditRelationContext[] = relationRows.map((entry) => {
+      const relation = this.relationFrom(entry);
+      const evidenceChunkIds = rows(
+        this.sql.prepare(`
+          SELECT re.chunk_id FROM relation_evidence re
+          JOIN chunks c ON c.id = re.chunk_id
+          WHERE re.relation_id = ? AND c.version_id = ?
+          ORDER BY c.ordinal
+        `),
+        relation.id,
+        versionId,
+      ).map((result) => String(result.chunk_id));
+      return {
+        id: relation.id,
+        type: relation.type,
+        sourceNodeId: relation.sourceNodeId,
+        sourceTitle: endpointTitles.get(relation.sourceNodeId) ?? "未知节点",
+        targetNodeId: relation.targetNodeId,
+        targetTitle: endpointTitles.get(relation.targetNodeId) ?? "未知节点",
+        reason: relation.reason,
+        confidence: relation.confidence,
+        evidenceChunkIds,
+      };
+    });
+
+    return {
+      versionId,
+      documentName: source.documentName,
+      chunks,
+      nodes,
+      relations,
+      note: "Only AI-generated nodes and non-rejected AI relations are included. User-created graph edits are excluded from mapping quality judgment.",
+    };
+  }
+
+  saveMappingAudit(libraryId: string, versionId: string, result: MappingAuditResult): MappingAudit {
+    const id = randomUUID();
+    const createdAt = now();
+    this.sql.prepare(`
+      INSERT INTO mapping_audits
+        (id, library_id, version_id, status, summary, reconstruction, findings_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(version_id) DO UPDATE SET
+        id = excluded.id,
+        library_id = excluded.library_id,
+        status = excluded.status,
+        summary = excluded.summary,
+        reconstruction = excluded.reconstruction,
+        findings_json = excluded.findings_json,
+        created_at = excluded.created_at
+    `).run(
+      id,
+      libraryId,
+      versionId,
+      result.status,
+      result.summary,
+      result.reconstruction,
+      JSON.stringify(result.findings),
+      createdAt,
+    );
+    return this.getMappingAudit(versionId) as MappingAudit;
+  }
+
+  getMappingAudit(versionId: string): MappingAudit | undefined {
+    const result = row(this.sql.prepare("SELECT * FROM mapping_audits WHERE version_id = ?"), versionId);
+    return result ? mappingAuditFrom(result) : undefined;
+  }
+
   createJob(libraryId: string, versionId: string): IngestJob {
     const job: IngestJob = {
       id: randomUUID(),
@@ -1053,6 +1271,30 @@ export class AgentDatabase {
       libraryId,
       limit,
     ).map((result) => ({ chunk: chunkFrom(result), score: -Number(result.rank) }));
+  }
+
+  searchChunksFuzzy(libraryId: string, query: string, limit: number): SearchResult[] {
+    const normalizedQuery = normalizeSearchText(query);
+    if (!normalizedQuery) return [];
+    const tokens = searchTokens(query);
+    const likeTerms = [normalizedQuery, ...tokens].slice(0, 6);
+    const filters = likeTerms.flatMap(() => ["heading_path LIKE ?", "text LIKE ?"]);
+    const params = likeTerms.flatMap((term) => [`%${term}%`, `%${term}%`]);
+    const candidates = rows(
+      this.sql.prepare(`
+        SELECT * FROM chunks
+        WHERE library_id = ? AND (${filters.join(" OR ")})
+        ORDER BY ordinal LIMIT ?
+      `),
+      libraryId,
+      ...params,
+      Math.max(limit * 6, 80),
+    ).map(chunkFrom);
+    return candidates
+      .map((chunk) => ({ chunk, score: scoreChunkMatch(chunk, query) }))
+      .filter((result) => result.score > 0)
+      .sort((left, right) => right.score - left.score || left.chunk.ordinal - right.chunk.ordinal)
+      .slice(0, limit);
   }
 
   listEvidenceChunks(libraryId: string, query: string, versionId: string | undefined, limit: number): SearchResult[] {

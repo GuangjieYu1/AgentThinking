@@ -6,6 +6,8 @@ import type {
   IngestJob,
   Library,
   LibrarySettings,
+  MappingAudit,
+  MappingAuditFinding,
   OcrMode,
   PublishedAnalysis,
   SourceStructure,
@@ -15,6 +17,28 @@ import { AnalysisWorkspace } from "./AnalysisWorkspace";
 import { GraphWorkspace } from "./GraphWorkspace";
 import { ModelTools } from "./ModelTools";
 import { TimelineWorkspace } from "./TimelineWorkspace";
+
+const mappingAuditStatusLabels: Record<MappingAudit["status"], string> = {
+  clean: "未发现明显分歧",
+  minor_issues: "有轻微问题",
+  major_issues: "有严重问题",
+  failed: "审计失败",
+};
+
+const mappingAuditKindLabels: Record<MappingAuditFinding["kind"], string> = {
+  missing_source_meaning: "原文语义遗漏",
+  unsupported_graph_claim: "图谱推断缺证据",
+  wrong_relation: "关系错误",
+  chunk_boundary_loss: "切分边界丢失",
+  overgeneralization: "过度概括",
+  other: "其他",
+};
+
+const mappingAuditSeverityLabels: Record<MappingAuditFinding["severity"], string> = {
+  low: "低",
+  medium: "中",
+  high: "高",
+};
 
 export function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
@@ -254,6 +278,13 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const [activeWorkspace, setActiveWorkspace] = useState<"graph" | "timeline" | "analysis">("graph");
   const [analysis, setAnalysis] = useState<PublishedAnalysis>();
   const [sourceView, setSourceView] = useState<{ structure: SourceStructure; text?: string; focus?: Citation }>();
+  const [mappingAuditView, setMappingAuditView] = useState<{
+    versionId: string;
+    documentName: string;
+    mediaType: string;
+    loading: boolean;
+    audit?: MappingAudit;
+  }>();
   const [resourcePanelCollapsed, setResourcePanelCollapsed] = useState(false);
   const activeJobs = useMemo(() => jobs.filter((job) => !["completed", "failed"].includes(job.stage)), [jobs]);
 
@@ -320,7 +351,22 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
       const text = mediaType === "text/markdown" || mediaType === "text/plain"
         ? await api.sourceText(versionId)
         : undefined;
-      setSourceView({ structure, ...(text !== undefined ? { text } : {}), ...(focus ? { focus } : {}) });
+      let resolvedFocus = focus;
+      if (focus?.chunkId && focus.startLine == null) {
+        const chunk = structure.chunks.find((item) => item.id === focus.chunkId);
+        if (chunk) {
+          resolvedFocus = {
+            ...focus,
+            headingPath: chunk.headingPath,
+            pageNumber: chunk.pageNumber,
+            startLine: chunk.startLine,
+            endLine: chunk.endLine,
+            blockId: chunk.blockId,
+            excerpt: chunk.text.slice(0, 280),
+          };
+        }
+      }
+      setSourceView({ structure, ...(text !== undefined ? { text } : {}), ...(resolvedFocus ? { focus: resolvedFocus } : {}) });
     } catch (cause) {
       onError((cause as Error).message);
     }
@@ -334,6 +380,45 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
     } catch (cause) {
       onError((cause as Error).message);
     }
+  };
+
+  const runMappingAudit = async (document: Document) => {
+    const version = document.latestVersion;
+    if (!version) return;
+    setMappingAuditView({
+      versionId: version.id,
+      documentName: document.name,
+      mediaType: document.mediaType,
+      loading: true,
+    });
+    try {
+      const audit = await api.runMappingAudit(version.id);
+      setMappingAuditView({
+        versionId: version.id,
+        documentName: document.name,
+        mediaType: document.mediaType,
+        loading: false,
+        audit,
+      });
+    } catch (cause) {
+      setMappingAuditView(undefined);
+      onError((cause as Error).message);
+    }
+  };
+
+  const openAuditChunk = (view: { versionId: string; documentName: string; mediaType: string }, chunkId: string) => {
+    void openSource(view.versionId, view.mediaType, {
+      versionId: view.versionId,
+      chunkId,
+      documentName: view.documentName,
+      mediaType: view.mediaType,
+      headingPath: null,
+      pageNumber: null,
+      startLine: null,
+      endLine: null,
+      blockId: null,
+      excerpt: "",
+    });
   };
 
   return (
@@ -391,6 +476,12 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
                   {document.latestVersion && <div className="document-actions">
                     <button onClick={() => void openSource(document.latestVersion!.id, document.mediaType)}>查看</button>
                     <a href={api.sourceUrl(document.latestVersion.id, true)}>下载</a>
+                    <button
+                      disabled={document.latestVersion.status !== "completed" || mappingAuditView?.loading}
+                      onClick={() => void runMappingAudit(document)}
+                    >
+                      映射审计
+                    </button>
                     <button onClick={() => void reanalyze(document.latestVersion!.id)}>重新分析</button>
                   </div>}
                 </div>
@@ -464,6 +555,102 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
         </div>
       </div>
       {sourceView && <SourcePreview view={sourceView} onClose={() => setSourceView(undefined)} />}
+      {mappingAuditView && (
+        <MappingAuditPanel
+          view={mappingAuditView}
+          onClose={() => setMappingAuditView(undefined)}
+          onRerun={() => {
+            const document = documents.find((item) => item.latestVersion?.id === mappingAuditView.versionId);
+            if (document) void runMappingAudit(document);
+          }}
+          onOpenChunk={(chunkId) => openAuditChunk(mappingAuditView, chunkId)}
+        />
+      )}
+    </div>
+  );
+}
+
+function MappingAuditPanel({
+  view,
+  onClose,
+  onRerun,
+  onOpenChunk,
+}: {
+  view: { versionId: string; documentName: string; mediaType: string; loading: boolean; audit?: MappingAudit };
+  onClose: () => void;
+  onRerun: () => void;
+  onOpenChunk: (chunkId: string) => void;
+}) {
+  const audit = view.audit;
+  return (
+    <div className="source-overlay">
+      <section className="mapping-audit-panel card">
+        <header>
+          <div>
+            <h2>映射审计</h2>
+            <p>{view.documentName}</p>
+          </div>
+          <div className="mapping-audit-actions">
+            <button className="ghost" disabled={view.loading} onClick={onRerun}>重新运行</button>
+            <button onClick={onClose}>关闭</button>
+          </div>
+        </header>
+        {view.loading ? (
+          <div className="mapping-audit-loading">
+            <strong>正在重构语义轮廓并审计 mapping...</strong>
+            <p>这一步会对照 chunk 原文、AI 节点和关系，只给建议，不会修改图谱。</p>
+          </div>
+        ) : audit ? (
+          <>
+            <section className={`mapping-audit-summary ${audit.status}`}>
+              <span>{mappingAuditStatusLabels[audit.status]}</span>
+              <p>{audit.summary}</p>
+              <small>{new Date(audit.createdAt).toLocaleString()}</small>
+            </section>
+            <section className="mapping-audit-reconstruction">
+              <h3>语义重构</h3>
+              <pre>{audit.reconstruction || "本次审计没有生成可展示的重构文本。"}</pre>
+            </section>
+            <section className="mapping-audit-findings">
+              <h3>发现的问题</h3>
+              {audit.findings.length === 0 ? (
+                <p className="muted">没有发现明显语义分歧。</p>
+              ) : audit.findings.map((finding, index) => (
+                <article className={`mapping-finding ${finding.severity}`} key={`${finding.kind}-${index}`}>
+                  <div className="mapping-finding-heading">
+                    <strong>{finding.title}</strong>
+                    <span>{mappingAuditKindLabels[finding.kind]} / {mappingAuditSeverityLabels[finding.severity]}</span>
+                  </div>
+                  <p>{finding.description}</p>
+                  <small>{finding.suggestion}</small>
+                  <MappingFindingRefs finding={finding} onOpenChunk={onOpenChunk} />
+                </article>
+              ))}
+            </section>
+          </>
+        ) : (
+          <p className="muted">尚未运行映射审计。</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function MappingFindingRefs({ finding, onOpenChunk }: { finding: MappingAuditFinding; onOpenChunk: (chunkId: string) => void }) {
+  const hasRefs = finding.evidenceChunkIds.length > 0 || finding.nodeIds.length > 0 || finding.relationIds.length > 0;
+  if (!hasRefs) return null;
+  return (
+    <div className="mapping-finding-refs">
+      {finding.evidenceChunkIds.length > 0 && (
+        <div>
+          <span>Chunk</span>
+          {finding.evidenceChunkIds.map((chunkId) => (
+            <button className="ghost" key={chunkId} onClick={() => onOpenChunk(chunkId)}>{chunkId.slice(0, 8)}</button>
+          ))}
+        </div>
+      )}
+      {finding.nodeIds.length > 0 && <div><span>节点</span><code>{finding.nodeIds.map((id) => id.slice(0, 8)).join(", ")}</code></div>}
+      {finding.relationIds.length > 0 && <div><span>关系</span><code>{finding.relationIds.map((id) => id.slice(0, 8)).join(", ")}</code></div>}
     </div>
   );
 }

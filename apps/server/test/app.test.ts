@@ -185,6 +185,41 @@ describe("HTTP application", () => {
     expect(graph.nodes.find((node) => node.nodeType === "abstract")?.data.citations?.length).toBeGreaterThan(0);
     const suggested = graph.edges.find((edge) => edge.relation)?.relation;
     expect(suggested?.citations.length).toBeGreaterThan(0);
+    const chunkSearch = await app.inject({
+      method: "POST",
+      url: `/api/libraries/${library.id}/search`,
+      payload: { query: "First" },
+    });
+    expect(chunkSearch.statusCode).toBe(200);
+    const chunkResults = chunkSearch.json<Array<{ chunk: { headingPath: string | null; text: string }; score: number }>>();
+    expect(chunkResults.length).toBeGreaterThan(0);
+    expect(chunkResults[0]?.chunk.headingPath ?? chunkResults[0]?.chunk.text).toContain("First");
+    expect(chunkResults.map((result) => result.score)).toEqual([...chunkResults.map((result) => result.score)].sort((left, right) => right - left));
+    const mappingAudit = await app.inject({
+      method: "POST",
+      url: `/api/versions/${versionId}/mapping-audit`,
+    });
+    expect(mappingAudit.statusCode).toBe(200);
+    const audit = mappingAudit.json<{ id: string; status: string; reconstruction: string; findings: unknown[] }>();
+    expect(audit.status).toBe("minor_issues");
+    expect(audit.reconstruction).toContain("演示语义重构");
+    expect(audit.findings.length).toBeGreaterThan(0);
+    const mappingAuditRead = (await app.inject({
+      method: "GET",
+      url: `/api/versions/${versionId}/mapping-audit`,
+    })).json<{ id: string }>();
+    expect(mappingAuditRead.id).toBe(audit.id);
+    const pendingVersion = db.createDocumentVersion(library.id, "pending.txt", "text/plain", "pending-hash", "pending").version;
+    const blockedAudit = await app.inject({
+      method: "POST",
+      url: `/api/versions/${pendingVersion.id}/mapping-audit`,
+    });
+    expect(blockedAudit.statusCode).toBe(409);
+    const missingAudit = await app.inject({
+      method: "GET",
+      url: `/api/versions/${pendingVersion.id}/mapping-audit`,
+    });
+    expect(missingAudit.statusCode).toBe(404);
     const overview = (await app.inject({
       method: "GET",
       url: `/api/libraries/${library.id}/graph?view=overview`,

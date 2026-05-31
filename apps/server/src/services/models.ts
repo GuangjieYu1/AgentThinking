@@ -1,17 +1,90 @@
 import type {
+  AbstractNodeKind,
   AspectKind,
   Chunk,
   Citation,
   ExtractionOutput,
+  MappingAuditResult,
   ModelTestResult,
   PulseAnswerContext,
   PulseAnswerOutput,
   PulseNavigationCandidate,
   PulseNavigationDecision,
+  RelationType,
   StatementPrecheckOutput,
 } from "@agent-thinking/contracts";
-import { extractionSchema, pulseAnswerSchema, pulseNavigationDecisionSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
+import { extractionSchema, mappingAuditResultSchema, pulseAnswerSchema, pulseNavigationDecisionSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
+
+export interface MappingAuditNodeContext {
+  id: string;
+  kind: AbstractNodeKind;
+  title: string;
+  summary: string;
+  level: 1 | 2;
+  evidenceChunkIds: string[];
+}
+
+export interface MappingAuditRelationContext {
+  id: string;
+  type: RelationType;
+  sourceNodeId: string;
+  sourceTitle: string;
+  targetNodeId: string;
+  targetTitle: string;
+  reason: string;
+  confidence: number | null;
+  evidenceChunkIds: string[];
+}
+
+export interface MappingAuditContext {
+  versionId: string;
+  documentName: string;
+  chunks: Chunk[];
+  nodes: MappingAuditNodeContext[];
+  relations: MappingAuditRelationContext[];
+  note?: string;
+}
+
+type MappingAuditReview = Pick<MappingAuditResult, "status" | "summary" | "findings">;
+const mappingAuditReviewSchema = mappingAuditResultSchema.omit({ reconstruction: true });
+
+function stripModelFences(value: string): string {
+  return value.trim().replace(/^```(?:json|markdown|md)?\s*/i, "").replace(/\s*```$/i, "").trim();
+}
+
+function jsonCandidate(value: string): string | undefined {
+  const start = value.indexOf("{");
+  const end = value.lastIndexOf("}");
+  return start >= 0 && end > start ? value.slice(start, end + 1) : undefined;
+}
+
+function parseJsonModelObject(raw: string): unknown {
+  const cleaned = stripModelFences(raw);
+  const candidates = [cleaned, jsonCandidate(cleaned)].filter((candidate): candidate is string => Boolean(candidate));
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch (cause) {
+      lastError = cause;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("模型返回了不可解析的 JSON");
+}
+
+function modelText(raw: string): string {
+  const cleaned = stripModelFences(raw);
+  try {
+    const parsed = parseJsonModelObject(cleaned) as { reconstruction?: unknown };
+    if (typeof parsed.reconstruction === "string" && parsed.reconstruction.trim()) {
+      return parsed.reconstruction.trim();
+    }
+  } catch {
+    // Plain text is the preferred format for reconstruction; malformed JSON is shown as text.
+  }
+  return cleaned;
+}
 
 export interface ModelProvider {
   readonly name: string;
@@ -19,6 +92,8 @@ export interface ModelProvider {
   embed(texts: string[]): Promise<number[][]>;
   extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>): Promise<ExtractionOutput>;
   precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput>;
+  reconstructMapping(context: MappingAuditContext): Promise<string>;
+  auditMapping(reconstruction: string, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<MappingAuditReview>;
   answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput>;
   selectPulseNavigation(question: string, step: string, candidates: PulseNavigationCandidate[]): Promise<PulseNavigationDecision>;
   stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }>;
@@ -120,6 +195,76 @@ export class FakeModelProvider implements ModelProvider {
     };
   }
 
+  async reconstructMapping(context: MappingAuditContext): Promise<string> {
+    const chunkOutline = context.chunks
+      .slice(0, 8)
+      .map((chunk) => `${chunk.ordinal + 1}. ${chunk.headingPath ? `${chunk.headingPath}：` : ""}${chunk.text.slice(0, 120)}`)
+      .join("\n");
+    const graphOutline = context.nodes
+      .slice(0, 8)
+      .map((node) => `- ${node.title}：${node.summary || "暂无摘要"}`)
+      .join("\n");
+    return [
+      `演示语义重构：${context.documentName}`,
+      "原文片段要点：",
+      chunkOutline || "暂无可重构的原文片段。",
+      "图谱映射要点：",
+      graphOutline || "当前批次没有映射节点。",
+    ].join("\n");
+  }
+
+  async auditMapping(_reconstruction: string, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<MappingAuditReview> {
+    const firstChunk = originalChunks[0];
+    if (graphContext.nodes.length === 0) {
+      return {
+        status: "major_issues",
+        summary: "演示审计发现：当前原文片段没有形成可追踪的 AI 节点，mapping 覆盖不足。",
+        findings: [{
+          kind: "missing_source_meaning",
+          severity: "high",
+          title: "原文片段缺少映射节点",
+          description: "这些 chunk 已完成切分，但审计上下文中没有可对应的 AI 节点或主题。",
+          suggestion: "重新分析该文档，或检查 chunk 是否过长、标题是否缺失、模型抽取是否失败。",
+          evidenceChunkIds: firstChunk ? [firstChunk.id] : [],
+          nodeIds: [],
+          relationIds: [],
+        }],
+      };
+    }
+    const relationWithoutEvidence = graphContext.relations.find((relation) => relation.evidenceChunkIds.length === 0);
+    if (relationWithoutEvidence) {
+      return {
+        status: "minor_issues",
+        summary: "演示审计发现：至少一条 AI 关系缺少直接证据，需要人工核对。",
+        findings: [{
+          kind: "unsupported_graph_claim",
+          severity: "medium",
+          title: "关系缺少原文证据",
+          description: `关系 ${relationWithoutEvidence.sourceTitle} → ${relationWithoutEvidence.targetTitle} 没有关联证据 chunk。`,
+          suggestion: "补充关系证据，或在关系审核中拒绝/改写该关系。",
+          evidenceChunkIds: firstChunk ? [firstChunk.id] : [],
+          nodeIds: [relationWithoutEvidence.sourceNodeId, relationWithoutEvidence.targetNodeId],
+          relationIds: [relationWithoutEvidence.id],
+        }],
+      };
+    }
+    const firstNode = graphContext.nodes[0]!;
+    return {
+      status: "minor_issues",
+      summary: "演示审计建议：mapping 基本可读，但仍建议核对节点摘要是否保留原文限定条件。",
+      findings: [{
+        kind: "overgeneralization",
+        severity: "low",
+        title: "核对节点摘要的限定条件",
+        description: `节点“${firstNode.title}”由原文抽象而来，演示审计建议人工确认摘要没有扩大原文含义。`,
+        suggestion: "打开相关 chunk，对照节点标题和摘要，必要时手动修改节点摘要或关系说明。",
+        evidenceChunkIds: firstNode.evidenceChunkIds.length > 0 ? firstNode.evidenceChunkIds : firstChunk ? [firstChunk.id] : [],
+        nodeIds: [firstNode.id],
+        relationIds: [],
+      }],
+    };
+  }
+
   async answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput> {
     const topNodes = context.nodes.slice(0, 3).map((node) => node.title).join("、") || "暂无节点";
     const topChunks = context.chunks.slice(0, 2).map((chunk) => chunk.text.slice(0, 80)).join("；") || "暂无证据片段";
@@ -195,6 +340,35 @@ export class OpenAICompatibleProvider implements ModelProvider {
       throw new Error(`模型服务请求失败 (${response.status}): ${text.slice(0, 240)}`);
     }
     return response.json() as Promise<T>;
+  }
+
+  private async repairMappingAuditJson(raw: string, parseError: unknown): Promise<MappingAuditReview> {
+    const errorMessage = parseError instanceof Error ? parseError.message : "JSON parse failed";
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Repair the supplied malformed JSON into valid JSON that matches exactly this shape: " +
+            '{"status":"clean|minor_issues|major_issues|failed","summary":"...","findings":[{"kind":"missing_source_meaning|unsupported_graph_claim|wrong_relation|chunk_boundary_loss|overgeneralization|other","severity":"low|medium|high","title":"...","description":"...","suggestion":"...","evidenceChunkIds":["..."],"nodeIds":["..."],"relationIds":["..."]}]}. ' +
+            "Preserve the meaning of any recoverable fields. If a field is missing, choose a conservative valid value. Return JSON only.",
+        },
+        { role: "user", content: JSON.stringify({ parseError: errorMessage, malformedJson: raw.slice(0, 12000) }) },
+      ],
+      max_tokens: 1400,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const repaired = response.choices[0]?.message.content ?? "{}";
+    return mappingAuditReviewSchema.parse(parseJsonModelObject(repaired));
   }
 
   async embed(texts: string[]): Promise<number[][]> {
@@ -298,6 +472,137 @@ export class OpenAICompatibleProvider implements ModelProvider {
     );
     const raw = response.choices[0]?.message.content ?? "{}";
     return statementPrecheckSchema.parse(JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, "")));
+  }
+
+  async reconstructMapping(context: MappingAuditContext): Promise<string> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const evidence = context.chunks.map((chunk) => ({
+      id: chunk.id,
+      ordinal: chunk.ordinal,
+      heading: chunk.headingPath,
+      pageNumber: chunk.pageNumber,
+      text: chunk.text.slice(0, 2400),
+    }));
+    const graph = {
+      nodes: context.nodes.map((node) => ({
+        id: node.id,
+        kind: node.kind,
+        level: node.level,
+        title: node.title,
+        summary: node.summary,
+        evidenceChunkIds: node.evidenceChunkIds,
+      })),
+      relations: context.relations.map((relation) => ({
+        id: relation.id,
+        type: relation.type,
+        source: relation.sourceTitle,
+        target: relation.targetTitle,
+        reason: relation.reason,
+        evidenceChunkIds: relation.evidenceChunkIds,
+      })),
+    };
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Reconstruct the semantic outline of the original document section using only the supplied knowledge graph mapping. " +
+            "Do not try to reproduce exact wording. Capture what the graph claims the source means, including important qualifiers, causal/argument links, and uncertainty. " +
+            "Return plain text only, not JSON and not Markdown code fences.",
+        },
+        { role: "user", content: JSON.stringify({ document: context.documentName, evidence, graph, note: context.note ?? "" }) },
+      ],
+      max_tokens: 2400,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const reconstruction = modelText(response.choices[0]?.message.content ?? "");
+    if (!reconstruction.trim()) throw new Error("语义重构模型没有返回可展示文本");
+    return reconstruction.slice(0, 20000);
+  }
+
+  async auditMapping(reconstruction: string, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<MappingAuditReview> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const original = originalChunks.map((chunk) => ({
+      id: chunk.id,
+      ordinal: chunk.ordinal,
+      heading: chunk.headingPath,
+      pageNumber: chunk.pageNumber,
+      text: chunk.text.slice(0, 2600),
+    }));
+    const graph = {
+      nodes: graphContext.nodes.map((node) => ({
+        id: node.id,
+        title: node.title,
+        summary: node.summary,
+        evidenceChunkIds: node.evidenceChunkIds,
+      })),
+      relations: graphContext.relations.map((relation) => ({
+        id: relation.id,
+        type: relation.type,
+        sourceNodeId: relation.sourceNodeId,
+        sourceTitle: relation.sourceTitle,
+        targetNodeId: relation.targetNodeId,
+        targetTitle: relation.targetTitle,
+        reason: relation.reason,
+        evidenceChunkIds: relation.evidenceChunkIds,
+      })),
+    };
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an auditor for chunking and knowledge-graph mapping quality. Compare the original chunks with the semantic reconstruction and graph mapping. " +
+            "Find semantic divergence only: missing important source meaning, unsupported graph claims, wrong relation type or direction, overgeneralization, and meaning lost at chunk boundaries. " +
+            "Do not penalize harmless wording changes. Prefer actionable findings with exact chunk, node, and relation ids when relevant. " +
+            'Return JSON only: {"status":"clean|minor_issues|major_issues|failed","summary":"...","findings":[{"kind":"missing_source_meaning|unsupported_graph_claim|wrong_relation|chunk_boundary_loss|overgeneralization|other","severity":"low|medium|high","title":"...","description":"...","suggestion":"...","evidenceChunkIds":["..."],"nodeIds":["..."],"relationIds":["..."]}]}.',
+        },
+        { role: "user", content: JSON.stringify({ original, reconstruction, graph, note: graphContext.note ?? "" }) },
+      ],
+      max_tokens: 1800,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const raw = response.choices[0]?.message.content ?? "{}";
+    try {
+      return mappingAuditReviewSchema.parse(parseJsonModelObject(raw));
+    } catch (cause) {
+      if (!(cause instanceof SyntaxError)) throw cause;
+      try {
+        return await this.repairMappingAuditJson(raw, cause);
+      } catch {
+        return {
+          status: "failed",
+          summary: "审计模型返回的结构化 JSON 无法解析；已保留语义重构文本，请重新运行审计。",
+          findings: [{
+            kind: "other",
+            severity: "medium",
+            title: "审计结构化输出解析失败",
+            description: `模型返回了不完整或未正确转义的 JSON：${cause.message}`,
+            suggestion: "点击重新运行；如果反复出现，可缩短输入文档或检查当前模型的 JSON 输出稳定性。",
+            evidenceChunkIds: originalChunks.slice(0, 3).map((chunk) => chunk.id),
+            nodeIds: graphContext.nodes.slice(0, 3).map((node) => node.id),
+            relationIds: graphContext.relations.slice(0, 3).map((relation) => relation.id),
+          }],
+        };
+      }
+    }
   }
 
   async answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput> {

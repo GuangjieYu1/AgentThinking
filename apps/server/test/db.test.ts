@@ -57,6 +57,60 @@ describe("knowledge database", () => {
     db.close();
   });
 
+  it("stores mapping audit results and builds AI-only version context", async () => {
+    const db = await database();
+    const library = db.createLibrary("Mapping Audit");
+    const version = db.createDocumentVersion(library.id, "audit.txt", "text/plain", "hash", "a").version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 5, text: "alpha" },
+      { ordinal: 1, headingPath: null, pageNumber: null, startChar: 6, endChar: 12, text: "beta" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [
+        { key: "a", kind: "concept", title: "Alpha", summary: "alpha summary", evidenceChunkIds: [chunks[0]!.id], aspects: [] },
+        { key: "b", kind: "claim", title: "Beta", summary: "beta summary", evidenceChunkIds: [chunks[1]!.id], aspects: [] },
+      ],
+      relations: [{
+        sourceKey: "a",
+        targetKey: "b",
+        type: "supports",
+        reason: "alpha supports beta",
+        confidence: 0.8,
+        evidenceChunkIds: [chunks[0]!.id],
+      }],
+    }, version.id);
+    const context = db.getMappingAuditContext(version.id);
+    expect(context?.chunks).toHaveLength(2);
+    expect(context?.nodes.map((node) => node.title)).toContain("Alpha");
+    expect(context?.relations[0]?.evidenceChunkIds).toEqual([chunks[0]!.id]);
+    const saved = db.saveMappingAudit(library.id, version.id, {
+      status: "minor_issues",
+      summary: "needs review",
+      reconstruction: "semantic outline",
+      findings: [{
+        kind: "overgeneralization",
+        severity: "low",
+        title: "Check summary",
+        description: "Summary may be broad.",
+        suggestion: "Compare against source chunk.",
+        evidenceChunkIds: [chunks[0]!.id],
+        nodeIds: [context!.nodes[0]!.id],
+        relationIds: [],
+      }],
+    });
+    expect(db.getMappingAudit(version.id)?.id).toBe(saved.id);
+    db.saveMappingAudit(library.id, version.id, {
+      status: "clean",
+      summary: "ok",
+      reconstruction: "updated",
+      findings: [],
+    });
+    expect(db.getMappingAudit(version.id)?.summary).toBe("ok");
+    expect(db.deleteLibrary(library.id)).toBe(true);
+    expect(db.getMappingAudit(version.id)).toBeUndefined();
+    db.close();
+  });
+
   it("merges evidence when AI suggests the same pending relation again", async () => {
     const db = await database();
     const library = db.createLibrary("Merged suggestions");

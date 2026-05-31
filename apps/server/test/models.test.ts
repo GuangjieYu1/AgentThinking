@@ -141,4 +141,152 @@ describe("DeepSeek model configuration", () => {
     expect(body.messages[1]!.content).toContain("材料支持结论");
     expect(body.messages[0]!.content).toContain("relationship");
   });
+
+  it("reconstructs and audits mapping output with structured validation", async () => {
+    const responses = [
+      { choices: [{ message: { content: "semantic reconstruction" } }] },
+      { choices: [{ message: { content: JSON.stringify({
+        status: "minor_issues",
+        summary: "one issue",
+        findings: [{
+          kind: "overgeneralization",
+          severity: "low",
+          title: "Check abstraction",
+          description: "Node summary may be too broad.",
+          suggestion: "Compare with the source chunk.",
+          evidenceChunkIds: ["chunk-1"],
+          nodeIds: ["node-1"],
+          relationIds: [],
+        }],
+      }) } }] },
+    ];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify(responses.shift()), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const chunk: Chunk = {
+      id: "chunk-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      ordinal: 0,
+      headingPath: "Topic",
+      pageNumber: null,
+      startLine: 1,
+      endLine: 2,
+      blockId: null,
+      startChar: 0,
+      endChar: 8,
+      text: "原文内容",
+      aspects: [],
+    };
+    const context = {
+      versionId: "version-1",
+      documentName: "source.md",
+      chunks: [chunk],
+      nodes: [{
+        id: "node-1",
+        kind: "concept" as const,
+        title: "Topic",
+        summary: "summary",
+        level: 1 as const,
+        evidenceChunkIds: ["chunk-1"],
+      }],
+      relations: [],
+    };
+    const reconstruction = await provider.reconstructMapping(context);
+    const audit = await provider.auditMapping(reconstruction, [chunk], context);
+    expect(reconstruction).toBe("semantic reconstruction");
+    expect(audit.status).toBe("minor_issues");
+    expect(audit.findings[0]?.kind).toBe("overgeneralization");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("repairs malformed mapping audit JSON instead of failing the whole audit", async () => {
+    const responses = [
+      { choices: [{ message: { content: '{"status":"minor_issues","summary":"partial","findings":[{"kind":"overgeneralization","severity":"low","title":"Broken' } }] },
+      { choices: [{ message: { content: JSON.stringify({
+        status: "minor_issues",
+        summary: "repaired issue",
+        findings: [{
+          kind: "overgeneralization",
+          severity: "low",
+          title: "Repaired finding",
+          description: "The original audit JSON was incomplete.",
+          suggestion: "Review the affected source chunk.",
+          evidenceChunkIds: ["chunk-1"],
+          nodeIds: ["node-1"],
+          relationIds: [],
+        }],
+      }) } }] },
+    ];
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify(responses.shift()), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const chunk: Chunk = {
+      id: "chunk-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      ordinal: 0,
+      headingPath: "Topic",
+      pageNumber: null,
+      startLine: 1,
+      endLine: 2,
+      blockId: null,
+      startChar: 0,
+      endChar: 8,
+      text: "source text",
+      aspects: [],
+    };
+    const context = {
+      versionId: "version-1",
+      documentName: "source.md",
+      chunks: [chunk],
+      nodes: [{
+        id: "node-1",
+        kind: "concept" as const,
+        title: "Topic",
+        summary: "summary",
+        level: 1 as const,
+        evidenceChunkIds: ["chunk-1"],
+      }],
+      relations: [],
+    };
+    const audit = await provider.auditMapping("semantic reconstruction", [chunk], context);
+    expect(audit.status).toBe("minor_issues");
+    expect(audit.summary).toBe("repaired issue");
+    expect(audit.findings[0]?.title).toBe("Repaired finding");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const repairBody = JSON.parse(fetchMock.mock.calls[1]![1]?.body as string) as { messages: Array<{ content: string }> };
+    expect(repairBody.messages[0]!.content).toContain("Repair the supplied malformed JSON");
+  });
+
+  it("rejects mapping audit findings with invalid labels", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({
+          status: "minor_issues",
+          summary: "bad",
+          findings: [{
+            kind: "invented_kind",
+            severity: "low",
+            title: "bad",
+            description: "bad",
+            suggestion: "bad",
+            evidenceChunkIds: [],
+            nodeIds: [],
+            relationIds: [],
+          }],
+        }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    await expect(provider.auditMapping("reconstruction", [], {
+      versionId: "version-1",
+      documentName: "source.md",
+      chunks: [],
+      nodes: [],
+      relations: [],
+    })).rejects.toThrow();
+  });
 });

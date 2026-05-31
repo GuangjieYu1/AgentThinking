@@ -23,6 +23,16 @@ export const pulseStatuses = ["unreviewed", "correct", "wrong"] as const;
 export const pulseHitTargetTypes = ["node", "relation", "chunk"] as const;
 export const pulsePathRoles = ["direct", "expanded", "bridge"] as const;
 export const pulseInputModes = ["full", "progressive"] as const;
+export const mappingAuditStatuses = ["clean", "minor_issues", "major_issues", "failed"] as const;
+export const mappingAuditFindingKinds = [
+  "missing_source_meaning",
+  "unsupported_graph_claim",
+  "wrong_relation",
+  "chunk_boundary_loss",
+  "overgeneralization",
+  "other",
+] as const;
+export const mappingAuditSeverities = ["low", "medium", "high"] as const;
 export const jobStages = [
   "queued",
   "parsing",
@@ -50,6 +60,9 @@ export type PulseStatus = (typeof pulseStatuses)[number];
 export type PulseHitTargetType = (typeof pulseHitTargetTypes)[number];
 export type PulsePathRole = (typeof pulsePathRoles)[number];
 export type PulseInputMode = (typeof pulseInputModes)[number];
+export type MappingAuditStatus = (typeof mappingAuditStatuses)[number];
+export type MappingAuditFindingKind = (typeof mappingAuditFindingKinds)[number];
+export type MappingAuditSeverity = (typeof mappingAuditSeverities)[number];
 export type JobStage = (typeof jobStages)[number];
 export type OcrMode = (typeof ocrModes)[number];
 
@@ -435,6 +448,28 @@ export interface AnalysisDraft {
   };
 }
 
+export interface MappingAuditFinding {
+  kind: MappingAuditFindingKind;
+  severity: MappingAuditSeverity;
+  title: string;
+  description: string;
+  suggestion: string;
+  evidenceChunkIds: string[];
+  nodeIds: string[];
+  relationIds: string[];
+}
+
+export interface MappingAudit {
+  id: string;
+  libraryId: string;
+  versionId: string;
+  status: MappingAuditStatus;
+  summary: string;
+  reconstruction: string;
+  findings: MappingAuditFinding[];
+  createdAt: string;
+}
+
 export interface ModelTestResult {
   ok: boolean;
   provider: string;
@@ -523,6 +558,26 @@ export const statementPrecheckSchema = z.object({
 });
 
 export type StatementPrecheckOutput = z.infer<typeof statementPrecheckSchema>;
+
+export const mappingAuditFindingSchema = z.object({
+  kind: z.enum(mappingAuditFindingKinds),
+  severity: z.enum(mappingAuditSeverities),
+  title: z.string().trim().min(1).max(180),
+  description: z.string().trim().min(1).max(1200),
+  suggestion: z.string().trim().min(1).max(800),
+  evidenceChunkIds: z.array(z.string()).default([]),
+  nodeIds: z.array(z.string()).default([]),
+  relationIds: z.array(z.string()).default([]),
+});
+
+export const mappingAuditResultSchema = z.object({
+  status: z.enum(mappingAuditStatuses),
+  summary: z.string().trim().min(1).max(2000),
+  reconstruction: z.string().trim().max(20000),
+  findings: z.array(mappingAuditFindingSchema).default([]),
+});
+
+export type MappingAuditResult = z.infer<typeof mappingAuditResultSchema>;
 
 export const pulseAnswerSchema = z.object({
   answer: z.string().trim().min(1).max(4000),

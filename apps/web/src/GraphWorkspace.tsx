@@ -52,6 +52,7 @@ type PulseStreamHitRecord = PulseStreamHit;
 type PulseNavigationEvent = Extract<PulseStreamEvent, { type: "candidates" | "decision" | "backtrack" }>;
 type PulseDecorated = { pulseActive?: boolean; pulseReverse?: boolean; pulseTransitKey?: string };
 type PulseVisualHit = Pick<PulseHitRecord, "targetType" | "targetId">;
+type SearchFocus = { matchIds: ReadonlySet<string>; activeId?: string };
 type PulsePlaybackStep =
   | { kind: "hit"; hit: PulseHitRecord }
   | { kind: "backtrack"; fromNodeId: string; toNodeId: string; edgeId: string; label: string; transitKey: string };
@@ -637,15 +638,19 @@ function visualNodes(
   direction?: "horizontal" | "vertical",
   activeAspect?: AspectKind,
   pulseMode: PulseLayerMode = "normal",
+  searchFocus?: SearchFocus,
 ): VisualNode[] {
   return records.map((record) => {
     const point = positions.get(record.id);
     const title = record.nodeType === "abstract"
       ? record.data.title
       : `${record.data.pageNumber ? `P${record.data.pageNumber} ` : ""}${record.data.text.slice(0, 36)}`;
+    const searchMatched = record.nodeType === "chunk" && searchFocus?.matchIds.has(record.id);
     const label = record.nodeType === "abstract" && record.focusRole === "match" && activeAspect
       ? <div className="flow-label"><span>{title}</span><small className="flow-aspect-tag">{aspectLabels[activeAspect]}</small></div>
-      : title;
+      : searchMatched
+        ? <div className="flow-label"><span>{title}</span><small className="flow-search-tag">{record.id === searchFocus?.activeId ? "已定位" : "搜索命中"}</small></div>
+        : title;
     return {
       id: record.id,
       position: { x: point?.x ?? 0, y: point?.y ?? 0 },
@@ -655,6 +660,8 @@ function visualNodes(
       className: [
         record.nodeType === "chunk" ? "flow-chunk" : record.data.level === 2 ? "flow-theme" : `flow-${record.data.kind}`,
         record.focusRole === "match" ? "flow-aspect-match" : record.focusRole ? "flow-context" : "",
+        searchMatched ? "flow-search-match" : "",
+        record.nodeType === "chunk" && record.id === searchFocus?.activeId ? "flow-search-active" : "",
         pulseTraceClass(record, pulseMode),
         pulseMode === "current" && isPulseActive(record) ? "flow-pulse-active" : "",
       ].filter(Boolean).join(" "),
@@ -667,7 +674,7 @@ function visualNodes(
   });
 }
 
-function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode): VisualNode[] {
+function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode, searchFocus?: SearchFocus): VisualNode[] {
   const links: LayoutLink[] = graphEdges.map((edge) => ({
     source: edge.source,
     target: edge.target,
@@ -683,10 +690,10 @@ function layeredLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspe
       });
     });
   });
-  return visualNodes(records, positions, "horizontal", activeAspect, pulseMode);
+  return visualNodes(records, positions, "horizontal", activeAspect, pulseMode, searchFocus);
 }
 
-function treeLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode): VisualNode[] {
+function treeLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode, searchFocus?: SearchFocus): VisualNode[] {
   const links: LayoutLink[] = graphEdges.map((edge) => ({
     source: edge.source,
     target: edge.target,
@@ -702,10 +709,10 @@ function treeLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?
       });
     });
   });
-  return visualNodes(records, positions, "vertical", activeAspect, pulseMode);
+  return visualNodes(records, positions, "vertical", activeAspect, pulseMode, searchFocus);
 }
 
-function networkLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode): VisualNode[] {
+function networkLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspect?: AspectKind, pulseMode?: PulseLayerMode, searchFocus?: SearchFocus): VisualNode[] {
   const positions: PositionedNode[] = records.map((record) => ({ id: record.id }));
   const links = graphEdges.map((edge) => ({
     source: edge.source,
@@ -729,12 +736,46 @@ function networkLayout(records: GraphNode[], graphEdges: GraphEdge[], activeAspe
   return visualNodes(records, new Map(positions.map((position) => [position.id, {
     x: position.x ?? 0,
     y: position.y ?? 0,
-  }])), undefined, activeAspect, pulseMode);
+  }])), undefined, activeAspect, pulseMode, searchFocus);
 }
 
-function layoutNodes(records: GraphNode[], graphEdges: GraphEdge[], layout: LayoutMode, activeAspect?: AspectKind, pulseMode?: PulseLayerMode): VisualNode[] {
-  if (layout === "network") return networkLayout(records, graphEdges, activeAspect, pulseMode);
-  return layout === "tree" ? treeLayout(records, graphEdges, activeAspect, pulseMode) : layeredLayout(records, graphEdges, activeAspect, pulseMode);
+function layoutNodes(
+  records: GraphNode[],
+  graphEdges: GraphEdge[],
+  layout: LayoutMode,
+  activeAspect?: AspectKind,
+  pulseMode?: PulseLayerMode,
+  searchFocus?: SearchFocus,
+): VisualNode[] {
+  if (layout === "network") return networkLayout(records, graphEdges, activeAspect, pulseMode, searchFocus);
+  return layout === "tree"
+    ? treeLayout(records, graphEdges, activeAspect, pulseMode, searchFocus)
+    : layeredLayout(records, graphEdges, activeAspect, pulseMode, searchFocus);
+}
+
+function searchFocusFrom(results: SearchResult[], activeId?: string): SearchFocus {
+  const focus: SearchFocus = { matchIds: new Set(results.map((result) => result.chunk.id)) };
+  if (activeId) focus.activeId = activeId;
+  return focus;
+}
+
+function includeSearchChunks(nodes: GraphNode[], results: SearchResult[]): GraphNode[] {
+  if (results.length === 0) return nodes;
+  const seen = new Set(nodes.map((node) => node.id));
+  const extras = results.flatMap((result): GraphNode[] => {
+    if (seen.has(result.chunk.id)) return [];
+    seen.add(result.chunk.id);
+    return [{ id: result.chunk.id, nodeType: "chunk", data: result.chunk }];
+  });
+  return extras.length === 0 ? nodes : [...nodes, ...extras];
+}
+
+function chunkSearchTitle(chunk: SearchResult["chunk"]): string {
+  return chunk.headingPath ?? `片段 ${chunk.ordinal + 1}`;
+}
+
+function chunkSearchExcerpt(chunk: SearchResult["chunk"]): string {
+  return chunk.text.replace(/\s+/g, " ").trim().slice(0, 86);
 }
 
 function displayEdges(records: GraphEdge[], layout: LayoutMode, pulseMode: PulseLayerMode = "normal"): VisualEdge[] {
@@ -801,6 +842,7 @@ export function GraphWorkspace({
   const [manualReason, setManualReason] = useState("用户手动建立的关联");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [activeSearchChunkId, setActiveSearchChunkId] = useState<string>();
   const [pulseQuestion, setPulseQuestion] = useState("");
   const [pulseInputMode, setPulseInputMode] = useState<PulseInputMode>("full");
   const [pulseHistory, setPulseHistory] = useState<Pulse[]>([]);
@@ -815,6 +857,7 @@ export function GraphWorkspace({
   const [pulseDraftAnswer, setPulseDraftAnswer] = useState("");
   const activeLibraryIdRef = useRef(libraryId);
   const graphRequestSeqRef = useRef(0);
+  const pendingFocusNodeIdRef = useRef<string | undefined>(undefined);
   activeLibraryIdRef.current = libraryId;
   const visibleCurrentPulse = currentPulse?.pulse.libraryId === libraryId ? currentPulse : undefined;
   const activePulseHistory = useMemo(
@@ -832,6 +875,7 @@ export function GraphWorkspace({
     () => new Set(currentPulsePlaybackSteps.slice(0, pulseRevealCount).flatMap((step) => step.kind === "hit" ? [pulseHitKey(step.hit)] : [])),
     [currentPulsePlaybackSteps, pulseRevealCount],
   );
+  const searchFocus = useMemo(() => searchFocusFrom(results, activeSearchChunkId), [results, activeSearchChunkId]);
 
   const applyGraph = (
     graph: GraphResponse,
@@ -839,17 +883,27 @@ export function GraphWorkspace({
     nextPulseMode = pulseMode,
     nextRevealCount = pulseRevealCount,
     nextPulse = visibleCurrentPulse,
+    nextSearchResults = results,
+    nextActiveSearchChunkId = activeSearchChunkId,
   ) => {
-    const visibleGraph = revealPulseGraph(graph.nodes, graph.edges, nextPulseMode, nextPulse, nextRevealCount);
-    setRecords(graph.nodes);
+    const graphNodes = includeSearchChunks(graph.nodes, nextSearchResults);
+    const visibleGraph = revealPulseGraph(graphNodes, graph.edges, nextPulseMode, nextPulse, nextRevealCount);
+    const nextSearchFocus = searchFocusFrom(nextSearchResults, nextActiveSearchChunkId);
+    setRecords(graphNodes);
     setEdgeRecords(graph.edges);
     setAspectFilter(graph.aspectFilter);
-    setSelected((current) => current ? graph.nodes.find((node) => node.id === current.id) : undefined);
-    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, nextPulseMode));
+    setSelected((current) => current ? graphNodes.find((node) => node.id === current.id) : undefined);
+    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, nextPulseMode, nextSearchFocus));
     setEdges(displayEdges(visibleGraph.edges, nextLayout, nextPulseMode));
   };
 
-  const loadGraph = async (centerId?: string, includeChunks = false, requestedView = view) => {
+  const loadGraph = async (
+    centerId?: string,
+    includeChunks = false,
+    requestedView = view,
+    nextSearchResults = results,
+    nextActiveSearchChunkId = activeSearchChunkId,
+  ) => {
     const requestLibraryId = libraryId;
     const requestSeq = graphRequestSeqRef.current + 1;
     graphRequestSeqRef.current = requestSeq;
@@ -864,17 +918,33 @@ export function GraphWorkspace({
         pulseStats: pulseMode !== "normal",
         view: requestedView,
       });
-      if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return;
-      applyGraph(graph);
+      if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return undefined;
+      applyGraph(graph, layout, pulseMode, pulseRevealCount, visibleCurrentPulse, nextSearchResults, nextActiveSearchChunkId);
+      return graph;
     } catch (cause) {
-      if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return;
+      if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return undefined;
       onError((cause as Error).message);
+      return undefined;
     }
   };
 
   useEffect(() => {
     if (!flowInstance || records.length === 0) return;
-    window.requestAnimationFrame(() => void flowInstance.fitView({ padding: 0.16, minZoom: 0.35, maxZoom: 1.18 }));
+    const focusNodeId = pendingFocusNodeIdRef.current;
+    window.requestAnimationFrame(() => {
+      if (focusNodeId) {
+        pendingFocusNodeIdRef.current = undefined;
+        void flowInstance.fitView({
+          nodes: [{ id: focusNodeId }],
+          padding: 0.34,
+          minZoom: 0.55,
+          maxZoom: 1.35,
+          duration: 420,
+        });
+        return;
+      }
+      void flowInstance.fitView({ padding: 0.16, minZoom: 0.35, maxZoom: 1.18 });
+    });
   }, [flowInstance, records, layout]);
 
   useEffect(() => {
@@ -892,16 +962,16 @@ export function GraphWorkspace({
   useEffect(() => {
     if (records.length === 0) return;
     const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, visibleCurrentPulse, pulseRevealCount);
-    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, pulseMode));
+    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, pulseMode, searchFocus));
     setEdges(displayEdges(visibleGraph.edges, layout, pulseMode));
-  }, [pulseMode, pulseRevealCount, visibleCurrentPulse?.pulse.id, records, edgeRecords, layout, aspect]);
+  }, [pulseMode, pulseRevealCount, visibleCurrentPulse?.pulse.id, records, edgeRecords, layout, aspect, searchFocus]);
 
   useEffect(() => {
     if (!pulsing || visibleCurrentPulse || pulseStreamHits.length === 0 || records.length === 0) return;
     const visibleGraph = decoratePulseStreamGraph(records, edgeRecords, pulseStreamHits);
-    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, "current"));
+    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, "current", searchFocus));
     setEdges(displayEdges(visibleGraph.edges, layout, "current"));
-  }, [pulsing, visibleCurrentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect]);
+  }, [pulsing, visibleCurrentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect, searchFocus]);
 
   useEffect(() => {
     const requestLibraryId = libraryId;
@@ -922,6 +992,7 @@ export function GraphWorkspace({
     setSelectedRelation(undefined);
     setSelectedAggregate(undefined);
     setResults([]);
+    setActiveSearchChunkId(undefined);
     setRecords([]);
     setEdgeRecords([]);
     setAspectFilter(undefined);
@@ -946,7 +1017,8 @@ export function GraphWorkspace({
     setSelectedRelation(undefined);
     setSelectedAggregate(undefined);
     setResults([]);
-    void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view);
+    setActiveSearchChunkId(undefined);
+    void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view, [], undefined);
   }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, visibleCurrentPulse?.pulse.id]);
 
   const suggested = useMemo(
@@ -960,12 +1032,30 @@ export function GraphWorkspace({
 
   const search = async (event: FormEvent) => {
     event.preventDefault();
-    if (!query.trim()) return;
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    const requestLibraryId = libraryId;
     try {
-      setResults(await api.search(libraryId, query));
+      const nextResults = await api.search(requestLibraryId, trimmed);
+      if (activeLibraryIdRef.current !== requestLibraryId) return;
+      setResults(nextResults);
+      setActiveSearchChunkId(undefined);
+      await loadGraph(undefined, true, view, nextResults, undefined);
     } catch (cause) {
+      if (activeLibraryIdRef.current !== requestLibraryId) return;
       onError((cause as Error).message);
     }
+  };
+
+  const openSearchResult = async (result: SearchResult) => {
+    const chunkNode: GraphNode = { id: result.chunk.id, nodeType: "chunk", data: result.chunk };
+    setActiveSearchChunkId(result.chunk.id);
+    setSelected(chunkNode);
+    setSelectedRelation(undefined);
+    setSelectedAggregate(undefined);
+    pendingFocusNodeIdRef.current = result.chunk.id;
+    const graph = await loadGraph(result.chunk.id, true, view, results, result.chunk.id);
+    if (!graph) pendingFocusNodeIdRef.current = undefined;
   };
 
   const runPulse = async (event: FormEvent) => {
@@ -1157,7 +1247,7 @@ export function GraphWorkspace({
   const changeLayout = (nextLayout: LayoutMode) => {
     setLayout(nextLayout);
     const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, visibleCurrentPulse, pulseRevealCount);
-    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, pulseMode));
+    setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, pulseMode, searchFocus));
     setEdges(displayEdges(visibleGraph.edges, nextLayout, pulseMode));
   };
 
@@ -1194,7 +1284,7 @@ export function GraphWorkspace({
         <div className="toolbar-group toolbar-search">
           <span className="toolbar-label">检索</span>
           <form onSubmit={(event) => void search(event)}>
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="语义搜索 chunk..." />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="模糊搜索 chunk 名称/内容..." />
             <button type="submit">搜索</button>
           </form>
         </div>
@@ -1471,13 +1561,17 @@ export function GraphWorkspace({
           </div>}
           {results.length > 0 && (
             <div className="search-results">
-              <h3>搜索结果</h3>
+              <h3>搜索结果 <small>{results.length} 个，按关联度排序</small></h3>
               {results.map((result) => (
-                <button key={result.chunk.id} onClick={() => {
-                  setSelected({ id: result.chunk.id, nodeType: "chunk", data: result.chunk });
-                  void loadGraph(result.chunk.id, true);
-                }}>
-                  <span>{result.chunk.text.slice(0, 65)}</span>
+                <button
+                  className={activeSearchChunkId === result.chunk.id ? "selected" : ""}
+                  key={result.chunk.id}
+                  onClick={() => void openSearchResult(result)}
+                >
+                  <span>
+                    <strong>{chunkSearchTitle(result.chunk)}</strong>
+                    <em>{chunkSearchExcerpt(result.chunk)}</em>
+                  </span>
                   <small>{result.score.toFixed(3)}</small>
                 </button>
               ))}

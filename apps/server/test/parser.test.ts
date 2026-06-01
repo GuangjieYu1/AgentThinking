@@ -30,6 +30,9 @@ function model(): ModelProvider {
     embed: async () => [],
     extract: async () => ({ nodes: [], relations: [] }),
     precheckStatement: async () => ({ status: "supported", reason: "ok", suggestions: [] }),
+    reconstructMapping: async () => "ok",
+    auditMapping: async () => ({ status: "clean", summary: "ok", findings: [] }),
+    rebuildGraphFromMappingAudit: async () => ({ nodes: [], relations: [], themes: [] }),
     answerPulse: async () => ({ answer: "ok", summary: "ok" }),
     selectPulseNavigation: async (_question, _step, candidates) => ({
       selectedIds: candidates.slice(0, 1).map((candidate) => candidate.id),

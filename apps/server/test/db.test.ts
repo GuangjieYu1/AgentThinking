@@ -57,6 +57,56 @@ describe("knowledge database", () => {
     db.close();
   });
 
+  it("updates relation details and graph evidence safely", async () => {
+    const db = await database();
+    const library = db.createLibrary("Audit Tools");
+    const version = db.createDocumentVersion(library.id, "source.txt", "text/plain", "hash", "source").version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 5, text: "alpha" },
+      { ordinal: 1, headingPath: null, pageNumber: null, startChar: 6, endChar: 10, text: "beta" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [
+        { key: "a", kind: "concept", title: "Alpha", summary: "alpha", evidenceChunkIds: [chunks[0]!.id], aspects: [] },
+        { key: "b", kind: "claim", title: "Beta", summary: "beta", evidenceChunkIds: [chunks[1]!.id], aspects: [] },
+      ],
+      relations: [{
+        sourceKey: "a",
+        targetKey: "b",
+        type: "related_to",
+        reason: "loose relation",
+        confidence: 0.4,
+        evidenceChunkIds: [chunks[0]!.id],
+      }],
+    }, version.id);
+
+    const graph = db.getGraph(library.id, {});
+    const relation = graph.edges[0]!.relation!;
+    const node = graph.nodes.find((item) => item.nodeType === "abstract" && item.data.title === "Alpha")!.data;
+    const updated = db.updateRelation(relation.id, {
+      type: "depends_on",
+      reason: "alpha depends on beta",
+      confidence: null,
+      status: "accepted",
+    });
+    expect(updated).toMatchObject({ type: "depends_on", reason: "alpha depends on beta", confidence: null, status: "accepted" });
+
+    expect(db.addRelationEvidence(relation.id, chunks[1]!.id).evidenceChunkIds).toEqual(expect.arrayContaining(chunks.map((chunk) => chunk.id)));
+    expect(db.removeRelationEvidence(relation.id, chunks[0]!.id).evidenceChunkIds).toEqual([chunks[1]!.id]);
+    expect(db.addNodeEvidence(node.id, chunks[1]!.id).citations.map((citation) => citation.chunkId))
+      .toEqual(expect.arrayContaining(chunks.map((chunk) => chunk.id)));
+    expect(db.removeNodeEvidence(node.id, chunks[0]!.id).citations.map((citation) => citation.chunkId)).toEqual([chunks[1]!.id]);
+
+    const other = db.createLibrary("Other");
+    const otherVersion = db.createDocumentVersion(other.id, "other.txt", "text/plain", "other", "other").version;
+    const otherChunk = db.replaceChunks(other.id, otherVersion.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 5, text: "other" },
+    ])[0]!;
+    expect(() => db.addRelationEvidence(relation.id, otherChunk.id)).toThrow(/不属于当前知识库/);
+    expect(() => db.addNodeEvidence(node.id, otherChunk.id)).toThrow(/不属于当前知识库/);
+    db.close();
+  });
+
   it("stores mapping audit results and builds AI-only version context", async () => {
     const db = await database();
     const library = db.createLibrary("Mapping Audit");
@@ -96,9 +146,15 @@ describe("knowledge database", () => {
         evidenceChunkIds: [chunks[0]!.id],
         nodeIds: [context!.nodes[0]!.id],
         relationIds: [],
+        userComment: "",
       }],
     });
     expect(db.getMappingAudit(version.id)?.id).toBe(saved.id);
+    expect(db.updateMappingAuditFindingComment(version.id, 0, "优先保留节点，调整摘要。").findings[0]?.userComment)
+      .toBe("优先保留节点，调整摘要。");
+    const rebuildReport = db.saveMappingAuditGraphRebuildReport(version.id, "审计驱动图谱重构已完成");
+    expect(rebuildReport.graphRebuildReport).toBe("审计驱动图谱重构已完成");
+    expect(rebuildReport.graphRebuiltAt).toBeTruthy();
     db.saveMappingAudit(library.id, version.id, {
       status: "clean",
       summary: "ok",
@@ -106,6 +162,7 @@ describe("knowledge database", () => {
       findings: [],
     });
     expect(db.getMappingAudit(version.id)?.summary).toBe("ok");
+    expect(db.getMappingAudit(version.id)?.graphRebuildReport).toBe("");
     expect(db.deleteLibrary(library.id)).toBe(true);
     expect(db.getMappingAudit(version.id)).toBeUndefined();
     db.close();

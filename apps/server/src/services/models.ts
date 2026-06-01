@@ -4,7 +4,9 @@ import type {
   Chunk,
   Citation,
   ExtractionOutput,
+  MappingAudit,
   MappingAuditResult,
+  MappingAuditStatus,
   ModelTestResult,
   PulseAnswerContext,
   PulseAnswerOutput,
@@ -13,7 +15,20 @@ import type {
   RelationType,
   StatementPrecheckOutput,
 } from "@agent-thinking/contracts";
-import { extractionSchema, mappingAuditResultSchema, pulseAnswerSchema, pulseNavigationDecisionSchema, statementPrecheckSchema } from "@agent-thinking/contracts";
+import {
+  abstractNodeKinds,
+  aspectKinds,
+  extractionSchema,
+  mappingAuditFindingKinds,
+  mappingAuditResultSchema,
+  mappingAuditSeverities,
+  mappingAuditStatuses,
+  pulseAnswerSchema,
+  pulseNavigationDecisionSchema,
+  relationTypes,
+  statementPrecheckSchema,
+} from "@agent-thinking/contracts";
+import { ZodError } from "zod";
 import type { AppConfig } from "../config.js";
 
 export interface MappingAuditNodeContext {
@@ -48,6 +63,13 @@ export interface MappingAuditContext {
 
 type MappingAuditReview = Pick<MappingAuditResult, "status" | "summary" | "findings">;
 const mappingAuditReviewSchema = mappingAuditResultSchema.omit({ reconstruction: true });
+const auditTextLimits = {
+  summary: 1000,
+  title: 80,
+  description: 800,
+  suggestion: 400,
+};
+const truncationSuffix = "...（已截断）";
 
 function stripModelFences(value: string): string {
   return value.trim().replace(/^```(?:json|markdown|md)?\s*/i, "").replace(/\s*```$/i, "").trim();
@@ -86,6 +108,179 @@ function modelText(raw: string): string {
   return cleaned;
 }
 
+function truncateText(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(0, max - truncationSuffix.length))}${truncationSuffix}`;
+}
+
+function normalizedText(value: unknown, fallback: string, max: number): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  return truncateText(text || fallback, max);
+}
+
+function normalizedStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function normalizedAuditEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T | string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return fallback;
+  return allowed.includes(text as T) ? text as T : text;
+}
+
+function sanitizeMappingAuditReview(value: unknown): unknown {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const findings = Array.isArray(source.findings) ? source.findings.slice(0, 5).map((entry) => {
+    const finding = entry && typeof entry === "object" && !Array.isArray(entry)
+      ? entry as Record<string, unknown>
+      : {};
+    return {
+      kind: normalizedAuditEnum(finding.kind, mappingAuditFindingKinds, "other"),
+      severity: normalizedAuditEnum(finding.severity, mappingAuditSeverities, "medium"),
+      title: normalizedText(finding.title, "审计发现", auditTextLimits.title),
+      description: normalizedText(
+        finding.description,
+        "审计模型没有提供具体说明，请对照相关原文与图谱节点人工核对。",
+        auditTextLimits.description,
+      ),
+      suggestion: normalizedText(
+        finding.suggestion,
+        "重新运行审计，或手动核对相关 chunk、节点和关系。",
+        auditTextLimits.suggestion,
+      ),
+      evidenceChunkIds: normalizedStringArray(finding.evidenceChunkIds),
+      nodeIds: normalizedStringArray(finding.nodeIds),
+      relationIds: normalizedStringArray(finding.relationIds),
+      userComment: normalizedText(finding.userComment, "", 1200),
+    };
+  }) : [];
+  return {
+    status: normalizedAuditEnum(source.status, mappingAuditStatuses, "failed" satisfies MappingAuditStatus),
+    summary: normalizedText(source.summary, "审计模型没有提供摘要。", auditTextLimits.summary),
+    findings,
+  };
+}
+
+function parseMappingAuditReview(raw: string): MappingAuditReview {
+  return mappingAuditReviewSchema.parse(sanitizeMappingAuditReview(parseJsonModelObject(raw)));
+}
+
+function firstSentence(text: string, fallback: string): string {
+  return text.split(/[。\n.!?]/, 1)[0]?.trim() || fallback;
+}
+
+function safeAspectArray(value: unknown, fallback: AspectKind[] = []): AspectKind[] {
+  if (!Array.isArray(value)) return fallback;
+  return [...new Set(value.filter((entry): entry is AspectKind => aspectKinds.includes(entry as AspectKind)))];
+}
+
+function safeEvidenceIds(value: unknown, allowedChunkIds: Set<string>): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((entry): entry is string => (
+    typeof entry === "string" && (!allowedChunkIds.size || allowedChunkIds.has(entry))
+  )))];
+}
+
+function safeConfidence(value: unknown): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return 0.5;
+  return Math.min(1, Math.max(0, numeric));
+}
+
+function fallbackExtractionFromChunks(chunks: Chunk[], note = "模型结构化输出不可用，系统生成保守候选。"): ExtractionOutput {
+  const selected = chunks.slice(0, 8);
+  const nodes = selected.map((chunk, index) => {
+    const kind = /认为|证明|应当|导致|因此|所以|主张|结论|claim|therefore/i.test(chunk.text)
+      ? "claim" as const
+      : "concept" as const;
+    return {
+      key: `fallback_${index}`,
+      kind,
+      title: truncateText(chunk.headingPath || firstSentence(chunk.text, `片段 ${index + 1}`), 80),
+      summary: truncateText(`${note} ${chunk.text.trim()}`.trim(), 500),
+      evidenceChunkIds: [chunk.id],
+      aspects: demoAspects(chunk.text, kind),
+    };
+  });
+  return { nodes, relations: [], themes: [] };
+}
+
+function sanitizeExtractionOutput(value: unknown, allowedChunks: Chunk[], fallbackNote?: string): ExtractionOutput {
+  const allowedChunkIds = new Set(allowedChunks.map((chunk) => chunk.id));
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const rawNodes = Array.isArray(source.nodes) ? source.nodes : [];
+  const nodes = rawNodes.slice(0, 32).map((entry, index) => {
+    const node = entry && typeof entry === "object" && !Array.isArray(entry)
+      ? entry as Record<string, unknown>
+      : {};
+    const key = normalizedText(node.key, `n${index}`, 80);
+    const kind = abstractNodeKinds.includes(node.kind as AbstractNodeKind) ? node.kind as AbstractNodeKind : "concept";
+    const evidenceChunkIds = safeEvidenceIds(node.evidenceChunkIds, allowedChunkIds);
+    const fallbackChunk = allowedChunks.find((chunk) => evidenceChunkIds.includes(chunk.id)) ?? allowedChunks[index % Math.max(1, allowedChunks.length)];
+    return {
+      key,
+      kind,
+      title: normalizedText(node.title, fallbackChunk ? firstSentence(fallbackChunk.text, `候选节点 ${index + 1}`) : `候选节点 ${index + 1}`, 180),
+      summary: normalizedText(node.summary, fallbackChunk?.text.slice(0, 500) ?? "模型未提供摘要。", 2000),
+      evidenceChunkIds: evidenceChunkIds.length > 0 ? evidenceChunkIds : (fallbackChunk ? [fallbackChunk.id] : []),
+      aspects: safeAspectArray(node.aspects, demoAspects(String(node.title ?? node.summary ?? fallbackChunk?.text ?? ""), kind)),
+    };
+  });
+  if (nodes.length === 0 && allowedChunks.length > 0) return fallbackExtractionFromChunks(allowedChunks, fallbackNote);
+  const nodeKeys = new Set(nodes.map((node) => node.key));
+  const rawRelations = Array.isArray(source.relations) ? source.relations : [];
+  const relations = rawRelations.slice(0, 64).flatMap((entry) => {
+    const relation = entry && typeof entry === "object" && !Array.isArray(entry)
+      ? entry as Record<string, unknown>
+      : {};
+    const sourceKey = typeof relation.sourceKey === "string" ? relation.sourceKey.trim() : "";
+    const targetKey = typeof relation.targetKey === "string" ? relation.targetKey.trim() : "";
+    if (!nodeKeys.has(sourceKey) || !nodeKeys.has(targetKey) || sourceKey === targetKey) return [];
+    return [{
+      sourceKey,
+      targetKey,
+      type: relationTypes.includes(relation.type as RelationType) ? relation.type as RelationType : "related_to",
+      reason: normalizedText(relation.reason, "模型未提供关系说明。", 1000),
+      confidence: safeConfidence(relation.confidence),
+      evidenceChunkIds: safeEvidenceIds(relation.evidenceChunkIds, allowedChunkIds),
+    }];
+  });
+  const rawThemes = Array.isArray(source.themes) ? source.themes : [];
+  const themes = rawThemes.slice(0, 12).flatMap((entry, index) => {
+    const theme = entry && typeof entry === "object" && !Array.isArray(entry)
+      ? entry as Record<string, unknown>
+      : {};
+    const memberKeys = Array.isArray(theme.memberKeys)
+      ? [...new Set(theme.memberKeys.filter((key): key is string => typeof key === "string" && nodeKeys.has(key)))]
+      : [];
+    if (memberKeys.length === 0) return [];
+    return [{
+      title: normalizedText(theme.title, `主题 ${index + 1}`, 180),
+      summary: normalizedText(theme.summary, "模型未提供主题摘要。", 2000),
+      memberKeys,
+      evidenceChunkIds: safeEvidenceIds(theme.evidenceChunkIds, allowedChunkIds),
+      aspects: safeAspectArray(theme.aspects, ["other"]),
+    }];
+  });
+  return extractionSchema.parse({ nodes, relations, themes });
+}
+
+function parseExtractionOutput(raw: string, allowedChunks: Chunk[], fallbackNote?: string): ExtractionOutput {
+  return sanitizeExtractionOutput(parseJsonModelObject(raw), allowedChunks, fallbackNote);
+}
+
+function isMappingAuditEnumValidationError(cause: unknown): boolean {
+  return cause instanceof ZodError && cause.issues.some((issue) => issue.code === "invalid_enum_value");
+}
+
 export interface ModelProvider {
   readonly name: string;
   readonly configured: boolean;
@@ -94,6 +289,7 @@ export interface ModelProvider {
   precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput>;
   reconstructMapping(context: MappingAuditContext): Promise<string>;
   auditMapping(reconstruction: string, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<MappingAuditReview>;
+  rebuildGraphFromMappingAudit(audit: MappingAudit, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<ExtractionOutput>;
   answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput>;
   selectPulseNavigation(question: string, step: string, candidates: PulseNavigationCandidate[]): Promise<PulseNavigationDecision>;
   stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }>;
@@ -228,6 +424,7 @@ export class FakeModelProvider implements ModelProvider {
           evidenceChunkIds: firstChunk ? [firstChunk.id] : [],
           nodeIds: [],
           relationIds: [],
+          userComment: "",
         }],
       };
     }
@@ -245,6 +442,7 @@ export class FakeModelProvider implements ModelProvider {
           evidenceChunkIds: firstChunk ? [firstChunk.id] : [],
           nodeIds: [relationWithoutEvidence.sourceNodeId, relationWithoutEvidence.targetNodeId],
           relationIds: [relationWithoutEvidence.id],
+          userComment: "",
         }],
       };
     }
@@ -261,8 +459,45 @@ export class FakeModelProvider implements ModelProvider {
         evidenceChunkIds: firstNode.evidenceChunkIds.length > 0 ? firstNode.evidenceChunkIds : firstChunk ? [firstChunk.id] : [],
         nodeIds: [firstNode.id],
         relationIds: [],
+        userComment: "",
       }],
     };
+  }
+
+  async rebuildGraphFromMappingAudit(audit: MappingAudit, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<ExtractionOutput> {
+    const chunks = originalChunks.length > 0 ? originalChunks : graphContext.chunks.slice(0, 8);
+    const nodes = chunks.map((chunk, index) => {
+      const finding = audit.findings[index % Math.max(1, audit.findings.length)];
+      const opening = chunk.text.trim().split(/\s+/).slice(0, 14).join(" ");
+      const kind = finding?.kind === "unsupported_graph_claim" || finding?.kind === "overgeneralization" ? "claim" : "concept";
+      return {
+        key: `audit-node-${index + 1}`,
+        kind: kind as AbstractNodeKind,
+        title: finding ? `${finding.title}：${opening.slice(0, 30)}` : chunk.headingPath || opening.slice(0, 44),
+        summary: `审计驱动重构：${finding?.description ?? chunk.text.slice(0, 160)}`,
+        evidenceChunkIds: [chunk.id],
+        aspects: demoAspects(`${chunk.text} ${finding?.title ?? ""}`, kind),
+      };
+    });
+    const relations = nodes.slice(1).map((node, index) => ({
+      sourceKey: nodes[index]?.key ?? node.key,
+      targetKey: node.key,
+      type: "related_to" as const,
+      reason: "演示模型基于原文、当前图谱和映射审计报告重新生成的关系建议。",
+      confidence: 0.6,
+      evidenceChunkIds: [
+        ...(nodes[index]?.evidenceChunkIds ?? []),
+        ...node.evidenceChunkIds,
+      ],
+    }));
+    const themes = nodes.length > 1 ? [{
+      title: "审计驱动重构主题",
+      summary: `根据映射审计中 ${audit.findings.length} 个发现，对当前关系图谱进行重新组织后的主题。`,
+      memberKeys: nodes.map((node) => node.key),
+      evidenceChunkIds: nodes.flatMap((node) => node.evidenceChunkIds),
+      aspects: [...new Set(nodes.flatMap((node) => node.aspects))],
+    }] : [];
+    return { nodes, relations, themes };
   }
 
   async answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput> {
@@ -354,7 +589,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
           content:
             "Repair the supplied malformed JSON into valid JSON that matches exactly this shape: " +
             '{"status":"clean|minor_issues|major_issues|failed","summary":"...","findings":[{"kind":"missing_source_meaning|unsupported_graph_claim|wrong_relation|chunk_boundary_loss|overgeneralization|other","severity":"low|medium|high","title":"...","description":"...","suggestion":"...","evidenceChunkIds":["..."],"nodeIds":["..."],"relationIds":["..."]}]}. ' +
-            "Preserve the meaning of any recoverable fields. If a field is missing, choose a conservative valid value. Return JSON only.",
+            "Preserve the meaning of any recoverable fields. If a field is missing, choose a conservative valid value. " +
+            "Keep summary under 1000 characters, each title under 80 characters, each description under 800 characters, each suggestion under 400 characters, and at most 5 findings. " +
+            "All human-readable strings must be Simplified Chinese. Return JSON only.",
         },
         { role: "user", content: JSON.stringify({ parseError: errorMessage, malformedJson: raw.slice(0, 12000) }) },
       ],
@@ -368,7 +605,36 @@ export class OpenAICompatibleProvider implements ModelProvider {
       body,
     );
     const repaired = response.choices[0]?.message.content ?? "{}";
-    return mappingAuditReviewSchema.parse(parseJsonModelObject(repaired));
+    return parseMappingAuditReview(repaired);
+  }
+
+  private async repairExtractionJson(raw: string, parseError: unknown, allowedChunks: Chunk[]): Promise<ExtractionOutput> {
+    const errorMessage = parseError instanceof Error ? parseError.message : "JSON parse failed";
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Repair the supplied malformed knowledge-graph JSON into valid JSON matching exactly this shape: " +
+            '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["system"]}],"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],"themes":[{"title":"...","summary":"...","memberKeys":["n1"],"evidenceChunkIds":["..."],"aspects":["other"]}]}. ' +
+            "Use only the supplied allowedChunkIds in evidenceChunkIds. Use only valid relation types and aspects. " +
+            "If a field is missing, choose a conservative valid value. All human-readable strings must be Simplified Chinese. Return JSON only.",
+        },
+        { role: "user", content: JSON.stringify({ parseError: errorMessage, allowedChunkIds: allowedChunks.map((chunk) => chunk.id), malformedJson: raw.slice(0, 14000) }) },
+      ],
+      max_tokens: 4096,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return parseExtractionOutput(response.choices[0]?.message.content ?? "{}", allowedChunks, "模型修复后仍缺少结构化字段。");
   }
 
   async embed(texts: string[]): Promise<number[][]> {
@@ -424,8 +690,19 @@ export class OpenAICompatibleProvider implements ModelProvider {
       choices: Array<{ message: { content: string } }>;
     }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
     const raw = response.choices[0]?.message.content ?? "{}";
-    const json = JSON.parse(raw.replace(/^```(?:json)?\s*|\s*```$/g, ""));
-    return extractionSchema.parse(json);
+    const allowedChunks = [
+      ...chunks,
+      ...chunks.flatMap((chunk) => relatedChunks.get(chunk.id) ?? []),
+    ];
+    try {
+      return parseExtractionOutput(raw, allowedChunks, "模型抽取结构化输出不可用，系统生成保守导入候选。");
+    } catch (cause) {
+      try {
+        return await this.repairExtractionJson(raw, cause, allowedChunks);
+      } catch {
+        return fallbackExtractionFromChunks(chunks, "模型结构化输出修复失败，系统生成保守导入候选。");
+      }
+    }
   }
 
   async precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput> {
@@ -510,7 +787,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
           content:
             "Reconstruct the semantic outline of the original document section using only the supplied knowledge graph mapping. " +
             "Do not try to reproduce exact wording. Capture what the graph claims the source means, including important qualifiers, causal/argument links, and uncertainty. " +
-            "Return plain text only, not JSON and not Markdown code fences.",
+            "Use Simplified Chinese for the whole answer. Return plain text only, not JSON and not Markdown code fences.",
         },
         { role: "user", content: JSON.stringify({ document: context.documentName, evidence, graph, note: context.note ?? "" }) },
       ],
@@ -566,6 +843,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "You are an auditor for chunking and knowledge-graph mapping quality. Compare the original chunks with the semantic reconstruction and graph mapping. " +
             "Find semantic divergence only: missing important source meaning, unsupported graph claims, wrong relation type or direction, overgeneralization, and meaning lost at chunk boundaries. " +
             "Do not penalize harmless wording changes. Prefer actionable findings with exact chunk, node, and relation ids when relevant. " +
+            "Keep summary under 1000 characters. Return at most 5 findings. For each finding keep title under 80 characters, description under 800 characters, and suggestion under 400 characters; put long explanations into concise issue plus action. " +
+            "All human-readable strings in summary, title, description, and suggestion must be Simplified Chinese. " +
             'Return JSON only: {"status":"clean|minor_issues|major_issues|failed","summary":"...","findings":[{"kind":"missing_source_meaning|unsupported_graph_claim|wrong_relation|chunk_boundary_loss|overgeneralization|other","severity":"low|medium|high","title":"...","description":"...","suggestion":"...","evidenceChunkIds":["..."],"nodeIds":["..."],"relationIds":["..."]}]}.',
         },
         { role: "user", content: JSON.stringify({ original, reconstruction, graph, note: graphContext.note ?? "" }) },
@@ -581,26 +860,105 @@ export class OpenAICompatibleProvider implements ModelProvider {
     );
     const raw = response.choices[0]?.message.content ?? "{}";
     try {
-      return mappingAuditReviewSchema.parse(parseJsonModelObject(raw));
+      return parseMappingAuditReview(raw);
     } catch (cause) {
-      if (!(cause instanceof SyntaxError)) throw cause;
+      if (isMappingAuditEnumValidationError(cause)) throw cause;
       try {
         return await this.repairMappingAuditJson(raw, cause);
-      } catch {
+      } catch (repairCause) {
+        if (isMappingAuditEnumValidationError(repairCause)) throw repairCause;
         return {
           status: "failed",
-          summary: "审计模型返回的结构化 JSON 无法解析；已保留语义重构文本，请重新运行审计。",
+          summary: "审计模型返回的结构化 JSON 无法整理；已保留语义重构文本，请重新运行审计。",
           findings: [{
             kind: "other",
             severity: "medium",
-            title: "审计结构化输出解析失败",
-            description: `模型返回了不完整或未正确转义的 JSON：${cause.message}`,
+            title: "审计结构化输出不可用",
+            description: "模型返回的审计 JSON 不完整、格式异常或字段超出预期，系统未将其作为正式审计结论。",
             suggestion: "点击重新运行；如果反复出现，可缩短输入文档或检查当前模型的 JSON 输出稳定性。",
             evidenceChunkIds: originalChunks.slice(0, 3).map((chunk) => chunk.id),
             nodeIds: graphContext.nodes.slice(0, 3).map((node) => node.id),
             relationIds: graphContext.relations.slice(0, 3).map((relation) => relation.id),
+            userComment: "",
           }],
         };
+      }
+    }
+  }
+
+  async rebuildGraphFromMappingAudit(audit: MappingAudit, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<ExtractionOutput> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const original = originalChunks.map((chunk) => ({
+      id: chunk.id,
+      ordinal: chunk.ordinal,
+      heading: chunk.headingPath,
+      pageNumber: chunk.pageNumber,
+      text: chunk.text.slice(0, 2600),
+    }));
+    const graph = {
+      nodes: graphContext.nodes.map((node) => ({
+        id: node.id,
+        kind: node.kind,
+        level: node.level,
+        title: node.title,
+        summary: node.summary,
+        evidenceChunkIds: node.evidenceChunkIds,
+      })),
+      relations: graphContext.relations.map((relation) => ({
+        id: relation.id,
+        type: relation.type,
+        sourceTitle: relation.sourceTitle,
+        targetTitle: relation.targetTitle,
+        reason: relation.reason,
+        evidenceChunkIds: relation.evidenceChunkIds,
+      })),
+    };
+    const findings = audit.findings.map((finding) => ({
+      kind: finding.kind,
+      severity: finding.severity,
+      title: finding.title,
+      description: finding.description,
+      suggestion: finding.suggestion,
+      evidenceChunkIds: finding.evidenceChunkIds,
+      nodeIds: finding.nodeIds,
+      relationIds: finding.relationIds,
+      userComment: finding.userComment,
+    }));
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是关系图谱重构助手。请把原文 chunk、当前关系图谱、映射审计报告一起作为素材，重新生成一份更准确的候选关系图谱。 " +
+            "必须使用简体中文。审计发现只是线索，不是事实；所有节点、主题和关系都必须由原文 chunk 支撑。 " +
+            "若审计发现包含 userComment，它代表用户对该问题的修正意图，应作为重构时的重要参考，但仍必须受原文证据约束。 " +
+            "优先修复审计报告指出的缺失含义、无证据图谱声明、错误关系方向/类型、过度概括和 chunk 边界造成的语义损失。 " +
+            "不要输出解释文本，只返回 JSON，形状必须是：" +
+            '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["claim"]}],"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],"themes":[{"title":"...","summary":"...","memberKeys":["n1"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
+            "aspects 只能从 person, operation, system, story, claim, conflict, time, other 中选择。所有 evidenceChunkIds 必须来自提供的 original chunk id。节点数量保持紧凑，关系只生成可由原文支撑的候选。",
+        },
+        { role: "user", content: JSON.stringify({ document: graphContext.documentName, auditSummary: audit.summary, findings, original, graph, reconstruction: audit.reconstruction }) },
+      ],
+      max_tokens: 4096,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const raw = response.choices[0]?.message.content ?? "{}";
+    try {
+      return parseExtractionOutput(raw, originalChunks, "模型重构结构化输出不可用，系统生成保守候选。");
+    } catch (cause) {
+      try {
+        return await this.repairExtractionJson(raw, cause, originalChunks);
+      } catch {
+        return fallbackExtractionFromChunks(originalChunks, "模型重构结构化输出修复失败，系统生成保守候选。");
       }
     }
   }

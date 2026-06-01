@@ -59,7 +59,7 @@ describe("DeepSeek model configuration", () => {
     expect(body.response_format).toEqual({ type: "json_object" });
   });
 
-  it("rejects extracted nodes that omit required aspect arrays", async () => {
+  it("sanitizes extracted nodes that omit optional-but-required arrays", async () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       new Response(JSON.stringify({
         choices: [{ message: { content: JSON.stringify({
@@ -84,7 +84,51 @@ describe("DeepSeek model configuration", () => {
       text: "概念证据",
       aspects: [],
     };
-    await expect(provider.extract([chunk], new Map())).rejects.toThrow();
+    const extraction = await provider.extract([chunk], new Map());
+    expect(extraction.nodes[0]?.aspects).toEqual(["other"]);
+    expect(extraction.nodes[0]?.evidenceChunkIds).toEqual(["chunk-1"]);
+  });
+
+  it("repairs malformed extraction JSON and falls back without failing imports", async () => {
+    const responses = [
+      { choices: [{ message: { content: '{"nodes":[{"key":"n1","kind":"concept","title":"Broken"' } }] },
+      { choices: [{ message: { content: JSON.stringify({
+        nodes: [{
+          key: "n1",
+          kind: "concept",
+          title: "修复节点",
+          summary: "修复后的摘要",
+          evidenceChunkIds: ["chunk-1", "unknown"],
+          aspects: ["system", "bad"],
+        }],
+        relations: [],
+        themes: [],
+      }) } }] },
+    ];
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify(responses.shift()), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const chunk: Chunk = {
+      id: "chunk-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      ordinal: 0,
+      headingPath: null,
+      pageNumber: null,
+      startLine: null,
+      endLine: null,
+      blockId: null,
+      startChar: 0,
+      endChar: 4,
+      text: "概念证据",
+      aspects: [],
+    };
+    const extraction = await provider.extract([chunk], new Map());
+    expect(extraction.nodes[0]?.title).toBe("修复节点");
+    expect(extraction.nodes[0]?.evidenceChunkIds).toEqual(["chunk-1"]);
+    expect(extraction.nodes[0]?.aspects).toEqual(["system"]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("forwards streamed DeepSeek content and reasoning deltas", async () => {
@@ -199,6 +243,69 @@ describe("DeepSeek model configuration", () => {
     expect(audit.status).toBe("minor_issues");
     expect(audit.findings[0]?.kind).toBe("overgeneralization");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    const reconstructionBody = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as { messages: Array<{ content: string }> };
+    const auditBody = JSON.parse(fetchMock.mock.calls[1]![1]?.body as string) as { messages: Array<{ content: string }> };
+    expect(reconstructionBody.messages[0]!.content).toContain("Simplified Chinese");
+    expect(auditBody.messages[0]!.content).toContain("Simplified Chinese");
+  });
+
+  it("sanitizes overlong mapping audit text fields before validation", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({
+          status: "minor_issues",
+          summary: "s".repeat(1300),
+          findings: [{
+            kind: "overgeneralization",
+            severity: "low",
+            title: "t".repeat(120),
+            description: "d".repeat(1600),
+            suggestion: "x".repeat(700),
+            evidenceChunkIds: ["chunk-1", 42, ""],
+            nodeIds: ["node-1", null],
+            relationIds: [false, "relation-1"],
+          }],
+        }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const chunk: Chunk = {
+      id: "chunk-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      ordinal: 0,
+      headingPath: "Topic",
+      pageNumber: null,
+      startLine: 1,
+      endLine: 2,
+      blockId: null,
+      startChar: 0,
+      endChar: 8,
+      text: "source text",
+      aspects: [],
+    };
+    const audit = await provider.auditMapping("semantic reconstruction", [chunk], {
+      versionId: "version-1",
+      documentName: "source.md",
+      chunks: [chunk],
+      nodes: [{
+        id: "node-1",
+        kind: "concept" as const,
+        title: "Topic",
+        summary: "summary",
+        level: 1 as const,
+        evidenceChunkIds: ["chunk-1"],
+      }],
+      relations: [],
+    });
+    expect(audit.summary).toHaveLength(1000);
+    expect(audit.findings[0]?.title.length).toBeLessThanOrEqual(80);
+    expect(audit.findings[0]?.description.length).toBeLessThanOrEqual(800);
+    expect(audit.findings[0]?.description).toContain("已截断");
+    expect(audit.findings[0]?.suggestion.length).toBeLessThanOrEqual(400);
+    expect(audit.findings[0]?.evidenceChunkIds).toEqual(["chunk-1"]);
+    expect(audit.findings[0]?.nodeIds).toEqual(["node-1"]);
+    expect(audit.findings[0]?.relationIds).toEqual(["relation-1"]);
   });
 
   it("repairs malformed mapping audit JSON instead of failing the whole audit", async () => {

@@ -211,12 +211,26 @@ function parseMappingAuditFindings(value: Row[string] | undefined): MappingAudit
   try {
     const parsed = JSON.parse(value) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((entry): entry is MappingAuditFinding => (
-      typeof entry === "object" && entry !== null
-      && typeof (entry as MappingAuditFinding).kind === "string"
-      && typeof (entry as MappingAuditFinding).severity === "string"
-      && typeof (entry as MappingAuditFinding).title === "string"
-    ));
+    return parsed.flatMap((entry) => {
+      if (
+        typeof entry !== "object" || entry === null
+        || typeof (entry as MappingAuditFinding).kind !== "string"
+        || typeof (entry as MappingAuditFinding).severity !== "string"
+        || typeof (entry as MappingAuditFinding).title !== "string"
+      ) return [];
+      const finding = entry as Partial<MappingAuditFinding>;
+      return [{
+        kind: String(finding.kind) as MappingAuditFinding["kind"],
+        severity: String(finding.severity) as MappingAuditFinding["severity"],
+        title: String(finding.title),
+        description: typeof finding.description === "string" ? finding.description : "",
+        suggestion: typeof finding.suggestion === "string" ? finding.suggestion : "",
+        evidenceChunkIds: Array.isArray(finding.evidenceChunkIds) ? finding.evidenceChunkIds.filter((id): id is string => typeof id === "string") : [],
+        nodeIds: Array.isArray(finding.nodeIds) ? finding.nodeIds.filter((id): id is string => typeof id === "string") : [],
+        relationIds: Array.isArray(finding.relationIds) ? finding.relationIds.filter((id): id is string => typeof id === "string") : [],
+        userComment: typeof finding.userComment === "string" ? finding.userComment : "",
+      }];
+    });
   } catch {
     return [];
   }
@@ -231,6 +245,8 @@ function mappingAuditFrom(r: Row): MappingAudit {
     summary: String(r.summary),
     reconstruction: String(r.reconstruction),
     findings: parseMappingAuditFindings(r.findings_json),
+    graphRebuildReport: r.graph_rebuild_report === null ? "" : String(r.graph_rebuild_report ?? ""),
+    graphRebuiltAt: r.graph_rebuilt_at === null ? null : String(r.graph_rebuilt_at),
     createdAt: String(r.created_at),
   };
 }
@@ -478,6 +494,8 @@ export class AgentDatabase {
         summary TEXT NOT NULL,
         reconstruction TEXT NOT NULL,
         findings_json TEXT NOT NULL DEFAULT '[]',
+        graph_rebuild_report TEXT NOT NULL DEFAULT '',
+        graph_rebuilt_at TEXT,
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_mapping_audits_library ON mapping_audits(library_id, created_at DESC);
@@ -561,6 +579,8 @@ export class AgentDatabase {
     this.addColumn("pulse_hits", "step_index", "INTEGER");
     this.addColumn("pulse_hits", "observation", "TEXT");
     this.addColumn("pulse_hits", "rationale", "TEXT");
+    this.addColumn("mapping_audits", "graph_rebuild_report", "TEXT NOT NULL DEFAULT ''");
+    this.addColumn("mapping_audits", "graph_rebuilt_at", "TEXT");
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)").run(now());
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (3, ?)").run(now());
@@ -1021,6 +1041,8 @@ export class AgentDatabase {
         summary = excluded.summary,
         reconstruction = excluded.reconstruction,
         findings_json = excluded.findings_json,
+        graph_rebuild_report = '',
+        graph_rebuilt_at = NULL,
         created_at = excluded.created_at
     `).run(
       id,
@@ -1032,6 +1054,33 @@ export class AgentDatabase {
       JSON.stringify(result.findings),
       createdAt,
     );
+    return this.getMappingAudit(versionId) as MappingAudit;
+  }
+
+  saveMappingAuditGraphRebuildReport(versionId: string, report: string): MappingAudit {
+    const rebuiltAt = now();
+    this.sql.prepare(`
+      UPDATE mapping_audits
+      SET graph_rebuild_report = ?, graph_rebuilt_at = ?
+      WHERE version_id = ?
+    `).run(report, rebuiltAt, versionId);
+    return this.getMappingAudit(versionId) as MappingAudit;
+  }
+
+  updateMappingAuditFindingComment(versionId: string, findingIndex: number, userComment: string): MappingAudit {
+    const audit = this.getMappingAudit(versionId);
+    if (!audit) throw new Error("尚未运行映射审计");
+    if (!Number.isInteger(findingIndex) || findingIndex < 0 || findingIndex >= audit.findings.length) {
+      throw new Error("审计发现不存在");
+    }
+    const findings = audit.findings.map((finding, index) => (
+      index === findingIndex ? { ...finding, userComment } : finding
+    ));
+    this.sql.prepare(`
+      UPDATE mapping_audits
+      SET findings_json = ?, graph_rebuild_report = '', graph_rebuilt_at = NULL
+      WHERE version_id = ?
+    `).run(JSON.stringify(findings), versionId);
     return this.getMappingAudit(versionId) as MappingAudit;
   }
 
@@ -1499,7 +1548,12 @@ export class AgentDatabase {
     }));
   }
 
-  saveExtraction(libraryId: string, extraction: ExtractionOutput, analyzedVersionId?: string): void {
+  saveExtraction(
+    libraryId: string,
+    extraction: ExtractionOutput,
+    analyzedVersionId?: string,
+    options: { updateExistingAi?: boolean } = {},
+  ): void {
     const keyToId = new Map<string, string>();
     const findNode = this.sql.prepare(
       "SELECT * FROM abstract_nodes WHERE library_id = ? AND kind = ? AND level = ? AND title = ? COLLATE NOCASE LIMIT 1",
@@ -1510,6 +1564,9 @@ export class AgentDatabase {
     `);
     const updateAiNodeAspects = this.sql.prepare(
       "UPDATE abstract_nodes SET aspects_json = ?, updated_at = ? WHERE id = ?",
+    );
+    const updateAiNodeSummary = this.sql.prepare(
+      "UPDATE abstract_nodes SET summary = ?, updated_at = ? WHERE id = ? AND source = 'ai'",
     );
     const getAiNodeAspects = this.sql.prepare("SELECT aspects_json FROM abstract_nodes WHERE id = ?");
     const saveAiAspects = (nodeId: string, aspects: AspectKind[]) => {
@@ -1542,6 +1599,8 @@ export class AgentDatabase {
           nodeId, libraryId, extracted.kind, extracted.title, extracted.summary, 1,
           JSON.stringify([]), timestamp, timestamp,
         );
+      } else if (options.updateExistingAi) {
+        updateAiNodeSummary.run(extracted.summary, now(), nodeId);
       }
       saveAiAspects(nodeId, extracted.aspects);
       keyToId.set(extracted.key, nodeId);
@@ -1562,6 +1621,10 @@ export class AgentDatabase {
           confidence: extracted.confidence,
           createdBy: "ai",
         }).id;
+      if (existing && options.updateExistingAi) {
+        this.sql.prepare("UPDATE relations SET reason = ?, confidence = ?, updated_at = ? WHERE id = ? AND created_by = 'ai' AND status = 'suggested'")
+          .run(extracted.reason, extracted.confidence, now(), relationId);
+      }
       for (const chunkId of extracted.evidenceChunkIds) insertRelationEvidence.run(relationId, chunkId);
     }
 
@@ -1584,6 +1647,8 @@ export class AgentDatabase {
           themeId, libraryId, "concept", theme.title, theme.summary, 2,
           JSON.stringify([]), timestamp, timestamp,
         );
+      } else if (options.updateExistingAi) {
+        updateAiNodeSummary.run(theme.summary, now(), themeId);
       }
       saveAiAspects(themeId, theme.aspects);
       const themeEvidence = new Set(theme.evidenceChunkIds);
@@ -1614,6 +1679,26 @@ export class AgentDatabase {
       WHERE n.id = ?
     `), id);
     return this.withNodeCitations(nodeFrom(updated as Row));
+  }
+
+  addNodeEvidence(nodeId: string, chunkId: string): AbstractNode {
+    const nodeLibraryId = this.getLibraryIdForNode(nodeId);
+    const chunkLibraryId = this.getLibraryIdForChunk(chunkId);
+    if (!nodeLibraryId) throw new Error("抽象节点不存在");
+    if (!chunkLibraryId) throw new Error("证据 chunk 不存在");
+    if (nodeLibraryId !== chunkLibraryId) throw new Error("证据 chunk 不属于当前知识库");
+    this.sql.prepare("INSERT OR IGNORE INTO abstract_node_evidence (node_id, chunk_id) VALUES (?, ?)")
+      .run(nodeId, chunkId);
+    this.sql.prepare("UPDATE abstract_nodes SET updated_at = ? WHERE id = ?").run(now(), nodeId);
+    return this.getAbstractNode(nodeId) as AbstractNode;
+  }
+
+  removeNodeEvidence(nodeId: string, chunkId: string): AbstractNode {
+    const nodeLibraryId = this.getLibraryIdForNode(nodeId);
+    if (!nodeLibraryId) throw new Error("抽象节点不存在");
+    this.sql.prepare("DELETE FROM abstract_node_evidence WHERE node_id = ? AND chunk_id = ?").run(nodeId, chunkId);
+    this.sql.prepare("UPDATE abstract_nodes SET updated_at = ? WHERE id = ?").run(now(), nodeId);
+    return this.getAbstractNode(nodeId) as AbstractNode;
   }
 
   updateNodeAspects(id: string, aspects: AspectKind[]): AbstractNode {
@@ -1677,16 +1762,58 @@ export class AgentDatabase {
     return result ? this.relationFrom(result) : undefined;
   }
 
-  updateRelationStatus(id: string, status: "accepted" | "rejected"): Relation {
+  updateRelation(
+    id: string,
+    values: { status?: "accepted" | "rejected"; type?: RelationType; reason?: string; confidence?: number | null },
+  ): Relation {
     const previous = this.getRelation(id);
     if (!previous) throw new Error("关系不存在");
-    this.sql.prepare("UPDATE relations SET status = ?, updated_at = ? WHERE id = ?")
-      .run(status, now(), id);
-    if (previous.status !== status) {
-      this.invalidateStatementForRelation(id, status === "rejected" ? "上游关系已被拒绝" : "上游关系已重新接受");
+    const next = {
+      status: values.status ?? previous.status,
+      type: values.type ?? previous.type,
+      reason: values.reason ?? previous.reason,
+      confidence: values.confidence !== undefined ? values.confidence : previous.confidence,
+    };
+    this.sql.prepare("UPDATE relations SET status = ?, type = ?, reason = ?, confidence = ?, updated_at = ? WHERE id = ?")
+      .run(next.status, next.type, next.reason, next.confidence, now(), id);
+    const statusChanged = values.status !== undefined && previous.status !== values.status;
+    const contentChanged =
+      (values.type !== undefined && previous.type !== values.type)
+      || (values.reason !== undefined && previous.reason !== values.reason)
+      || (values.confidence !== undefined && previous.confidence !== values.confidence);
+    if (statusChanged || contentChanged) {
+      this.invalidateStatementForRelation(
+        id,
+        statusChanged && next.status === "rejected" ? "上游关系已被拒绝" : "上游关系已被修改",
+      );
     }
-    const relation = this.getRelation(id);
-    return relation as Relation;
+    return this.getRelation(id) as Relation;
+  }
+
+  updateRelationStatus(id: string, status: "accepted" | "rejected"): Relation {
+    return this.updateRelation(id, { status });
+  }
+
+  addRelationEvidence(relationId: string, chunkId: string): Relation {
+    const relationLibraryId = this.getLibraryIdForRelation(relationId);
+    const chunkLibraryId = this.getLibraryIdForChunk(chunkId);
+    if (!relationLibraryId) throw new Error("关系不存在");
+    if (!chunkLibraryId) throw new Error("证据 chunk 不存在");
+    if (relationLibraryId !== chunkLibraryId) throw new Error("证据 chunk 不属于当前知识库");
+    this.sql.prepare("INSERT OR IGNORE INTO relation_evidence (relation_id, chunk_id) VALUES (?, ?)")
+      .run(relationId, chunkId);
+    this.sql.prepare("UPDATE relations SET updated_at = ? WHERE id = ?").run(now(), relationId);
+    this.invalidateStatementForRelation(relationId, "关系证据已变更");
+    return this.getRelation(relationId) as Relation;
+  }
+
+  removeRelationEvidence(relationId: string, chunkId: string): Relation {
+    const relationLibraryId = this.getLibraryIdForRelation(relationId);
+    if (!relationLibraryId) throw new Error("关系不存在");
+    this.sql.prepare("DELETE FROM relation_evidence WHERE relation_id = ? AND chunk_id = ?").run(relationId, chunkId);
+    this.sql.prepare("UPDATE relations SET updated_at = ? WHERE id = ?").run(now(), relationId);
+    this.invalidateStatementForRelation(relationId, "关系证据已变更");
+    return this.getRelation(relationId) as Relation;
   }
 
   deleteRelation(id: string): boolean {

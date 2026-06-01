@@ -66,6 +66,7 @@ function emptyMappingResult(context: MappingAuditContext): MappingAuditResult {
       evidenceChunkIds: context.chunks.slice(0, 3).map((chunk) => chunk.id),
       nodeIds: [],
       relationIds: [],
+      userComment: "",
     }],
   };
 }
@@ -74,9 +75,11 @@ function combineResults(results: MappingAuditResult[]): MappingAuditResult {
   const findings = results.flatMap((result) => result.findings);
   const status = statusFromFindings(findings, results.map((result) => result.status));
   const issueCount = findings.length;
-  const summary = status === "clean"
-    ? "语义重构审计未发现明显分歧。"
-    : `语义重构审计发现 ${issueCount} 个需要核对的问题。`;
+  const summary = status === "failed"
+    ? "映射审计部分失败；已保留可用的语义重构，请重新运行或缩短输入后再试。"
+    : status === "clean"
+      ? "语义重构审计未发现明显分歧。"
+      : `语义重构审计发现 ${issueCount} 个需要核对的问题。`;
   return {
     status,
     summary,
@@ -85,6 +88,42 @@ function combineResults(results: MappingAuditResult[]): MappingAuditResult {
       .join("\n\n"),
     findings,
   };
+}
+
+function failedReviewResult(reconstruction: string, chunks: Chunk[], context: MappingAuditContext): MappingAuditResult {
+  return {
+    status: "failed",
+    summary: "审计模型返回的结构化 JSON 无法整理；已保留语义重构文本，请重新运行审计。",
+    reconstruction,
+    findings: [{
+      kind: "other",
+      severity: "medium",
+      title: "审计结构化输出不可用",
+      description: "模型返回的审计 JSON 不完整、格式异常或字段超出预期，系统未将其作为正式审计结论。",
+      suggestion: "点击重新运行；如果反复出现，可缩短输入文档或检查当前模型的 JSON 输出稳定性。",
+      evidenceChunkIds: chunks.slice(0, 3).map((chunk) => chunk.id),
+      nodeIds: context.nodes.slice(0, 3).map((node) => node.id),
+      relationIds: context.relations.slice(0, 3).map((relation) => relation.id),
+      userComment: "",
+    }],
+  };
+}
+
+function chunksForAuditFindings(audit: MappingAudit, context: MappingAuditContext): Chunk[] {
+  const referencedIds = new Set(audit.findings.flatMap((finding) => finding.evidenceChunkIds));
+  const referenced = context.chunks.filter((chunk) => referencedIds.has(chunk.id));
+  if (referenced.length > 0) return referenced;
+  return context.chunks.slice(0, 12);
+}
+
+function graphRebuildReport(audit: MappingAudit, nodeCount: number, relationCount: number, themeCount: number): string {
+  const issueCount = audit.findings.length;
+  return [
+    "审计驱动图谱重构已完成。",
+    `输入材料：原文 chunk、当前关系图谱、映射审计报告（${issueCount} 条发现）。`,
+    `生成结果：${nodeCount} 个候选节点、${relationCount} 条候选关系、${themeCount} 个上层主题。`,
+    "这些结果已写入图谱作为 AI 建议；请继续在关系图谱审核中接受、拒绝或手动修正。",
+  ].join("\n");
 }
 
 export class MappingAuditService {
@@ -106,7 +145,13 @@ export class MappingAuditService {
       for (const batch of chunkBatches(context.chunks)) {
         const currentContext = batchContext(context, batch);
         const reconstruction = await this.model.reconstructMapping(currentContext);
-        const review = await this.model.auditMapping(reconstruction, batch, currentContext);
+        let review: Awaited<ReturnType<ModelProvider["auditMapping"]>>;
+        try {
+          review = await this.model.auditMapping(reconstruction, batch, currentContext);
+        } catch {
+          results.push(failedReviewResult(reconstruction, batch, currentContext));
+          continue;
+        }
         results.push({
           status: review.status,
           summary: review.summary,
@@ -125,5 +170,25 @@ export class MappingAuditService {
         findings: [],
       });
     }
+  }
+
+  async rebuildGraph(versionId: string): Promise<MappingAudit> {
+    if (!this.db.getVersionSource(versionId)) throw new Error("导入版本不存在");
+    const context = this.db.getMappingAuditContext(versionId);
+    if (!context) throw new Error("导入版本不存在");
+    const audit = this.db.getMappingAudit(versionId);
+    if (!audit) throw new Error("尚未运行映射审计");
+    const extraction = await this.model.rebuildGraphFromMappingAudit(
+      audit,
+      chunksForAuditFindings(audit, context),
+      context,
+    );
+    const source = this.db.getVersionSource(versionId);
+    if (!source) throw new Error("导入版本不存在");
+    this.db.saveExtraction(source.libraryId, extraction, versionId, { updateExistingAi: true });
+    return this.db.saveMappingAuditGraphRebuildReport(
+      versionId,
+      graphRebuildReport(audit, extraction.nodes.length, extraction.relations.length, extraction.themes?.length ?? 0),
+    );
   }
 }

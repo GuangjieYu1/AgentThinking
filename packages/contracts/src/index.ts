@@ -457,6 +457,7 @@ export interface MappingAuditFinding {
   evidenceChunkIds: string[];
   nodeIds: string[];
   relationIds: string[];
+  userComment: string;
 }
 
 export interface MappingAudit {
@@ -467,6 +468,8 @@ export interface MappingAudit {
   summary: string;
   reconstruction: string;
   findings: MappingAuditFinding[];
+  graphRebuildReport: string;
+  graphRebuiltAt: string | null;
   createdAt: string;
 }
 
@@ -533,7 +536,21 @@ export const createRelationSchema = z.object({
 });
 
 export const updateRelationSchema = z.object({
-  status: z.enum(["accepted", "rejected"]),
+  status: z.enum(["accepted", "rejected"]).optional(),
+  type: z.enum(relationTypes).optional(),
+  reason: z.string().trim().min(1).max(1000).optional(),
+  confidence: z.number().min(0).max(1).nullable().optional(),
+}).refine(
+  (body) => body.status !== undefined || body.type !== undefined || body.reason !== undefined || body.confidence !== undefined,
+  "没有可更新的内容",
+);
+
+export const addGraphEvidenceSchema = z.object({
+  chunkId: z.string().min(1),
+});
+
+export const updateMappingAuditFindingCommentSchema = z.object({
+  userComment: z.string().trim().max(1200),
 });
 
 export const updateAnalysisStatementSchema = z.object({
@@ -568,6 +585,7 @@ export const mappingAuditFindingSchema = z.object({
   evidenceChunkIds: z.array(z.string()).default([]),
   nodeIds: z.array(z.string()).default([]),
   relationIds: z.array(z.string()).default([]),
+  userComment: z.string().trim().max(1200).default(""),
 });
 
 export const mappingAuditResultSchema = z.object({

@@ -123,6 +123,13 @@ export const api = {
     request<MappingAudit>(`/versions/${versionId}/mapping-audit`, { method: "POST" }),
   mappingAudit: (versionId: string) =>
     request<MappingAudit>(`/versions/${versionId}/mapping-audit`),
+  rebuildGraphFromMappingAudit: (versionId: string) =>
+    request<MappingAudit>(`/versions/${versionId}/mapping-audit/rebuild-graph`, { method: "POST" }),
+  updateMappingAuditFindingComment: (versionId: string, findingIndex: number, userComment: string) =>
+    request<MappingAudit>(`/versions/${versionId}/mapping-audit/findings/${findingIndex}/comment`, {
+      method: "PATCH",
+      body: JSON.stringify({ userComment }),
+    }),
   jobs: (id: string) => request<IngestJob[]>(`/libraries/${id}/jobs`),
   retry: (id: string) => request<IngestJob>(`/jobs/${id}/retry`, { method: "POST" }),
   deleteJob: (id: string) => request<void>(`/jobs/${id}`, { method: "DELETE" }),
@@ -216,6 +223,18 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ title, summary }),
     }),
+  updateNodeFields: (nodeId: string, values: { title?: string; summary?: string }) =>
+    request<AbstractNode>(`/nodes/${nodeId}`, {
+      method: "PATCH",
+      body: JSON.stringify(values),
+    }),
+  addNodeEvidence: (nodeId: string, chunkId: string) =>
+    request<AbstractNode>(`/nodes/${nodeId}/evidence`, {
+      method: "POST",
+      body: JSON.stringify({ chunkId }),
+    }),
+  removeNodeEvidence: (nodeId: string, chunkId: string) =>
+    request<AbstractNode>(`/nodes/${nodeId}/evidence/${chunkId}`, { method: "DELETE" }),
   updateNodeAspects: (nodeId: string, aspects: AspectKind[]) =>
     request<AbstractNode>(`/nodes/${nodeId}/aspects`, {
       method: "PATCH",
@@ -238,6 +257,24 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ status }),
     }),
+  relation: (relationId: string) => request<Relation>(`/relations/${relationId}`),
+  updateRelation: (relationId: string, values: {
+    status?: "accepted" | "rejected";
+    type?: RelationType;
+    reason?: string;
+    confidence?: number | null;
+  }) =>
+    request<Relation>(`/relations/${relationId}`, {
+      method: "PATCH",
+      body: JSON.stringify(values),
+    }),
+  addRelationEvidence: (relationId: string, chunkId: string) =>
+    request<Relation>(`/relations/${relationId}/evidence`, {
+      method: "POST",
+      body: JSON.stringify({ chunkId }),
+    }),
+  removeRelationEvidence: (relationId: string, chunkId: string) =>
+    request<Relation>(`/relations/${relationId}/evidence/${chunkId}`, { method: "DELETE" }),
   deleteRelation: (relationId: string) =>
     request<void>(`/relations/${relationId}`, { method: "DELETE" }),
   syncAnalysisDraft: (libraryId: string) =>

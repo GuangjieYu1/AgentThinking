@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import { getConfig } from "../src/config.js";
 import { AgentDatabase } from "../src/db.js";
@@ -93,6 +93,52 @@ describe("HTTP application", () => {
     })).json<Array<{ id: string; name: string }>>();
     expect(remembered.map((library) => library.id)).toEqual([aliceLibrary.id]);
     expect(remembered[0]?.name).toBe("Alice Research");
+
+    await app.close();
+    db.close();
+  });
+
+  it("keeps mapping reconstruction when audit JSON cannot be used", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-audit-fallback-"));
+    dirs.push(dir);
+    const config = getConfig({
+      dataDir: dir,
+      filesDir: join(dir, "files"),
+      ocrCacheDir: join(dir, "ocr"),
+      provider: "fake",
+    });
+    const db = new AgentDatabase(dir);
+    const vectors = new VectorStore(db);
+    const model = new FakeModelProvider();
+    vi.spyOn(model, "reconstructMapping").mockResolvedValue("kept semantic reconstruction");
+    vi.spyOn(model, "auditMapping").mockRejectedValue(new Error("invalid enum"));
+    const queue = new IngestionQueue(db, vectors, model, config);
+    const app = await createApp({ config, db, vectors, model, queue });
+    const library = db.createLibrary("Audit Fallback");
+    const version = db.createDocumentVersion(library.id, "audit.txt", "text/plain", "hash", join(dir, "audit.txt")).version;
+    db.updateVersionStatus(version.id, "completed");
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: null, pageNumber: null, startChar: 0, endChar: 12, text: "source claim" },
+    ]);
+    db.saveExtraction(library.id, {
+      nodes: [{
+        key: "claim",
+        kind: "claim",
+        title: "Source claim",
+        summary: "A claim from source.",
+        evidenceChunkIds: [chunks[0]!.id],
+        aspects: ["claim"],
+      }],
+      relations: [],
+    }, version.id);
+
+    const response = await app.inject({ method: "POST", url: `/api/versions/${version.id}/mapping-audit` });
+    expect(response.statusCode).toBe(200);
+    const audit = response.json<{ status: string; summary: string; reconstruction: string; findings: Array<{ description: string }> }>();
+    expect(audit.status).toBe("failed");
+    expect(audit.summary).toContain("已保留");
+    expect(audit.reconstruction).toBe("## 批次 1\nkept semantic reconstruction");
+    expect(audit.findings[0]?.description).toContain("审计 JSON");
 
     await app.close();
     db.close();
@@ -207,8 +253,17 @@ describe("HTTP application", () => {
     const mappingAuditRead = (await app.inject({
       method: "GET",
       url: `/api/versions/${versionId}/mapping-audit`,
-    })).json<{ id: string }>();
+    })).json<{ id: string; graphRebuildReport: string }>();
     expect(mappingAuditRead.id).toBe(audit.id);
+    expect(mappingAuditRead.graphRebuildReport).toBe("");
+    const graphRebuild = await app.inject({
+      method: "POST",
+      url: `/api/versions/${versionId}/mapping-audit/rebuild-graph`,
+    });
+    expect(graphRebuild.statusCode).toBe(200);
+    const rebuiltAudit = graphRebuild.json<{ graphRebuildReport: string; graphRebuiltAt: string | null }>();
+    expect(rebuiltAudit.graphRebuildReport).toContain("审计驱动图谱重构已完成");
+    expect(rebuiltAudit.graphRebuiltAt).toBeTruthy();
     const pendingVersion = db.createDocumentVersion(library.id, "pending.txt", "text/plain", "pending-hash", "pending").version;
     const blockedAudit = await app.inject({
       method: "POST",

@@ -4,11 +4,12 @@ import { dirname, join, resolve } from "node:path";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import {
   createLibrarySchema,
   createPulseSchema,
   createRelationSchema,
+  addGraphEvidenceSchema,
   addStatementEvidenceSchema,
   aspectKinds,
   evidenceQuerySchema,
@@ -20,6 +21,7 @@ import {
   reviewPulseSchema,
   searchSchema,
   updateAbstractNodeSchema,
+  updateMappingAuditFindingCommentSchema,
   updateNodeAspectsSchema,
   updateLibrarySettingsSchema,
   updateAnalysisStatementSchema,
@@ -317,6 +319,30 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     if (!model.configured) return reply.status(400).send({ error: "映射审计需要配置模型服务" });
     return mappingAudit.run(request.params.versionId);
   });
+  app.patch<{ Params: { versionId: string; findingIndex: string } }>(
+    "/api/versions/:versionId/mapping-audit/findings/:findingIndex/comment",
+    async (request, reply) => {
+      const source = db.getVersionSource(request.params.versionId);
+      if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+      requireLibrary(db, source.libraryId, request.user);
+      const body = updateMappingAuditFindingCommentSchema.parse(request.body);
+      return db.updateMappingAuditFindingComment(request.params.versionId, Number(request.params.findingIndex), body.userComment);
+    },
+  );
+  const rebuildGraphFromAudit = async (
+    request: FastifyRequest<{ Params: { versionId: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+    requireLibrary(db, source.libraryId, request.user);
+    if (source.version.status !== "completed") return reply.status(409).send({ error: "文档尚未完成分析，无法重构关系图谱" });
+    if (!db.getMappingAudit(request.params.versionId)) return reply.status(404).send({ error: "尚未运行映射审计" });
+    if (!model.configured) return reply.status(400).send({ error: "审计驱动图谱重构需要配置模型服务" });
+    return mappingAudit.rebuildGraph(request.params.versionId);
+  };
+  app.post<{ Params: { versionId: string } }>("/api/versions/:versionId/mapping-audit/rebuild-graph", rebuildGraphFromAudit);
+  app.post<{ Params: { versionId: string } }>("/api/versions/:versionId/mapping-audit/reanalysis", rebuildGraphFromAudit);
   app.post<{ Params: { versionId: string } }>("/api/versions/:versionId/reanalyze", async (request, reply) => {
     const source = db.getVersionSource(request.params.versionId);
     if (!source) return reply.status(404).send({ error: "导入版本不存在" });
@@ -478,6 +504,16 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       ...(body.summary !== undefined ? { summary: body.summary } : {}),
     });
   });
+  app.post<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/evidence", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
+    const body = addGraphEvidenceSchema.parse(request.body);
+    requireLibraryAccess(db, db.getLibraryIdForChunk(body.chunkId), request.user);
+    return db.addNodeEvidence(request.params.nodeId, body.chunkId);
+  });
+  app.delete<{ Params: { nodeId: string; chunkId: string } }>("/api/nodes/:nodeId/evidence/:chunkId", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
+    return db.removeNodeEvidence(request.params.nodeId, request.params.chunkId);
+  });
   app.patch<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/aspects", async (request) => {
     requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
     const body = updateNodeAspectsSchema.parse(request.body);
@@ -499,8 +535,32 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   });
   app.patch<{ Params: { relationId: string } }>("/api/relations/:relationId", async (request) => {
     requireLibraryAccess(db, db.getLibraryIdForRelation(request.params.relationId), request.user);
-    const { status } = updateRelationSchema.parse(request.body);
-    return db.updateRelationStatus(request.params.relationId, status);
+    const body = updateRelationSchema.parse(request.body);
+    return db.updateRelation(request.params.relationId, {
+      ...(body.status !== undefined ? { status: body.status } : {}),
+      ...(body.type !== undefined ? { type: body.type } : {}),
+      ...(body.reason !== undefined ? { reason: body.reason } : {}),
+      ...(body.confidence !== undefined ? { confidence: body.confidence } : {}),
+    });
+  });
+  app.post<{ Params: { relationId: string } }>("/api/relations/:relationId/evidence", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForRelation(request.params.relationId), request.user);
+    const body = addGraphEvidenceSchema.parse(request.body);
+    requireLibraryAccess(db, db.getLibraryIdForChunk(body.chunkId), request.user);
+    return db.addRelationEvidence(request.params.relationId, body.chunkId);
+  });
+  app.delete<{ Params: { relationId: string; chunkId: string } }>(
+    "/api/relations/:relationId/evidence/:chunkId",
+    async (request) => {
+      requireLibraryAccess(db, db.getLibraryIdForRelation(request.params.relationId), request.user);
+      return db.removeRelationEvidence(request.params.relationId, request.params.chunkId);
+    },
+  );
+  app.get<{ Params: { relationId: string } }>("/api/relations/:relationId", async (request, reply) => {
+    requireLibraryAccess(db, db.getLibraryIdForRelation(request.params.relationId), request.user);
+    const relation = db.getRelation(request.params.relationId);
+    if (!relation) return reply.status(404).send({ error: "关系不存在" });
+    return relation;
   });
   app.delete<{ Params: { relationId: string } }>("/api/relations/:relationId", async (request, reply) => {
     requireLibraryAccess(db, db.getLibraryIdForRelation(request.params.relationId), request.user);

@@ -27,6 +27,8 @@ import {
   type AbstractNode,
   type AspectKind,
   type Citation,
+  type DocumentTreeNode,
+  type EvidencePack,
   type GraphEdge,
   type GraphNode,
   type GraphRuleStage,
@@ -50,6 +52,7 @@ type VisualNode = Node<{ label: ReactNode; entity: GraphNode }>;
 type VisualEdge = Edge<{ entity: GraphEdge }>;
 type LayoutMode = "layered" | "network" | "tree";
 type PulseLayerMode = "normal" | "current" | "stats" | "wrong" | "correct";
+type WorkspaceViewMode = "graph" | "evidence" | "document" | "retrieval" | "governance";
 interface RuleGovernanceFeed {
   stage?: GraphRuleStage;
   summary?: GraphRulesSummary;
@@ -167,6 +170,14 @@ const graphRuleDecisionLabels = {
   excluded_from_graph: "排除",
   needs_review: "待复核",
 } satisfies Record<GraphRuleTrace["decision"], string>;
+
+const workspaceViewLabels: Record<WorkspaceViewMode, string> = {
+  graph: "图谱",
+  evidence: "证据",
+  document: "文档",
+  retrieval: "检索",
+  governance: "治理",
+};
 
 const pulseInitialRevealDelayMs = 455;
 const pulseRevealDelayMs = 1050;
@@ -863,6 +874,7 @@ export function GraphWorkspace({
   const [selectedRelation, setSelectedRelation] = useState<Relation>();
   const [selectedAggregate, setSelectedAggregate] = useState<GraphEdge["aggregate"]>();
   const [view, setView] = useState<GraphView>("detail");
+  const [viewMode, setViewMode] = useState<WorkspaceViewMode>("graph");
   const [layout, setLayout] = useState<LayoutMode>("layered");
   const [focusedNodeId, setFocusedNodeId] = useState<string>();
   const [status, setStatus] = useState<RelationStatus | "">("");
@@ -885,6 +897,10 @@ export function GraphWorkspace({
   const [pulseStreamHits, setPulseStreamHits] = useState<PulseStreamHitRecord[]>([]);
   const [pulseNavigationEvents, setPulseNavigationEvents] = useState<PulseNavigationEvent[]>([]);
   const [pulseDraftAnswer, setPulseDraftAnswer] = useState("");
+  const [documentTree, setDocumentTree] = useState<DocumentTreeNode[]>([]);
+  const [documentTreeLoading, setDocumentTreeLoading] = useState(false);
+  const [activeTreeNodeId, setActiveTreeNodeId] = useState<string>();
+  const [nodeEvidenceDetail, setNodeEvidenceDetail] = useState<Awaited<ReturnType<typeof api.nodeEvidenceDetail>>>();
   const activeLibraryIdRef = useRef(libraryId);
   const graphRequestSeqRef = useRef(0);
   const pendingFocusNodeIdRef = useRef<string | undefined>(undefined);
@@ -1004,6 +1020,24 @@ export function GraphWorkspace({
   }, [pulsing, visibleCurrentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect, searchFocus]);
 
   useEffect(() => {
+    if (viewMode !== "document" || documentTree.length > 0 || documentTreeLoading) return;
+    const requestLibraryId = libraryId;
+    setDocumentTreeLoading(true);
+    void api.documentTree(requestLibraryId)
+      .then((tree) => {
+        if (activeLibraryIdRef.current !== requestLibraryId) return;
+        setDocumentTree(tree);
+      })
+      .catch((cause: Error) => {
+        if (activeLibraryIdRef.current !== requestLibraryId) return;
+        onError(cause.message);
+      })
+      .finally(() => {
+        if (activeLibraryIdRef.current === requestLibraryId) setDocumentTreeLoading(false);
+      });
+  }, [viewMode, documentTree.length, documentTreeLoading, libraryId, onError]);
+
+  useEffect(() => {
     const requestLibraryId = libraryId;
     let cancelled = false;
     setCurrentPulse(undefined);
@@ -1017,6 +1051,10 @@ export function GraphWorkspace({
     setPulseStreamHits([]);
     setPulseNavigationEvents([]);
     setPulseDraftAnswer("");
+    setViewMode("graph");
+    setDocumentTree([]);
+    setActiveTreeNodeId(undefined);
+    setNodeEvidenceDetail(undefined);
     setFocusedNodeId(undefined);
     setSelected(undefined);
     setSelectedRelation(undefined);
@@ -1050,6 +1088,19 @@ export function GraphWorkspace({
     setActiveSearchChunkId(undefined);
     void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view, [], undefined);
   }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, visibleCurrentPulse?.pulse.id]);
+
+  useEffect(() => {
+    if (selected?.nodeType !== "abstract") {
+      setNodeEvidenceDetail(undefined);
+      return;
+    }
+    const nodeId = selected.id;
+    void api.nodeEvidenceDetail(nodeId)
+      .then((detail) => {
+        if (selected?.id === nodeId) setNodeEvidenceDetail(detail);
+      })
+      .catch(() => undefined);
+  }, [selected?.id, selected?.nodeType]);
 
   const suggested = useMemo(
     () => edges.flatMap((edge) => edge.data?.entity.relation?.status === "suggested" ? [edge.data.entity.relation] : []),
@@ -1335,6 +1386,13 @@ export function GraphWorkspace({
         </div>
         <div className="toolbar-group toolbar-right">
           <span className="toolbar-label">视图</span>
+          <div className="graph-depth" aria-label="工作区视图">
+            {(["graph", "evidence", "document", "retrieval", "governance"] as WorkspaceViewMode[]).map((mode) => (
+              <button key={mode} className={viewMode === mode ? "selected" : ""} onClick={() => setViewMode(mode)}>
+                {workspaceViewLabels[mode]}
+              </button>
+            ))}
+          </div>
           <div className="graph-depth" aria-label="图谱层级">
             <button className={view === "overview" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("overview"); }}>概览</button>
             <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
@@ -1430,7 +1488,45 @@ export function GraphWorkspace({
           )}
         </div>
         <aside className="inspector">
-          <RuleGovernanceCard feed={ruleGovernanceFeed} />
+          {viewMode === "governance" ? (
+            <GovernanceTracePanel feed={ruleGovernanceFeed} />
+          ) : (
+            <RuleGovernanceCard feed={ruleGovernanceFeed} />
+          )}
+          {viewMode === "document" && (
+            <DocumentTreePanel
+              nodes={documentTree}
+              loading={documentTreeLoading}
+              activeNodeId={activeTreeNodeId}
+              evidencePack={visibleCurrentPulse?.evidencePack}
+              onSelect={(node) => {
+                setActiveTreeNodeId(node.id);
+                const chunkId = node.sourceChunkIds[0];
+                const graphNode = chunkId ? records.find((record) => record.id === chunkId) : undefined;
+                if (graphNode) setSelected(graphNode);
+              }}
+            />
+          )}
+          {viewMode === "evidence" && (
+            <EvidencePackPanel evidencePack={visibleCurrentPulse?.evidencePack} onOpenChunk={(chunkId) => openPulseHit({
+              id: chunkId,
+              pulseId: visibleCurrentPulse?.pulse.id ?? "",
+              libraryId,
+              targetType: "chunk",
+              targetId: chunkId,
+              score: 1,
+              reason: "EvidencePack",
+              pathRole: "direct",
+              stepIndex: null,
+              observation: null,
+              rationale: null,
+              label: chunkId,
+              excerpt: null,
+            })} />
+          )}
+          {viewMode === "retrieval" && (
+            <RetrievalTracePanel evidencePack={visibleCurrentPulse?.evidencePack} />
+          )}
           {!visibleCurrentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
             <div className="pulse-panel pulse-stream-panel">
               <div className="pulse-panel-heading">
@@ -1609,16 +1705,21 @@ export function GraphWorkspace({
             </div>
           )}
           {selected && (
-            <SelectedNode
-              node={selected}
-              onOpenCitation={onOpenCitation}
-              onSaved={() => void loadGraph(selected.id, true)}
-              onDeleted={() => {
-                setSelected(undefined);
-                void loadGraph();
-              }}
-              onError={onError}
-            />
+            <>
+              <SelectedNode
+                node={selected}
+                onOpenCitation={onOpenCitation}
+                onSaved={() => void loadGraph(selected.id, true)}
+                onDeleted={() => {
+                  setSelected(undefined);
+                  void loadGraph();
+                }}
+                onError={onError}
+              />
+              {selected.nodeType === "abstract" && (
+                <NodeEvidenceDetail detail={nodeEvidenceDetail} onOpenCitation={onOpenCitation} />
+              )}
+            </>
           )}
           {selectedRelation && (
             <div className="relation-detail">
@@ -1666,6 +1767,159 @@ export function GraphWorkspace({
         </aside>
       </div>
     </section>
+  );
+}
+
+function DocumentTreePanel({
+  nodes,
+  loading,
+  activeNodeId,
+  evidencePack,
+  onSelect,
+}: {
+  nodes: DocumentTreeNode[];
+  loading: boolean;
+  activeNodeId?: string | undefined;
+  evidencePack?: EvidencePack | undefined;
+  onSelect: (node: DocumentTreeNode) => void;
+}) {
+  const evidenceNodeIds = new Set(evidencePack?.treeNodes.map((node) => node.id) ?? []);
+  const visible = nodes.slice(0, 240);
+  return (
+    <div className="workspace-panel document-tree-panel">
+      <div className="pulse-panel-heading">
+        <h3>文档结构树</h3>
+        <small>{loading ? "加载中" : `${nodes.length} 个节点`}</small>
+      </div>
+      {visible.length === 0 && <p className="muted">{loading ? "正在读取文档结构..." : "暂无 DocumentTreeNode，请重新导入或分析文档。"}</p>}
+      <div className="document-tree-list">
+        {visible.map((node) => (
+          <button
+            type="button"
+            key={node.id}
+            className={`${activeNodeId === node.id ? "selected" : ""} ${evidenceNodeIds.has(node.id) ? "has-evidence" : ""}`}
+            style={{ paddingLeft: `${Math.min(node.level, 5) * 12 + 10}px` }}
+            onClick={() => onSelect(node)}
+          >
+            <span>{node.nodeType}</span>
+            <strong>{(node.headingPath.at(-1) ?? node.summary.slice(0, 48)) || "未命名节点"}</strong>
+            <small>{node.summary || node.text.slice(0, 80)}</small>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EvidencePackPanel({ evidencePack, onOpenChunk }: { evidencePack?: EvidencePack | undefined; onOpenChunk: (chunkId: string) => void }) {
+  if (!evidencePack) {
+    return (
+      <div className="workspace-panel">
+        <h3>证据包</h3>
+        <p className="muted">运行或打开一个新版脉冲后可查看 EvidencePack。</p>
+      </div>
+    );
+  }
+  return (
+    <div className="workspace-panel evidence-pack-panel">
+      <div className="pulse-panel-heading">
+        <h3>证据包</h3>
+        <small>{evidencePack.evidenceRows.length} rows · {evidencePack.citations.length} citations</small>
+      </div>
+      {evidencePack.reconciliation && (
+        <div className="reconciliation-strip">
+          <span>declared {evidencePack.reconciliation.declaredTotal ?? "-"}</span>
+          <span>sum {evidencePack.reconciliation.itemizedSum ?? "-"}</span>
+          <span>diff {evidencePack.reconciliation.difference ?? "-"}</span>
+          <strong>{evidencePack.reconciliation.closed ? "closed" : "open"}</strong>
+        </div>
+      )}
+      <div className="evidence-table">
+        {evidencePack.evidenceRows.slice(0, 80).map((row) => (
+          <button type="button" key={row.rowId} onClick={() => onOpenChunk(row.evidenceChunkId)}>
+            <span>{row.evidenceType}</span>
+            <strong>{row.claimText}</strong>
+            <small>{row.evidenceQuote}</small>
+          </button>
+        ))}
+      </div>
+      {evidencePack.gaps.length > 0 && (
+        <div className="evidence-gaps">
+          <strong>Gaps</strong>
+          {evidencePack.gaps.map((gap, index) => (
+            <small key={`${gap.type}-${index}`}>{gap.severity} · {gap.description}</small>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RetrievalTracePanel({ evidencePack }: { evidencePack?: EvidencePack | undefined }) {
+  return (
+    <div className="workspace-panel retrieval-trace-panel">
+      <div className="pulse-panel-heading">
+        <h3>检索路径</h3>
+        <small>{evidencePack ? `${evidencePack.retrievalTrace.length} steps` : "等待脉冲"}</small>
+      </div>
+      {!evidencePack && <p className="muted">运行或打开一个新版脉冲后可查看 RetrievalTrace。</p>}
+      {evidencePack?.retrievalTrace.map((trace, index) => (
+        <div className={`retrieval-step retrieval-${trace.status}`} key={`${trace.stepIndex}-${trace.tool}-${index}`}>
+          <span>{trace.stepIndex} · {trace.tool}</span>
+          <strong>{trace.purpose}</strong>
+          <small>{trace.query ? `query: ${trace.query}` : "no query"} · new rows {trace.newEvidenceRowCount} · outputs {trace.outputIds.length}</small>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function GovernanceTracePanel({ feed }: { feed: RuleGovernanceFeed }) {
+  return (
+    <div className="workspace-panel">
+      <RuleGovernanceCard feed={feed} />
+    </div>
+  );
+}
+
+function NodeEvidenceDetail({
+  detail,
+  onOpenCitation,
+}: {
+  detail?: Awaited<ReturnType<typeof api.nodeEvidenceDetail>> | undefined;
+  onOpenCitation: (citation: Citation) => void;
+}) {
+  if (!detail) return <div className="node-evidence-detail"><p className="muted">正在读取节点证据...</p></div>;
+  return (
+    <div className="node-evidence-detail">
+      <h3>节点证据详情</h3>
+      <p>{detail.node.summary}</p>
+      <CitationList citations={detail.node.citations} onOpenCitation={onOpenCitation} />
+      {detail.treeNodes.length > 0 && (
+        <div className="evidence-gaps">
+          <strong>来源结构</strong>
+          {detail.treeNodes.slice(0, 8).map((node) => (
+            <small key={node.id}>{node.headingPath.join(" / ") || node.nodeType} · {node.summary}</small>
+          ))}
+        </div>
+      )}
+      {detail.parentChunks.length > 0 && (
+        <div className="evidence-gaps">
+          <strong>Parent context</strong>
+          {detail.parentChunks.slice(0, 4).map((link) => (
+            <small key={link.childChunkId}>{link.parentText.slice(0, 180)}</small>
+          ))}
+        </div>
+      )}
+      {detail.relations.length > 0 && (
+        <div className="evidence-gaps">
+          <strong>Relations</strong>
+          {detail.relations.slice(0, 8).map((relation) => (
+            <small key={relation.id}>{relation.type} · {relation.reason}</small>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 

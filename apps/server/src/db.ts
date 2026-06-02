@@ -13,7 +13,10 @@ import type {
   Citation,
   Chunk,
   Document,
+  DocumentTreeNode,
+  DocumentTreeNodeType,
   DocumentVersion,
+  EvidencePack,
   ExtractionOutput,
   GraphEdge,
   GraphNode,
@@ -36,10 +39,13 @@ import type {
   PulseResponse,
   PulseStats,
   PulseStatus,
+  ParentChildChunk,
   Relation,
   RelationStatus,
   RelationType,
   SearchResult,
+  SummaryTreeLevel,
+  SummaryTreeNode,
   StatementStatus,
   StatementPrecheckOutput,
   SourceLink,
@@ -48,6 +54,7 @@ import type {
   PublishedAnalysis,
 } from "@agent-thinking/contracts";
 import type { PendingChunk } from "./domain/chunker.js";
+import type { PendingDocumentIndex } from "./domain/document-tree.js";
 import type { MappingAuditContext, MappingAuditNodeContext, MappingAuditRelationContext } from "./services/models.js";
 
 type Row = Record<string, string | number | null | Uint8Array>;
@@ -111,6 +118,11 @@ function chunkFrom(r: Row): Chunk {
     id: String(r.id),
     libraryId: String(r.library_id),
     versionId: String(r.version_id),
+    parentChunkId: r.parent_chunk_id === null || r.parent_chunk_id === undefined ? null : String(r.parent_chunk_id),
+    documentTreeNodeId: r.document_tree_node_id === null || r.document_tree_node_id === undefined ? null : String(r.document_tree_node_id),
+    childOrdinal: r.child_ordinal === null || r.child_ordinal === undefined ? null : Number(r.child_ordinal),
+    parentOrdinal: r.parent_ordinal === null || r.parent_ordinal === undefined ? null : Number(r.parent_ordinal),
+    nodeType: r.node_type === null || r.node_type === undefined ? null : String(r.node_type) as DocumentTreeNodeType,
     ordinal: Number(r.ordinal),
     headingPath: r.heading_path === null ? null : String(r.heading_path),
     pageNumber: r.page_number === null ? null : Number(r.page_number),
@@ -121,6 +133,39 @@ function chunkFrom(r: Row): Chunk {
     endChar: Number(r.end_char),
     text: String(r.text),
     aspects: parseAspects(r.aspects_json),
+  };
+}
+
+function documentTreeNodeFrom(r: Row): DocumentTreeNode {
+  return {
+    id: String(r.id),
+    libraryId: String(r.library_id),
+    documentId: String(r.document_id),
+    versionId: String(r.version_id),
+    nodeType: String(r.node_type) as DocumentTreeNode["nodeType"],
+    parentId: r.parent_id === null ? null : String(r.parent_id),
+    childrenIds: parseTextList(r.children_ids_json),
+    ordinal: Number(r.ordinal),
+    level: Number(r.level),
+    headingPath: parseTextList(r.heading_path_json),
+    text: String(r.text),
+    summary: String(r.summary),
+    prevId: r.prev_id === null ? null : String(r.prev_id),
+    nextId: r.next_id === null ? null : String(r.next_id),
+    sourceChunkIds: parseTextList(r.source_chunk_ids_json),
+  };
+}
+
+function summaryTreeNodeFrom(r: Row): SummaryTreeNode {
+  return {
+    id: String(r.id),
+    versionId: String(r.version_id),
+    level: String(r.level) as SummaryTreeLevel,
+    sourceNodeIds: parseTextList(r.source_node_ids_json),
+    summary: String(r.summary),
+    embeddingId: r.embedding_id === null ? null : String(r.embedding_id),
+    parentSummaryId: r.parent_summary_id === null ? null : String(r.parent_summary_id),
+    childSummaryIds: parseTextList(r.child_summary_ids_json),
   };
 }
 
@@ -410,6 +455,48 @@ export class AgentDatabase {
         dimensions INTEGER NOT NULL,
         embedding BLOB NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS document_tree_nodes (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        node_type TEXT NOT NULL,
+        parent_id TEXT,
+        children_ids_json TEXT NOT NULL DEFAULT '[]',
+        ordinal INTEGER NOT NULL,
+        level INTEGER NOT NULL,
+        heading_path_json TEXT NOT NULL DEFAULT '[]',
+        text TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        prev_id TEXT,
+        next_id TEXT,
+        source_chunk_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS parent_child_chunks (
+        child_chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+        parent_chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+        document_tree_node_id TEXT NOT NULL REFERENCES document_tree_nodes(id) ON DELETE CASCADE,
+        child_text TEXT NOT NULL,
+        parent_text TEXT NOT NULL,
+        child_ordinal INTEGER NOT NULL,
+        parent_ordinal INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS summary_tree_nodes (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        level TEXT NOT NULL,
+        source_node_ids_json TEXT NOT NULL DEFAULT '[]',
+        summary TEXT NOT NULL,
+        embedding_id TEXT,
+        parent_summary_id TEXT,
+        child_summary_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS summary_embeddings (
+        summary_id TEXT PRIMARY KEY REFERENCES summary_tree_nodes(id) ON DELETE CASCADE,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        dimensions INTEGER NOT NULL,
+        embedding BLOB NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS abstract_nodes (
         id TEXT PRIMARY KEY,
         library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
@@ -540,6 +627,7 @@ export class AgentDatabase {
         question TEXT NOT NULL,
         answer TEXT NOT NULL,
         summary TEXT NOT NULL,
+        evidence_pack_json TEXT,
         input_mode TEXT NOT NULL DEFAULT 'full' CHECK (input_mode IN ('full','progressive')),
         status TEXT NOT NULL CHECK (status IN ('unreviewed','correct','wrong')),
         reviewed_at TEXT,
@@ -578,12 +666,22 @@ export class AgentDatabase {
       CREATE INDEX IF NOT EXISTS idx_pulse_hits_pulse ON pulse_hits(pulse_id);
       CREATE INDEX IF NOT EXISTS idx_pulse_traces_library ON pulse_traces(library_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_user ON auth_sessions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_document_tree_library ON document_tree_nodes(library_id, version_id, ordinal);
+      CREATE INDEX IF NOT EXISTS idx_document_tree_parent ON document_tree_nodes(parent_id);
+      CREATE INDEX IF NOT EXISTS idx_summary_tree_version ON summary_tree_nodes(version_id);
+      CREATE INDEX IF NOT EXISTS idx_summary_embeddings_library ON summary_embeddings(library_id);
     `);
     this.addColumn("libraries", "owner_user_id", "TEXT REFERENCES users(id) ON DELETE CASCADE");
     this.addColumn("chunks", "start_line", "INTEGER");
     this.addColumn("chunks", "end_line", "INTEGER");
     this.addColumn("chunks", "block_id", "TEXT");
     this.addColumn("chunks", "aspects_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumn("chunks", "parent_chunk_id", "TEXT REFERENCES chunks(id) ON DELETE SET NULL");
+    this.addColumn("chunks", "document_tree_node_id", "TEXT");
+    this.addColumn("chunks", "child_ordinal", "INTEGER");
+    this.addColumn("chunks", "parent_ordinal", "INTEGER");
+    this.addColumn("chunks", "node_type", "TEXT");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS idx_chunks_tree_node ON chunks(document_tree_node_id)");
     this.addColumn("abstract_nodes", "level", "INTEGER NOT NULL DEFAULT 1");
     this.addColumn("abstract_nodes", "aspects_json", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("abstract_nodes", "manual_aspects_json", "TEXT");
@@ -595,6 +693,7 @@ export class AgentDatabase {
     this.addColumn("analysis_statements", "precheck_checked_at", "TEXT");
     this.addColumn("analysis_statements", "precheck_content_updated_at", "TEXT");
     this.addColumn("pulses", "input_mode", "TEXT NOT NULL DEFAULT 'full'");
+    this.addColumn("pulses", "evidence_pack_json", "TEXT");
     this.addColumn("pulse_hits", "step_index", "INTEGER");
     this.addColumn("pulse_hits", "observation", "TEXT");
     this.addColumn("pulse_hits", "rationale", "TEXT");
@@ -1217,13 +1316,16 @@ export class AgentDatabase {
     this.sql.prepare("DELETE FROM chunks WHERE version_id = ?").run(versionId);
     const insert = this.sql.prepare(`
       INSERT INTO chunks
-        (id, library_id, version_id, ordinal, heading_path, page_number, start_line, end_line, block_id, start_char, end_char, text, aspects_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, library_id, version_id, parent_chunk_id, document_tree_node_id, child_ordinal, parent_ordinal, node_type,
+          ordinal, heading_path, page_number, start_line, end_line, block_id, start_char, end_char, text, aspects_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertFts = this.sql.prepare(
       "INSERT INTO chunks_fts (chunk_id, text, heading_path) VALUES (?, ?, ?)",
     );
     const result: Chunk[] = [];
+    const localToChunk = new Map<string, Chunk>();
+    const pendingByChunkId = new Map<string, PendingChunk & { localKey?: string; parentLocalKey?: string }>();
     for (const item of pending) {
       const chunk: Chunk = {
         id: randomUUID(),
@@ -1233,20 +1335,229 @@ export class AgentDatabase {
         startLine: item.startLine ?? null,
         endLine: item.endLine ?? null,
         blockId: item.blockId ?? null,
+        parentChunkId: item.parentChunkId ?? null,
+        documentTreeNodeId: item.documentTreeNodeId ?? null,
+        childOrdinal: item.childOrdinal ?? null,
+        parentOrdinal: item.parentOrdinal ?? null,
+        nodeType: item.nodeType ?? null,
         aspects: [],
       };
       insert.run(
-        chunk.id, libraryId, versionId, chunk.ordinal, chunk.headingPath, chunk.pageNumber,
+        chunk.id, libraryId, versionId, chunk.parentChunkId ?? null, chunk.documentTreeNodeId ?? null,
+        chunk.childOrdinal ?? null, chunk.parentOrdinal ?? null, chunk.nodeType ?? null,
+        chunk.ordinal, chunk.headingPath, chunk.pageNumber,
         chunk.startLine ?? null, chunk.endLine ?? null, chunk.blockId ?? null,
         chunk.startChar, chunk.endChar, chunk.text, JSON.stringify(chunk.aspects),
       );
       insertFts.run(chunk.id, chunk.text, chunk.headingPath ?? "");
       result.push(chunk);
+      const localKey = (item as { localKey?: string }).localKey;
+      if (localKey) localToChunk.set(localKey, chunk);
+      pendingByChunkId.set(chunk.id, item as PendingChunk & { localKey?: string; parentLocalKey?: string });
+    }
+    const updateParent = this.sql.prepare("UPDATE chunks SET parent_chunk_id = ? WHERE id = ?");
+    for (const chunk of result) {
+      const item = pendingByChunkId.get(chunk.id);
+      const parentLocalKey = item?.parentLocalKey;
+      if (!parentLocalKey) continue;
+      const parent = localToChunk.get(parentLocalKey);
+      if (!parent) continue;
+      updateParent.run(parent.id, chunk.id);
+      chunk.parentChunkId = parent.id;
     }
     return result;
   }
 
+  saveDocumentIndex(index: PendingDocumentIndex, chunks: Chunk[]): void {
+    const chunkByLocalKey = new Map<string, Chunk>();
+    for (const pending of index.chunks) {
+      const chunk = chunks.find((candidate) => candidate.ordinal === pending.ordinal);
+      if (chunk) chunkByLocalKey.set(pending.localKey, chunk);
+    }
+    const sourceIdsFor = (nodeId: string): string[] => {
+      const localIds = index.chunks
+        .filter((chunk) => chunk.documentTreeNodeId === nodeId)
+        .flatMap((chunk) => chunkByLocalKey.get(chunk.localKey)?.id ?? []);
+      return [...new Set(localIds)];
+    };
+    const insertNode = this.sql.prepare(`
+      INSERT INTO document_tree_nodes
+        (id, library_id, document_id, version_id, node_type, parent_id, children_ids_json, ordinal, level,
+          heading_path_json, text, summary, prev_id, next_id, source_chunk_ids_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const node of index.treeNodes) {
+      insertNode.run(
+        node.id,
+        node.libraryId,
+        node.documentId,
+        node.versionId,
+        node.nodeType,
+        node.parentId,
+        JSON.stringify(node.childrenIds),
+        node.ordinal,
+        node.level,
+        JSON.stringify(node.headingPath),
+        node.text,
+        node.summary,
+        node.prevId,
+        node.nextId,
+        JSON.stringify(sourceIdsFor(node.id)),
+      );
+    }
+    const insertLink = this.sql.prepare(`
+      INSERT OR REPLACE INTO parent_child_chunks
+        (child_chunk_id, parent_chunk_id, document_tree_node_id, child_text, parent_text, child_ordinal, parent_ordinal)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const link of index.parentChildLinks) {
+      const child = chunkByLocalKey.get(link.childLocalKey);
+      const parent = chunkByLocalKey.get(link.parentLocalKey);
+      if (!child || !parent) continue;
+      insertLink.run(
+        child.id,
+        parent.id,
+        link.documentTreeNodeId,
+        child.text,
+        parent.text,
+        child.childOrdinal ?? child.ordinal,
+        parent.ordinal,
+      );
+    }
+    const insertSummary = this.sql.prepare(`
+      INSERT INTO summary_tree_nodes
+        (id, version_id, level, source_node_ids_json, summary, embedding_id, parent_summary_id, child_summary_ids_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const summary of index.summaryNodes) {
+      insertSummary.run(
+        summary.id,
+        summary.versionId,
+        summary.level,
+        JSON.stringify(summary.sourceNodeIds),
+        summary.summary,
+        summary.embeddingId ?? summary.id,
+        summary.parentSummaryId,
+        JSON.stringify(summary.childSummaryIds),
+      );
+    }
+  }
+
+  getDocumentTreeForVersion(versionId: string): DocumentTreeNode[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM document_tree_nodes WHERE version_id = ? ORDER BY ordinal"),
+      versionId,
+    ).map(documentTreeNodeFrom);
+  }
+
+  getDocumentTreeForLibrary(libraryId: string): DocumentTreeNode[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM document_tree_nodes WHERE library_id = ? ORDER BY version_id, ordinal"),
+      libraryId,
+    ).map(documentTreeNodeFrom);
+  }
+
+  getDocumentTreeNodesByIds(ids: string[]): DocumentTreeNode[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const order = new Map(ids.map((id, index) => [id, index]));
+    return rows(this.sql.prepare(`SELECT * FROM document_tree_nodes WHERE id IN (${placeholders})`), ...ids)
+      .map(documentTreeNodeFrom)
+      .sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
+  }
+
+  searchDocumentTreeNodes(libraryId: string, query: string, limit = 20): DocumentTreeNode[] {
+    const normalized = normalizeSearchText(query);
+    if (!normalized) return [];
+    const tokens = searchTokens(query).slice(0, 6);
+    const likeTerms = [normalized, ...tokens];
+    const filters = likeTerms.flatMap(() => ["text LIKE ?", "summary LIKE ?"]);
+    const params = likeTerms.flatMap((term) => [`%${term}%`, `%${term}%`]);
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM document_tree_nodes
+        WHERE library_id = ? AND (${filters.join(" OR ")})
+        ORDER BY level, ordinal LIMIT ?
+      `),
+      libraryId,
+      ...params,
+      Math.max(1, Math.min(limit, 100)),
+    ).map(documentTreeNodeFrom);
+  }
+
+  getSectionSubtree(sectionId: string): DocumentTreeNode[] {
+    const root = row(this.sql.prepare("SELECT * FROM document_tree_nodes WHERE id = ?"), sectionId);
+    if (!root) return [];
+    const versionId = String(root.version_id);
+    const all = this.getDocumentTreeForVersion(versionId);
+    const byParent = new Map<string | null, DocumentTreeNode[]>();
+    for (const node of all) {
+      const group = byParent.get(node.parentId) ?? [];
+      group.push(node);
+      byParent.set(node.parentId, group);
+    }
+    const result: DocumentTreeNode[] = [];
+    const visit = (node: DocumentTreeNode) => {
+      result.push(node);
+      for (const child of byParent.get(node.id) ?? []) visit(child);
+    };
+    visit(documentTreeNodeFrom(root));
+    return result;
+  }
+
+  getSiblingTreeNodes(nodeId: string, window = 3): DocumentTreeNode[] {
+    const node = row(this.sql.prepare("SELECT * FROM document_tree_nodes WHERE id = ?"), nodeId);
+    if (!node) return [];
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM document_tree_nodes
+        WHERE version_id = ? AND parent_id IS ? AND ordinal BETWEEN ? AND ?
+        ORDER BY ordinal
+      `),
+      String(node.version_id),
+      node.parent_id,
+      Number(node.ordinal) - Math.max(1, window),
+      Number(node.ordinal) + Math.max(1, window),
+    ).map(documentTreeNodeFrom);
+  }
+
+  getRemainingTreeNodesAfter(nodeId: string, limit = 24): DocumentTreeNode[] {
+    const node = row(this.sql.prepare("SELECT * FROM document_tree_nodes WHERE id = ?"), nodeId);
+    if (!node) return [];
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM document_tree_nodes
+        WHERE version_id = ? AND ordinal > ?
+        ORDER BY ordinal LIMIT ?
+      `),
+      String(node.version_id),
+      Number(node.ordinal),
+      Math.max(1, Math.min(limit, 100)),
+    ).map(documentTreeNodeFrom);
+  }
+
+  getParentChildChunks(childChunkIds: string[]): ParentChildChunk[] {
+    if (childChunkIds.length === 0) return [];
+    const placeholders = childChunkIds.map(() => "?").join(",");
+    return rows(
+      this.sql.prepare(`SELECT * FROM parent_child_chunks WHERE child_chunk_id IN (${placeholders})`),
+      ...childChunkIds,
+    ).map((entry) => ({
+      childChunkId: String(entry.child_chunk_id),
+      parentChunkId: String(entry.parent_chunk_id),
+      documentTreeNodeId: String(entry.document_tree_node_id),
+      childText: String(entry.child_text),
+      parentText: String(entry.parent_text),
+      childOrdinal: Number(entry.child_ordinal),
+      parentOrdinal: Number(entry.parent_ordinal),
+    }));
+  }
+
   private clearGeneratedForVersion(versionId: string): void {
+    this.sql.prepare("DELETE FROM summary_embeddings WHERE summary_id IN (SELECT id FROM summary_tree_nodes WHERE version_id = ?)").run(versionId);
+    this.sql.prepare("DELETE FROM summary_tree_nodes WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM parent_child_chunks WHERE child_chunk_id IN (SELECT id FROM chunks WHERE version_id = ?)").run(versionId);
+    this.sql.prepare("DELETE FROM document_tree_nodes WHERE version_id = ?").run(versionId);
     const contributionNodes = rows(
       this.sql.prepare("SELECT node_id FROM abstract_node_aspect_contributions WHERE analyzed_version_id = ?"),
       versionId,
@@ -1394,6 +1705,22 @@ export class AgentDatabase {
     return result.slice(0, Math.max(1, Math.min(limit, 80)));
   }
 
+  getRemainingChunksAfter(versionId: string, chunkId: string, limit = 12): Chunk[] {
+    const seed = this.getChunk(chunkId);
+    if (!seed || seed.versionId !== versionId) return [];
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM chunks
+        WHERE library_id = ? AND version_id = ? AND ordinal > ?
+        ORDER BY ordinal LIMIT ?
+      `),
+      seed.libraryId,
+      versionId,
+      seed.ordinal,
+      Math.max(1, Math.min(Math.trunc(limit), 80)),
+    ).map(chunkFrom);
+  }
+
   getDocumentOutlineForLibrary(libraryId: string, versionId?: string): Array<{
     versionId: string;
     documentName: string;
@@ -1439,6 +1766,7 @@ export class AgentDatabase {
         SELECT c.*, bm25(chunks_fts) AS rank
         FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.chunk_id
         WHERE chunks_fts MATCH ? AND c.library_id = ?
+          AND (c.node_type IS NULL OR c.node_type IN ('paragraph','sentence','unknown'))
         ORDER BY rank LIMIT ?
       `),
       match,
@@ -1458,6 +1786,7 @@ export class AgentDatabase {
       this.sql.prepare(`
         SELECT * FROM chunks
         WHERE library_id = ? AND (${filters.join(" OR ")})
+          AND (node_type IS NULL OR node_type IN ('paragraph','sentence','unknown'))
         ORDER BY ordinal LIMIT ?
       `),
       libraryId,
@@ -1622,6 +1951,14 @@ export class AgentDatabase {
     `).run(chunkId, dimensions, embedding);
   }
 
+  saveSummaryEmbedding(libraryId: string, summaryId: string, dimensions: number, embedding: Uint8Array): void {
+    this.sql.prepare(`
+      INSERT INTO summary_embeddings (summary_id, library_id, dimensions, embedding) VALUES (?, ?, ?, ?)
+      ON CONFLICT(summary_id) DO UPDATE SET dimensions = excluded.dimensions, embedding = excluded.embedding
+    `).run(summaryId, libraryId, dimensions, embedding);
+    this.sql.prepare("UPDATE summary_tree_nodes SET embedding_id = ? WHERE id = ?").run(summaryId, summaryId);
+  }
+
   private citationsForChunkIds(ids: string[]): Citation[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
@@ -1655,7 +1992,20 @@ export class AgentDatabase {
       this.sql.prepare("SELECT chunk_id FROM abstract_node_evidence WHERE node_id = ?"),
       node.id,
     ).map((item) => String(item.chunk_id));
-    return { ...node, citations: this.citationsForChunkIds(evidenceIds) };
+    return {
+      ...node,
+      citations: this.citationsForChunkIds(evidenceIds),
+      evidenceNodeIds: this.treeNodeIdsForChunks(evidenceIds),
+    };
+  }
+
+  private treeNodeIdsForChunks(chunkIds: string[]): string[] {
+    if (chunkIds.length === 0) return [];
+    const placeholders = chunkIds.map(() => "?").join(",");
+    return [...new Set(rows(
+      this.sql.prepare(`SELECT document_tree_node_id FROM chunks WHERE id IN (${placeholders}) AND document_tree_node_id IS NOT NULL`),
+      ...chunkIds,
+    ).map((entry) => String(entry.document_tree_node_id)))];
   }
 
   listEmbeddings(libraryId: string, dimensions: number): Array<{ chunk: Chunk; embedding: Uint8Array }> {
@@ -1664,6 +2014,7 @@ export class AgentDatabase {
         SELECT c.*, e.embedding FROM chunk_embeddings e
         JOIN chunks c ON c.id = e.chunk_id
         WHERE c.library_id = ? AND e.dimensions = ?
+          AND (c.node_type IS NULL OR c.node_type IN ('paragraph','sentence','unknown'))
       `),
       libraryId,
       dimensions,
@@ -1671,6 +2022,63 @@ export class AgentDatabase {
       chunk: chunkFrom(result),
       embedding: result.embedding as Uint8Array,
     }));
+  }
+
+  listSummaryEmbeddings(libraryId: string, dimensions: number): Array<{ summary: SummaryTreeNode; embedding: Uint8Array }> {
+    return rows(
+      this.sql.prepare(`
+        SELECT s.*, e.embedding FROM summary_embeddings e
+        JOIN summary_tree_nodes s ON s.id = e.summary_id
+        WHERE e.library_id = ? AND e.dimensions = ?
+      `),
+      libraryId,
+      dimensions,
+    ).map((result) => ({
+      summary: summaryTreeNodeFrom(result),
+      embedding: result.embedding as Uint8Array,
+    }));
+  }
+
+  getSummaryTreeForVersion(versionId: string): SummaryTreeNode[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM summary_tree_nodes WHERE version_id = ? ORDER BY CASE level WHEN 'document' THEN 0 WHEN 'section' THEN 1 WHEN 'paragraph' THEN 2 ELSE 3 END, rowid"),
+      versionId,
+    ).map(summaryTreeNodeFrom);
+  }
+
+  getSummaryTreeForLibrary(libraryId: string): SummaryTreeNode[] {
+    return rows(
+      this.sql.prepare(`
+        SELECT s.* FROM summary_tree_nodes s
+        JOIN document_versions v ON v.id = s.version_id
+        JOIN documents d ON d.id = v.document_id
+        WHERE d.library_id = ?
+        ORDER BY s.version_id, CASE s.level WHEN 'document' THEN 0 WHEN 'section' THEN 1 WHEN 'paragraph' THEN 2 ELSE 3 END, s.rowid
+      `),
+      libraryId,
+    ).map(summaryTreeNodeFrom);
+  }
+
+  searchSummaryTree(libraryId: string, query: string, limit = 12): SummaryTreeNode[] {
+    const normalized = normalizeSearchText(query);
+    if (!normalized) return [];
+    const tokens = searchTokens(query).slice(0, 6);
+    const likeTerms = [normalized, ...tokens];
+    const filters = likeTerms.map(() => "s.summary LIKE ?");
+    const params = likeTerms.map((term) => `%${term}%`);
+    return rows(
+      this.sql.prepare(`
+        SELECT s.* FROM summary_tree_nodes s
+        JOIN document_versions v ON v.id = s.version_id
+        JOIN documents d ON d.id = v.document_id
+        WHERE d.library_id = ? AND (${filters.join(" OR ")})
+        ORDER BY CASE s.level WHEN 'document' THEN 0 WHEN 'section' THEN 1 WHEN 'paragraph' THEN 2 ELSE 3 END
+        LIMIT ?
+      `),
+      libraryId,
+      ...params,
+      Math.max(1, Math.min(limit, 50)),
+    ).map(summaryTreeNodeFrom);
   }
 
   saveExtraction(
@@ -1961,6 +2369,7 @@ export class AgentDatabase {
       confidence: result.confidence === null ? null : Number(result.confidence),
       createdBy: String(result.created_by) as "ai" | "user",
       evidenceChunkIds: evidence,
+      evidenceNodeIds: this.treeNodeIdsForChunks(evidence),
       citations: this.citationsForChunkIds(evidence),
       createdAt: String(result.created_at),
       updatedAt: String(result.updated_at),
@@ -1974,15 +2383,16 @@ export class AgentDatabase {
     summary: string,
     inputMode: PulseInputMode,
     hits: PendingPulseHit[],
+    evidencePack?: EvidencePack,
   ): Pulse {
     const id = randomUUID();
     const timestamp = now();
     this.sql.exec("BEGIN");
     try {
       this.sql.prepare(`
-        INSERT INTO pulses (id, library_id, question, answer, summary, input_mode, status, reviewed_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
-      `).run(id, libraryId, question, answer, summary, inputMode, timestamp);
+        INSERT INTO pulses (id, library_id, question, answer, summary, evidence_pack_json, input_mode, status, reviewed_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
+      `).run(id, libraryId, question, answer, summary, evidencePack ? JSON.stringify(evidencePack) : null, inputMode, timestamp);
       const insertHit = this.sql.prepare(`
         INSERT INTO pulse_hits
           (id, pulse_id, library_id, target_type, target_id, score, reason, path_role, step_index, observation, rationale, label, excerpt)
@@ -2040,6 +2450,16 @@ export class AgentDatabase {
     ).map(pulseHitFrom);
   }
 
+  getPulseEvidencePack(pulseId: string): EvidencePack | undefined {
+    const result = row(this.sql.prepare("SELECT evidence_pack_json FROM pulses WHERE id = ?"), pulseId);
+    if (typeof result?.evidence_pack_json !== "string" || !result.evidence_pack_json.trim()) return undefined;
+    try {
+      return JSON.parse(result.evidence_pack_json) as EvidencePack;
+    } catch {
+      return undefined;
+    }
+  }
+
   getPulseResponse(libraryId: string, pulseId: string): PulseResponse | undefined {
     const pulse = this.getPulse(pulseId);
     if (!pulse || pulse.libraryId !== libraryId) return undefined;
@@ -2047,6 +2467,7 @@ export class AgentDatabase {
       pulse,
       hits: this.getPulseHits(pulseId),
       graph: this.getGraph(libraryId, { pulseId, pulseStats: true }),
+      ...(this.getPulseEvidencePack(pulseId) ? { evidencePack: this.getPulseEvidencePack(pulseId) } : {}),
     };
   }
 

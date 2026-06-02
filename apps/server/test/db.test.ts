@@ -3,6 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentDatabase } from "../src/db.js";
+import { buildDocumentIndex } from "../src/domain/document-tree.js";
+import { FakeModelProvider } from "../src/services/models.js";
+import { VectorStore } from "../src/services/vector-store.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -17,6 +20,59 @@ afterEach(async () => {
 });
 
 describe("knowledge database", () => {
+  it("persists document tree, parent-child chunks, summaries, and evidence node links", async () => {
+    const db = await database();
+    const vectors = new VectorStore(db);
+    const model = new FakeModelProvider();
+    const library = db.createLibrary("RAG Index");
+    const version = db.createDocumentVersion(library.id, "rag.md", "text/markdown", "rag", "rag").version;
+    const documentId = db.getVersionSource(version.id)!.documentId;
+    const index = buildDocumentIndex({
+      libraryId: library.id,
+      documentId,
+      versionId: version.id,
+      documentName: "rag.md",
+      sections: [{ headingPath: "Overview", text: "Graph retrieval works. Parent context returns the section." }],
+    });
+    const chunks = db.replaceChunks(library.id, version.id, index.chunks);
+    db.saveDocumentIndex(index, chunks);
+    for (const chunk of chunks.filter((chunk) => chunk.nodeType === "paragraph")) {
+      const [embedding] = await model.embed([chunk.text]);
+      vectors.save(chunk, embedding ?? []);
+    }
+    for (const summary of index.summaryNodes) {
+      const [embedding] = await model.embed([summary.summary]);
+      vectors.saveSummary(library.id, summary, embedding ?? []);
+    }
+
+    const tree = db.getDocumentTreeForVersion(version.id);
+    expect(tree.map((node) => node.nodeType)).toEqual(expect.arrayContaining(["document", "section", "paragraph", "sentence"]));
+    const child = chunks.find((chunk) => chunk.nodeType === "paragraph")!;
+    expect(child.parentChunkId).toBeTruthy();
+    expect(db.getParentChildChunks([child.id])[0]).toMatchObject({
+      childChunkId: child.id,
+      parentChunkId: child.parentChunkId,
+      documentTreeNodeId: child.documentTreeNodeId,
+    });
+    expect(vectors.search(library.id, (await model.embed(["Parent context"]))[0]!, 5).every((result) => result.chunk.nodeType !== "section")).toBe(true);
+    expect(vectors.searchSummaries(library.id, (await model.embed(["Overview"]))[0]!, 5).length).toBeGreaterThan(0);
+
+    db.saveExtraction(library.id, {
+      nodes: [{
+        key: "graph",
+        kind: "concept",
+        title: "Graph retrieval",
+        summary: "Graph retrieval works.",
+        evidenceChunkIds: [child.id],
+        aspects: ["system"],
+      }],
+      relations: [],
+    }, version.id);
+    const node = db.searchAbstractNodes(library.id, "Graph retrieval", 1)[0]!.node;
+    expect(node.evidenceNodeIds).toEqual([child.documentTreeNodeId]);
+    db.close();
+  });
+
   it("deduplicates matching document content while retaining changed versions", async () => {
     const db = await database();
     const library = db.createLibrary("Research");

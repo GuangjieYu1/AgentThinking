@@ -575,21 +575,7 @@ export class PulseEngine {
         .filter((hit) => hit.targetType === "chunk")
         .flatMap((hit) => {
           const chunk = chunks.get(hit.targetId) ?? this.db.getChunk(hit.targetId);
-          return chunk ? [{
-            id: chunk.id,
-            text: chunk.text,
-            headingPath: chunk.headingPath,
-            pageNumber: chunk.pageNumber,
-            ordinal: chunk.ordinal,
-            libraryId: chunk.libraryId,
-            versionId: chunk.versionId,
-            startLine: chunk.startLine,
-            endLine: chunk.endLine,
-            blockId: chunk.blockId,
-            startChar: chunk.startChar,
-            endChar: chunk.endChar,
-            aspects: chunk.aspects,
-          }] : [];
+          return chunk ? [chunk] : [];
         }),
       nodes: orderedHits
         .filter((hit) => hit.targetType === "node")
@@ -606,7 +592,7 @@ export class PulseEngine {
     }, eventSink);
     await emitPulse(eventSink, { type: "answer", answer: answer.answer, summary: answer.summary });
     await emitPulse(eventSink, { type: "stage", message: "正在保存脉冲结果" });
-    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits);
+    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits, answer.evidencePack);
     const response = this.db.getPulseResponse(libraryId, pulse.id);
     if (!response) throw new Error("脉冲创建后读取失败");
     return response;

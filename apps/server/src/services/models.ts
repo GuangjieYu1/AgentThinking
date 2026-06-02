@@ -215,9 +215,10 @@ function fallbackPulseQuestionPlan(): PulseQuestionPlan {
 function fallbackPulseEvidencePlan(question: string, mode: PulseAnswerContext["mode"], tools: string[]): PulseEvidencePlan {
   const available = new Set(tools);
   const preferred = [
-    { tool: "semanticSearch", query: question, purpose: "Find semantically related raw chunks.", expectedResult: "Relevant source chunks." },
-    { tool: "fullTextSearch", query: question, purpose: "Find literal source matches.", expectedResult: "Chunks with explicit wording from the question." },
-    { tool: "getGraphContext", query: question, purpose: "Find graph context that may point to source evidence.", expectedResult: "Relevant nodes and relations." },
+    { tool: "semanticSearchChildChunks", query: question, purpose: "Find semantically related child chunks.", expectedResult: "Relevant source child chunks." },
+    { tool: "fullTextSearchChildChunks", query: question, purpose: "Find literal source matches in child chunks.", expectedResult: "Chunks with explicit wording from the question." },
+    { tool: "retrieveSummaryTree", query: question, purpose: "Find section or document summaries for broader context.", expectedResult: "Relevant summary tree nodes." },
+    { tool: "graphSearch", query: question, purpose: "Find graph context that may point to source evidence.", expectedResult: "Relevant nodes and relations." },
   ].filter((step) => available.has(step.tool));
   return {
     objective: "Build a question-focused evidence pack from generic retrieval tools.",
@@ -1308,7 +1309,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
           content:
             "Pulse Evidence Planner. Plan retrieval using only the supplied generic tools. " +
             "Do not request amountRegexScan, timelineRegexScan, legalMode, or any question-specific scanner. Prefer raw chunks when exact evidence is needed. " +
-            'Return JSON only: {"objective":"...","steps":[{"tool":"semanticSearch|fullTextSearch|graphExpand|readChunks|readNeighborChunks|readSameSectionChunks|getDocumentOutline|getChunkEvidenceAround|getGraphContext","query":"...","basedOnChunkIds":["..."],"basedOnNodeIds":["..."],"purpose":"...","expectedResult":"..."}],"stopCondition":"...","expectedEvidenceShape":"...","maxIterations":2}.',
+            "If EvidenceMemory contains a declared total but itemized rows do not reconcile, or existing rows look like part of the same source list/section, generate continuation actions: readRemainingChunksAfter the last covered chunk, readSameSectionChunks, and readNeighborChunks before broad semantic search. " +
+            "For exhaustive questions, plan to extract remaining itemized rows from continued raw chunks instead of stopping at a partial answer. " +
+            'Return JSON only: {"objective":"...","steps":[{"tool":"semanticSearch|fullTextSearch|graphExpand|readChunks|readNeighborChunks|readSameSectionChunks|readRemainingChunksAfter|getDocumentOutline|getChunkEvidenceAround|getGraphContext","query":"...","basedOnChunkIds":["..."],"basedOnNodeIds":["..."],"purpose":"...","expectedResult":"..."}],"stopCondition":"...","expectedEvidenceShape":"...","maxIterations":4}.',
         },
         { role: "user", content: JSON.stringify(input) },
       ],
@@ -1319,10 +1322,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
       const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
       const parsed = pulseEvidencePlanSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
       const allowed = new Set(input.tools);
+      const progressiveCap = input.questionPlan.riskLevel === "high" && input.questionPlan.requiresExhaustiveEvidence ? 6 : 5;
       return {
         ...parsed,
         steps: parsed.steps.filter((step) => allowed.has(step.tool)),
-        maxIterations: input.mode === "progressive" ? Math.min(4, Math.max(parsed.maxIterations, 1)) : Math.min(2, Math.max(parsed.maxIterations, 1)),
+        maxIterations: input.mode === "progressive" ? Math.min(progressiveCap, Math.max(parsed.maxIterations, 1)) : Math.min(2, Math.max(parsed.maxIterations, 1)),
       };
     } catch {
       return fallbackPulseEvidencePlan(input.question, input.mode, input.tools);
@@ -1389,6 +1393,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
           content:
             "Pulse Sufficiency Judge. Judge whether evidence is sufficient for the question plan. Use EvidenceMemory and computed reconciliation. " +
             "If insufficient, return concrete gaps and suggested generic search queries. Do not hide reconciliation failure. " +
+            "For exhaustive questions, if you see a partial list, numbered/list structure, or sections that appear to continue after the current chunks, return needs_gap_retrieval and recommend continuing the same section or subsequent chunks; do not return partial_answer_only unless the document has truly been covered or the details are absent from the document. " +
             'Return JSON only: {"sufficient":false,"status":"sufficient|insufficient_context|needs_gap_retrieval|failed_reconciliation|partial_answer_only","gaps":[{"type":"missing_itemized_evidence|declared_total_without_breakdown|sum_mismatch|missing_source_quote|missing_entity_coverage|timeline_gap|unsupported_claim|other","description":"...","suggestedQueries":["..."],"severity":"low|medium|high"}],"reasoning":"...","reconciliation":{"declaredTotal":0,"itemizedSum":0,"difference":0,"unit":"万","closed":false,"explanation":"..."}}.',
         },
         { role: "user", content: JSON.stringify(input) },

@@ -141,6 +141,135 @@ function seed(db: AgentDatabase): { libraryId: string; chunks: Chunk[] } {
   return { libraryId: library.id, chunks };
 }
 
+function seedTwentyOneItems(db: AgentDatabase): { libraryId: string; chunks: Chunk[]; amountByChunkId: Map<string, { amount: number; declared?: boolean; itemIndex?: number }> } {
+  const library = db.createLibrary("Pulse evidence 21 items");
+  const version = db.createDocumentVersion(library.id, "case-21.md", "text/markdown", "case-21", "case-21").version;
+  const itemAmounts = [556.782683, 144.8512, ...Array.from({ length: 18 }, () => 25), 72.28827];
+  const pending = [
+    { ordinal: 0, headingPath: "受贿事实", pageNumber: null, startChar: 0, endChar: 20, text: "受贿总额 1223.922153 万。" },
+    ...itemAmounts.map((amount, index) => ({
+      ordinal: index + 1,
+      headingPath: "受贿事实",
+      pageNumber: null,
+      startChar: 21 + index * 20,
+      endChar: 40 + index * 20,
+      text: `第 ${index + 1} 笔来源：行贿人 ${index + 1}，金额 ${amount} 万。`,
+    })),
+  ];
+  const chunks = db.replaceChunks(library.id, version.id, pending);
+  const amountByChunkId = new Map<string, { amount: number; declared?: boolean; itemIndex?: number }>();
+  amountByChunkId.set(chunks[0]!.id, { amount: 1223.922153, declared: true });
+  for (let index = 0; index < itemAmounts.length; index += 1) {
+    amountByChunkId.set(chunks[index + 1]!.id, { amount: itemAmounts[index]!, itemIndex: index + 1 });
+  }
+  return { libraryId: library.id, chunks, amountByChunkId };
+}
+
+class TwentyOneItemPulseModel extends FakeModelProvider {
+  readonly extractionInputs: Array<{ purpose: string; chunkIds: string[] }> = [];
+  judgeCalls = 0;
+  synthesizeCalls = 0;
+
+  constructor(private readonly amountByChunkId: Map<string, { amount: number; declared?: boolean; itemIndex?: number }>) {
+    super();
+  }
+
+  async analyzePulseQuestion(): Promise<PulseQuestionPlan> {
+    return plan();
+  }
+
+  async planPulseEvidence(): Promise<PulseEvidencePlan> {
+    return {
+      objective: "Read the initially visible total and first itemized rows.",
+      steps: [],
+      stopCondition: "Judge after seed evidence.",
+      expectedEvidenceShape: "Declared total and itemized rows.",
+      maxIterations: 6,
+    };
+  }
+
+  async extractPulseEvidenceRows(input: {
+    purpose: string;
+    chunks: Array<{ id: string; text: string }>;
+  }): Promise<PulseEvidenceRow[]> {
+    this.extractionInputs.push({ purpose: input.purpose, chunkIds: input.chunks.map((chunk) => chunk.id) });
+    return input.chunks.flatMap((chunk): PulseEvidenceRow[] => {
+      const amount = this.amountByChunkId.get(chunk.id);
+      if (!amount) return [];
+      return [{
+        rowId: amount.declared ? "declared-total" : `item-${amount.itemIndex}`,
+        evidenceType: "amount",
+        claimText: amount.declared
+          ? `声明总额 ${amount.amount} 万`
+          : `第 ${amount.itemIndex} 笔 ${amount.amount} 万`,
+        structuredValue: {
+          normalizedAmountWan: amount.amount,
+          ...(amount.declared ? { role: "declared_total" } : { itemIndex: amount.itemIndex }),
+        },
+        evidenceChunkId: chunk.id,
+        evidenceQuote: chunk.text,
+        confidence: 0.95,
+        countedInAnswer: !amount.declared,
+        dedupeKey: amount.declared ? "declared-total" : `item-${amount.itemIndex}`,
+      }];
+    });
+  }
+
+  async judgePulseEvidenceSufficiency(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    memory: unknown;
+    computedReconciliation?: unknown;
+  }): Promise<PulseEvidenceStatus> {
+    this.judgeCalls += 1;
+    const memory = input.memory as { evidenceRows?: PulseEvidenceRow[] };
+    const reconciliation = input.computedReconciliation as PulseEvidenceStatus["reconciliation"] | undefined;
+    const rows = memory.evidenceRows ?? [];
+    const itemizedCount = rows.filter((row) => row.evidenceType === "amount" && (row.structuredValue as { role?: string } | undefined)?.role !== "declared_total").length;
+    if (reconciliation?.closed && itemizedCount >= 21) {
+      return {
+        sufficient: true,
+        status: "sufficient",
+        gaps: [],
+        reasoning: "All 21 itemized rows reconcile to the declared total.",
+        reconciliation,
+      };
+    }
+    return {
+      sufficient: false,
+      status: "needs_gap_retrieval",
+      gaps: [{
+        type: "missing_itemized_evidence",
+        description: `Only ${itemizedCount} of 21 itemized rows have been extracted; continue the same section.`,
+        suggestedQueries: [],
+        severity: "high",
+      }],
+      reasoning: "The visible rows are a partial list and require continuation retrieval.",
+      ...(reconciliation ? { reconciliation } : {}),
+    };
+  }
+
+  async synthesizePulseAnswer(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    memory: unknown;
+    evidenceStatus: PulseEvidenceStatus;
+  }): Promise<PulseAnswerOutput> {
+    this.synthesizeCalls += 1;
+    const memory = input.memory as { evidenceRows?: PulseEvidenceRow[] };
+    const rows = memory.evidenceRows ?? [];
+    const itemizedCount = rows.filter((row) => row.evidenceType === "amount" && (row.structuredValue as { role?: string } | undefined)?.role !== "declared_total").length;
+    return {
+      answer: `受贿总额 1223.922153 万。受贿总额 1223.922153 万。已列明 ${itemizedCount} 笔，分项合计 ${input.evidenceStatus.reconciliation?.itemizedSum} 万。`,
+      summary: "sufficient",
+    };
+  }
+
+  async rewritePulseAnswer(input: { draft: PulseAnswerOutput }): Promise<PulseAnswerOutput> {
+    return input.draft;
+  }
+}
+
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -228,11 +357,65 @@ describe("PulseEvidenceController", () => {
     );
 
     const tools = result.diagnostics?.retrievalSteps?.map((step) => step.tool) ?? [];
-    expect(tools).toEqual(expect.arrayContaining(["semanticSearch", "fullTextSearch", "readNeighborChunks", "readSameSectionChunks"]));
+    expect(tools).toEqual(expect.arrayContaining([
+      "semanticSearchChildChunks",
+      "fullTextSearchChildChunks",
+      "retrieveSiblingNodes",
+      "retrieveSectionSubtree",
+    ]));
     expect(tools).not.toContain("amountRegexScan");
     expect(model.judgeCalls).toBe(2);
     expect(result.diagnostics?.retrievalSteps?.some((step) => step.query === "606.42607")).toBe(true);
     expect(result.evidenceRows?.some((row) => row.evidenceChunkId === chunks[0]!.id && row.evidenceQuote)).toBe(true);
+    db.close();
+  });
+
+  it("continues progressive retrieval across consecutive chunks before guarding exhaustive gaps", async () => {
+    const db = await database();
+    const { libraryId, chunks, amountByChunkId } = seedTwentyOneItems(db);
+    const vectors = new VectorStore(db);
+    const model = new TwentyOneItemPulseModel(amountByChunkId);
+    for (const chunk of chunks) {
+      const [embedding] = await model.embed([chunk.text]);
+      vectors.save(chunk, embedding!);
+    }
+
+    const result = await new PulseEvidenceController(db, vectors, model).answer(
+      libraryId,
+      "此受贿案的总共受贿金额是多少？列出每一笔来源",
+      "progressive",
+      {
+        hits: chunks.slice(0, 3).map((chunk, index) => ({
+          targetType: "chunk",
+          targetId: chunk.id,
+          score: 0.9,
+          reason: "seed",
+          pathRole: "direct",
+          stepIndex: index + 1,
+          observation: "seed",
+          rationale: "seed",
+          label: "seed",
+          excerpt: chunk.text,
+        })),
+        chunks: chunks.slice(0, 3),
+        nodes: [],
+        relations: [],
+      },
+    );
+
+    const tools = result.diagnostics?.retrievalSteps?.map((step) => step.tool) ?? [];
+    const itemRows = result.evidenceRows?.filter((row) => row.evidenceType === "amount" && (row.structuredValue as { role?: string } | undefined)?.role !== "declared_total") ?? [];
+    expect(model.judgeCalls).toBeGreaterThan(1);
+    expect(model.synthesizeCalls).toBe(1);
+    expect(result.answer).not.toContain("当前证据不足");
+    expect(tools).toEqual(expect.arrayContaining(["retrieveRemainingNodesAfter"]));
+    expect(itemRows).toHaveLength(21);
+    expect(result.evidenceStatus?.reconciliation).toMatchObject({
+      declaredTotal: 1223.922153,
+      itemizedSum: 1223.922153,
+      difference: 0,
+      closed: true,
+    });
     db.close();
   });
 });

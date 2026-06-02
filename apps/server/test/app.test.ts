@@ -285,10 +285,18 @@ describe("HTTP application", () => {
     const structure = (await app.inject({
       method: "GET",
       url: `/api/versions/${versionId}/structure`,
-    })).json<{ metadata: { title: string }; links: Array<{ type: string }>; chunks: Array<{ startLine: number }> }>();
+    })).json<{
+      metadata: { title: string };
+      links: Array<{ type: string }>;
+      chunks: Array<{ startLine: number; parentChunkId?: string | null; documentTreeNodeId?: string | null }>;
+      documentTree: Array<{ nodeType: string; headingPath: string[] }>;
+      summaryTree: Array<{ level: string; summary: string }>;
+    }>();
     expect(structure.metadata.title).toBe("Research Notes");
     expect(structure.links.map((link) => link.type)).toEqual(["markdown", "wiki", "block", "logseq"]);
     expect(structure.chunks[0]?.startLine).toBe(5);
+    expect(structure.documentTree.map((node) => node.nodeType)).toEqual(expect.arrayContaining(["document", "section", "paragraph", "sentence"]));
+    expect(structure.summaryTree.map((node) => node.level)).toEqual(expect.arrayContaining(["document", "section", "paragraph"]));
     const original = await app.inject({ method: "GET", url: `/api/versions/${versionId}/source` });
     expect(original.body).toContain("title: Research Notes");
     const graph = (await app.inject({
@@ -383,11 +391,22 @@ describe("HTTP application", () => {
     })).json<{
       pulse: { id: string; status: string; answer: string };
       hits: Array<{ targetType: string; pathRole: string }>;
+      evidencePack: { evidenceRows: unknown[]; treeNodes: unknown[]; semanticNodes: unknown[]; summaryNodes: unknown[]; retrievalTrace: unknown[] };
       graph: { nodes: Array<{ pulseRole?: string; pulseStats?: { correctCount: number; wrongCount: number } }> };
     }>();
     expect(createdPulse.pulse.status).toBe("unreviewed");
     expect(createdPulse.pulse.answer).toContain("演示脉冲回答");
     expect(createdPulse.hits.some((hit) => hit.targetType === "node" && hit.pathRole === "direct")).toBe(true);
+    expect(createdPulse.evidencePack.evidenceRows.length).toBeGreaterThan(0);
+    expect(createdPulse.evidencePack.treeNodes.length).toBeGreaterThan(0);
+    expect(createdPulse.evidencePack.summaryNodes.length).toBeGreaterThan(0);
+    expect(createdPulse.evidencePack.retrievalTrace.length).toBeGreaterThan(0);
+    const storedPack = (await app.inject({
+      method: "GET",
+      url: `/api/libraries/${library.id}/pulses/${createdPulse.pulse.id}/evidence-pack`,
+    })).json<{ question: string; evidenceRows: unknown[] }>();
+    expect(storedPack.question).toBe("claim follows");
+    expect(storedPack.evidenceRows.length).toBeGreaterThan(0);
     expect(createdPulse.graph.nodes.some((node) => node.pulseRole === "direct")).toBe(true);
     const listedPulses = (await app.inject({ method: "GET", url: `/api/libraries/${library.id}/pulses` }))
       .json<Array<{ id: string }>>();

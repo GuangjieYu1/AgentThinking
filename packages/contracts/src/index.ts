@@ -23,6 +23,8 @@ export const pulseStatuses = ["unreviewed", "correct", "wrong"] as const;
 export const pulseHitTargetTypes = ["node", "relation", "chunk"] as const;
 export const pulsePathRoles = ["direct", "expanded", "bridge"] as const;
 export const pulseInputModes = ["full", "progressive"] as const;
+export const documentTreeNodeTypes = ["document", "section", "paragraph", "sentence", "table", "unknown"] as const;
+export const summaryTreeLevels = ["paragraph", "section", "document", "cluster"] as const;
 export const mappingAuditStatuses = ["clean", "minor_issues", "major_issues", "failed"] as const;
 export const mappingAuditFindingKinds = [
   "missing_source_meaning",
@@ -87,6 +89,8 @@ export type PulseStatus = (typeof pulseStatuses)[number];
 export type PulseHitTargetType = (typeof pulseHitTargetTypes)[number];
 export type PulsePathRole = (typeof pulsePathRoles)[number];
 export type PulseInputMode = (typeof pulseInputModes)[number];
+export type DocumentTreeNodeType = (typeof documentTreeNodeTypes)[number];
+export type SummaryTreeLevel = (typeof summaryTreeLevels)[number];
 export type MappingAuditStatus = (typeof mappingAuditStatuses)[number];
 export type MappingAuditFindingKind = (typeof mappingAuditFindingKinds)[number];
 export type MappingAuditSeverity = (typeof mappingAuditSeverities)[number];
@@ -143,6 +147,11 @@ export interface Chunk {
   id: string;
   libraryId: string;
   versionId: string;
+  parentChunkId?: string | null;
+  documentTreeNodeId?: string | null;
+  childOrdinal?: number | null;
+  parentOrdinal?: number | null;
+  nodeType?: DocumentTreeNodeType | null;
   ordinal: number;
   headingPath: string | null;
   pageNumber: number | null;
@@ -153,6 +162,53 @@ export interface Chunk {
   endChar: number;
   text: string;
   aspects: AspectKind[];
+}
+
+export interface DocumentTreeNode {
+  id: string;
+  libraryId: string;
+  documentId: string;
+  versionId: string;
+  nodeType: DocumentTreeNodeType;
+  parentId: string | null;
+  childrenIds: string[];
+  ordinal: number;
+  level: number;
+  headingPath: string[];
+  text: string;
+  summary: string;
+  prevId: string | null;
+  nextId: string | null;
+  sourceChunkIds: string[];
+}
+
+export interface ParentChildChunk {
+  childChunkId: string;
+  parentChunkId: string;
+  documentTreeNodeId: string;
+  childText: string;
+  parentText: string;
+  childOrdinal: number;
+  parentOrdinal: number;
+}
+
+export interface SummaryTreeNode {
+  id: string;
+  versionId: string;
+  level: SummaryTreeLevel;
+  sourceNodeIds: string[];
+  summary: string;
+  embeddingId: string | null;
+  parentSummaryId: string | null;
+  childSummaryIds: string[];
+}
+
+export interface EvidenceCitation {
+  chunkId: string;
+  treeNodeId: string | null;
+  quote: string;
+  headingPath: string[] | string | null;
+  pageNumber: number | null;
 }
 
 export interface Citation {
@@ -196,6 +252,8 @@ export interface SourceStructure {
   metadata: SourceMetadata | null;
   links: SourceLink[];
   chunks: Chunk[];
+  documentTree?: DocumentTreeNode[] | undefined;
+  summaryTree?: SummaryTreeNode[] | undefined;
 }
 
 export interface AbstractNode {
@@ -210,6 +268,7 @@ export interface AbstractNode {
   memberCount: number;
   source: "ai" | "user";
   citations: Citation[];
+  evidenceNodeIds?: string[] | undefined;
   createdAt: string;
   updatedAt: string;
 }
@@ -233,6 +292,7 @@ export interface Relation {
   confidence: number | null;
   createdBy: "ai" | "user";
   evidenceChunkIds: string[];
+  evidenceNodeIds?: string[] | undefined;
   ruleWarnings?: string[] | undefined;
   ruleDecision?: GraphRuleDecision | undefined;
   originalType?: string | undefined;
@@ -373,6 +433,7 @@ export interface PulseResponse {
   pulse: Pulse;
   hits: PulseHit[];
   graph: GraphResponse;
+  evidencePack?: EvidencePack | undefined;
 }
 
 export type PulseStreamEvent =
@@ -432,12 +493,24 @@ export type PulseQuestionType =
   | "mixed";
 
 export type PulseEvidenceTool =
+  | "semanticSearchChildChunks"
+  | "fullTextSearchChildChunks"
+  | "retrieveParentChunks"
+  | "retrieveDocumentTreeNodes"
+  | "retrieveSectionSubtree"
+  | "retrieveSiblingNodes"
+  | "retrieveRemainingNodesAfter"
+  | "retrieveSummaryTree"
+  | "graphSearch"
+  | "graphExpand"
+  | "retrieveEvidenceForGraphNodes"
+  | "buildEvidencePack"
   | "semanticSearch"
   | "fullTextSearch"
-  | "graphExpand"
   | "readChunks"
   | "readNeighborChunks"
   | "readSameSectionChunks"
+  | "readRemainingChunksAfter"
   | "getDocumentOutline"
   | "getChunkEvidenceAround"
   | "getGraphContext";
@@ -487,11 +560,38 @@ export interface PulseEvidenceRow {
   targetEntity?: string | undefined;
   relationType?: string | undefined;
   evidenceChunkId: string;
+  treeNodeId?: string | null | undefined;
   evidenceQuote: string;
   confidence: number;
   countedInAnswer?: boolean | undefined;
   dedupeKey?: string | undefined;
   warnings?: string[] | undefined;
+}
+
+export interface RetrievalTrace {
+  stepIndex: number;
+  tool: PulseEvidenceTool;
+  purpose: string;
+  query?: string | undefined;
+  inputIds: string[];
+  outputIds: string[];
+  newEvidenceRowCount: number;
+  status: "success" | "empty" | "error" | "skipped";
+}
+
+export interface EvidencePack {
+  id: string;
+  question: string;
+  treeNodes: DocumentTreeNode[];
+  parentChunks: ParentChildChunk[];
+  semanticNodes: AbstractNode[];
+  semanticRelations: Relation[];
+  summaryNodes: SummaryTreeNode[];
+  evidenceRows: PulseEvidenceRow[];
+  citations: EvidenceCitation[];
+  gaps: PulseEvidenceGap[];
+  retrievalTrace: RetrievalTrace[];
+  reconciliation?: PulseEvidenceReconciliation | undefined;
 }
 
 export interface PulseEvidenceGap {
@@ -529,12 +629,16 @@ export interface PulseEvidenceStatus {
 export interface PulseEvidenceMemory {
   question: string;
   questionPlan: PulseQuestionPlan;
-  collectedChunks: Array<{ id: string; text: string; headingPath: string | null; pageNumber: number | null; ordinal: number }>;
+  collectedChunks: Array<{ id: string; versionId: string; text: string; headingPath: string | null; pageNumber: number | null; ordinal: number; parentChunkId?: string | null; documentTreeNodeId?: string | null; nodeType?: DocumentTreeNodeType | null }>;
   graphNodes: Array<{ id: string; title: string; summary: string }>;
   graphRelations: Array<{ id: string; type: RelationType; sourceTitle: string; targetTitle: string; reason: string }>;
+  treeNodes?: DocumentTreeNode[] | undefined;
+  parentChunks?: ParentChildChunk[] | undefined;
+  summaryNodes?: SummaryTreeNode[] | undefined;
   evidenceRows: PulseEvidenceRow[];
   citedChunkIds: string[];
   retrievalHistory: Array<{ tool: PulseEvidenceTool; query?: string | undefined; chunkIds: string[]; purpose: string }>;
+  retrievalTrace?: RetrievalTrace[] | undefined;
   currentFindings: string[];
   gaps: PulseEvidenceGap[];
   sufficiencyHistory: PulseEvidenceStatus[];
@@ -909,8 +1013,32 @@ export const pulseQuestionPlanSchema = z.object({
   reasoning: z.string().trim().min(1).max(2000),
 });
 
+export const pulseEvidenceToolValues = [
+  "semanticSearchChildChunks",
+  "fullTextSearchChildChunks",
+  "retrieveParentChunks",
+  "retrieveDocumentTreeNodes",
+  "retrieveSectionSubtree",
+  "retrieveSiblingNodes",
+  "retrieveRemainingNodesAfter",
+  "retrieveSummaryTree",
+  "graphSearch",
+  "graphExpand",
+  "retrieveEvidenceForGraphNodes",
+  "buildEvidencePack",
+  "semanticSearch",
+  "fullTextSearch",
+  "readChunks",
+  "readNeighborChunks",
+  "readSameSectionChunks",
+  "readRemainingChunksAfter",
+  "getDocumentOutline",
+  "getChunkEvidenceAround",
+  "getGraphContext",
+] as const;
+
 export const pulseEvidenceStepSchema = z.object({
-  tool: z.enum(["semanticSearch", "fullTextSearch", "graphExpand", "readChunks", "readNeighborChunks", "readSameSectionChunks", "getDocumentOutline", "getChunkEvidenceAround", "getGraphContext"]),
+  tool: z.enum(pulseEvidenceToolValues),
   query: z.string().trim().max(1000).optional(),
   basedOnChunkIds: z.array(z.string().trim().min(1)).optional(),
   basedOnNodeIds: z.array(z.string().trim().min(1)).optional(),
@@ -935,6 +1063,7 @@ export const pulseEvidenceRowSchema = z.object({
   targetEntity: z.string().trim().max(300).optional(),
   relationType: z.string().trim().max(120).optional(),
   evidenceChunkId: z.string().trim().min(1),
+  treeNodeId: z.string().trim().min(1).nullable().optional(),
   evidenceQuote: z.string().trim().min(1).max(1200),
   confidence: z.coerce.number().min(0).max(1),
   countedInAnswer: z.boolean().optional(),
@@ -1006,6 +1135,8 @@ export const extractionSchema = z.object({
       title: z.string().trim().min(1).max(180),
       summary: z.string().trim().max(2000),
       evidenceChunkIds: z.array(z.string()).default([]),
+      sourceChunkIds: z.array(z.string()).optional(),
+      evidenceNodeIds: z.array(z.string()).optional(),
       aspects: z.array(z.enum(aspectKinds)),
     }),
   ),
@@ -1017,6 +1148,8 @@ export const extractionSchema = z.object({
       reason: z.string().trim().min(1).max(1000),
       confidence: z.number().min(0).max(1),
       evidenceChunkIds: z.array(z.string()).default([]),
+      sourceChunkIds: z.array(z.string()).optional(),
+      evidenceNodeIds: z.array(z.string()).optional(),
       ruleWarnings: z.array(z.string().trim().min(1).max(300)).optional(),
       ruleDecision: z.preprocess((value) => value === "dropped" ? "excluded_from_graph" : value, z.enum(graphRuleDecisions)).optional(),
       originalType: z.string().trim().min(1).max(80).optional(),
@@ -1029,6 +1162,8 @@ export const extractionSchema = z.object({
       summary: z.string().trim().max(2000),
       memberKeys: z.array(z.string()).min(1),
       evidenceChunkIds: z.array(z.string()).default([]),
+      sourceChunkIds: z.array(z.string()).optional(),
+      evidenceNodeIds: z.array(z.string()).optional(),
       aspects: z.array(z.enum(aspectKinds)),
     }),
   ).optional(),

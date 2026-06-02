@@ -5,6 +5,8 @@ import type {
   AnalysisStatement,
   AuthSession,
   Document,
+  DocumentTreeNode,
+  EvidencePack,
   GraphResponse,
   GraphView,
   IngestJob,
@@ -24,6 +26,7 @@ import type {
   PulseStreamEvent,
   PublishedAnalysis,
   SourceStructure,
+  SummaryTreeNode,
 } from "@agent-thinking/contracts";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -118,6 +121,10 @@ export const api = {
     return response.text();
   },
   structure: (versionId: string) => request<SourceStructure>(`/versions/${versionId}/structure`),
+  documentTree: (libraryId: string) => request<DocumentTreeNode[]>(`/libraries/${libraryId}/document-tree`),
+  versionDocumentTree: (versionId: string) => request<DocumentTreeNode[]>(`/versions/${versionId}/document-tree`),
+  sectionSubtree: (nodeId: string) => request<DocumentTreeNode[]>(`/document-tree/${nodeId}/subtree`),
+  summaryTree: (libraryId: string) => request<SummaryTreeNode[]>(`/libraries/${libraryId}/summary-tree`),
   reanalyze: (versionId: string) => request<IngestJob>(`/versions/${versionId}/reanalyze`, { method: "POST" }),
   runMappingAudit: (versionId: string) =>
     request<MappingAudit>(`/versions/${versionId}/mapping-audit`, { method: "POST" }),
@@ -172,6 +179,8 @@ export const api = {
     }),
   pulses: (libraryId: string) => request<Pulse[]>(`/libraries/${libraryId}/pulses`),
   pulse: (libraryId: string, pulseId: string) => request<PulseResponse>(`/libraries/${libraryId}/pulses/${pulseId}`),
+  pulseEvidencePack: (libraryId: string, pulseId: string) =>
+    request<EvidencePack>(`/libraries/${libraryId}/pulses/${pulseId}/evidence-pack`),
   clearPulses: (libraryId: string) =>
     request<{ deleted: number }>(`/libraries/${libraryId}/pulses`, { method: "DELETE" }),
   createPulse: (libraryId: string, question: string, mode: PulseInputMode = "full") =>
@@ -223,6 +232,13 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ title, summary }),
     }),
+  nodeEvidenceDetail: (nodeId: string) =>
+    request<{
+      node: AbstractNode;
+      relations: Relation[];
+      treeNodes: DocumentTreeNode[];
+      parentChunks: EvidencePack["parentChunks"];
+    }>(`/nodes/${nodeId}/evidence-detail`),
   updateNodeFields: (nodeId: string, values: { title?: string; summary?: string }) =>
     request<AbstractNode>(`/nodes/${nodeId}`, {
       method: "PATCH",

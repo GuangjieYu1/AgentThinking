@@ -902,3 +902,85 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   padding: 9px;
   border-radius: 7px;
 }
+
+.workspace-panel, .node-evidence-detail {
+  border: 1px solid #202d44;
+  background: #0c1628;
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+.workspace-panel h3, .node-evidence-detail h3 { margin: 0; font-size: 14px; }
+.document-tree-list, .evidence-table {
+  display: grid;
+  gap: 6px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.document-tree-list button, .evidence-table button {
+  text-align: left;
+  border: 1px solid #20304a;
+  background: #101b2f;
+  color: #dbe7f6;
+  border-radius: 7px;
+  padding: 8px 10px;
+  display: grid;
+  gap: 4px;
+}
+.document-tree-list button.selected, .evidence-table button:hover {
+  border-color: #58d5bd;
+  background: #12342f;
+}
+.document-tree-list button.has-evidence {
+  box-shadow: inset 3px 0 0 #e7b84d;
+}
+.document-tree-list span, .evidence-table span {
+  color: #79ddc6;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.document-tree-list strong, .evidence-table strong {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.document-tree-list small, .evidence-table small, .retrieval-step small, .evidence-gaps small {
+  color: #91a3bd;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.reconciliation-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  font-size: 11px;
+}
+.reconciliation-strip span, .reconciliation-strip strong {
+  border: 1px solid #263750;
+  border-radius: 6px;
+  padding: 6px;
+  color: #b7c7df;
+  background: #101b2f;
+}
+.evidence-gaps {
+  border-top: 1px solid #202d44;
+  padding-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+.evidence-gaps strong { color: #e7b84d; font-size: 12px; }
+.retrieval-trace-panel {
+  max-height: 520px;
+  overflow-y: auto;
+}
+.retrieval-step {
+  border-left: 2px solid #526178;
+  padding: 8px 0 8px 10px;
+  display: grid;
+  gap: 4px;
+}
+.retrieval-step span { color: #79ddc6; font-size: 12px; }
+.retrieval-step strong { color: #dce7f5; font-size: 12px; line-height: 1.4; }
+.retrieval-success { border-left-color: #43cca0; }
+.retrieval-empty { border-left-color: #e7a93c; }
+.retrieval-error { border-left-color: #ec6f86; }

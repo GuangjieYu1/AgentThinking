@@ -304,7 +304,30 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     const source = db.getVersionSource(request.params.versionId);
     if (!source) throw new Error("导入版本不存在");
     requireLibrary(db, source.libraryId, request.user);
-    return db.getSourceStructure(request.params.versionId);
+    return {
+      ...db.getSourceStructure(request.params.versionId),
+      documentTree: db.getDocumentTreeForVersion(request.params.versionId),
+      summaryTree: db.getSummaryTreeForVersion(request.params.versionId),
+    };
+  });
+  app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/document-tree", async (request) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    return db.getDocumentTreeForVersion(request.params.versionId);
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/document-tree", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    return db.getDocumentTreeForLibrary(request.params.libraryId);
+  });
+  app.get<{ Params: { nodeId: string } }>("/api/document-tree/:nodeId/subtree", async (request) => {
+    const nodes = db.getSectionSubtree(request.params.nodeId);
+    requireLibraryAccess(db, nodes[0]?.libraryId, request.user);
+    return nodes;
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/summary-tree", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    return db.getSummaryTreeForLibrary(request.params.libraryId);
   });
   app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/mapping-audit", async (request, reply) => {
     const source = db.getVersionSource(request.params.versionId);
@@ -495,6 +518,12 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     if (!response) return reply.status(404).send({ error: "脉冲不存在" });
     return response;
   });
+  app.get<{ Params: { libraryId: string; pulseId: string } }>("/api/libraries/:libraryId/pulses/:pulseId/evidence-pack", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    const pulse = db.getPulse(request.params.pulseId);
+    if (!pulse || pulse.libraryId !== request.params.libraryId) return reply.status(404).send({ error: "脉冲不存在" });
+    return db.getPulseEvidencePack(request.params.pulseId) ?? { error: "该脉冲没有证据包" };
+  });
   app.patch<{ Params: { pulseId: string } }>("/api/pulses/:pulseId/review", async (request, reply) => {
     const { status } = reviewPulseSchema.parse(request.body);
     const existing = db.getPulse(request.params.pulseId);
@@ -512,6 +541,19 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       ...(body.title !== undefined ? { title: body.title } : {}),
       ...(body.summary !== undefined ? { summary: body.summary } : {}),
     });
+  });
+  app.get<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/evidence-detail", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
+    const node = db.getAbstractNode(request.params.nodeId);
+    if (!node) throw new Error("抽象节点不存在");
+    const chunkIds = node.citations.map((citation) => citation.chunkId);
+    const parentChunks = db.getParentChildChunks(chunkIds);
+    const treeNodes = db.getDocumentTreeNodesByIds([
+      ...(node.evidenceNodeIds ?? []),
+      ...parentChunks.map((link) => link.documentTreeNodeId),
+    ]);
+    const relations = db.getIncidentRelations(node.libraryId, [node.id]);
+    return { node, relations, treeNodes, parentChunks };
   });
   app.post<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/evidence", async (request) => {
     requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);

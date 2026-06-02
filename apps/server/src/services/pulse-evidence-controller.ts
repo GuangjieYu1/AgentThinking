@@ -1,6 +1,8 @@
 import type {
   AbstractNode,
   Chunk,
+  EvidenceCitation,
+  EvidencePack,
   PulseAnswerOutput,
   PulseEvidenceMemory,
   PulseEvidencePlan,
@@ -14,6 +16,7 @@ import type {
   PulseVerificationResult,
   Relation,
   SearchResult,
+  SummaryTreeNode,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
@@ -37,19 +40,51 @@ export interface PulseSeedContext {
 
 export interface PulseEvidenceControllerResult extends PulseAnswerOutput {
   hits: PendingPulseHit[];
+  evidencePack: EvidencePack;
 }
 
 const allowedTools: PulseEvidenceTool[] = [
+  "semanticSearchChildChunks",
+  "fullTextSearchChildChunks",
+  "retrieveParentChunks",
+  "retrieveDocumentTreeNodes",
+  "retrieveSectionSubtree",
+  "retrieveSiblingNodes",
+  "retrieveRemainingNodesAfter",
+  "retrieveSummaryTree",
+  "graphSearch",
+  "graphExpand",
+  "retrieveEvidenceForGraphNodes",
+  "buildEvidencePack",
   "semanticSearch",
   "fullTextSearch",
-  "graphExpand",
   "readChunks",
   "readNeighborChunks",
   "readSameSectionChunks",
+  "readRemainingChunksAfter",
   "getDocumentOutline",
   "getChunkEvidenceAround",
   "getGraphContext",
 ];
+
+const toolAliases = new Map<PulseEvidenceTool, PulseEvidenceTool>([
+  ["semanticSearch", "semanticSearchChildChunks"],
+  ["fullTextSearch", "fullTextSearchChildChunks"],
+  ["readNeighborChunks", "retrieveSiblingNodes"],
+  ["readSameSectionChunks", "retrieveSectionSubtree"],
+  ["readRemainingChunksAfter", "retrieveRemainingNodesAfter"],
+  ["getDocumentOutline", "retrieveDocumentTreeNodes"],
+  ["getChunkEvidenceAround", "retrieveParentChunks"],
+  ["getGraphContext", "graphSearch"],
+  ["readChunks", "retrieveParentChunks"],
+]);
+
+const continuationGapTypes = new Set<PulseEvidenceStatus["gaps"][number]["type"]>([
+  "missing_itemized_evidence",
+  "declared_total_without_breakdown",
+  "sum_mismatch",
+  "missing_entity_coverage",
+]);
 
 function clampScore(value: number): number {
   if (!Number.isFinite(value)) return 0.5;
@@ -69,10 +104,14 @@ function relationLabel(relation: Relation, nodes: Map<string, AbstractNode>): st
 function compactChunk(chunk: Chunk): PulseEvidenceMemory["collectedChunks"][number] {
   return {
     id: chunk.id,
+    versionId: chunk.versionId,
     text: chunk.text.slice(0, 1600),
     headingPath: chunk.headingPath,
     pageNumber: chunk.pageNumber,
     ordinal: chunk.ordinal,
+    parentChunkId: chunk.parentChunkId ?? null,
+    documentTreeNodeId: chunk.documentTreeNodeId ?? null,
+    nodeType: chunk.nodeType ?? null,
   };
 }
 
@@ -203,20 +242,31 @@ export class PulseEvidenceController {
       memorySummary: this.memorySummary(memory),
       tools: allowedTools,
     });
+    const defaultMaxIterations = mode === "progressive"
+      ? questionPlan.riskLevel === "high" && questionPlan.requiresExhaustiveEvidence ? 6 : 5
+      : 2;
     const maxIterations = Math.min(
-      mode === "progressive" ? 4 : 2,
-      Math.max(1, initialPlan.maxIterations || (mode === "progressive" ? 4 : 2)),
+      defaultMaxIterations,
+      Math.max(mode === "progressive" ? defaultMaxIterations : 1, initialPlan.maxIterations || defaultMaxIterations),
     );
     let plan: PulseEvidencePlan = initialPlan;
     let status: PulseEvidenceStatus | undefined;
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       await eventSink?.({ type: "stage", message: `正在执行证据检索第 ${iteration + 1} 轮` });
-      const steps = this.validSteps(plan).slice(0, mode === "progressive" ? 4 : 8);
+      const chunkIdsBeforeIteration = new Set(memory.collectedChunks.map((chunk) => chunk.id));
+      const rowsBeforeIteration = memory.evidenceRows.length;
+      const steps = this.validSteps(plan).slice(0, mode === "progressive" ? 5 : 8);
       for (const step of steps) {
         const chunks = await this.executeStep(libraryId, question, step, memory, hitMap, mode, iteration + 1);
-        if (chunks.length > 0) await this.extractRowsForChunks(question, memory, step.purpose, chunks);
+        if (chunks.length > 0) {
+          const addedRows = await this.extractRowsForChunks(question, memory, step.purpose, chunks);
+          const latestTrace = memory.retrievalTrace?.at(-1);
+          if (latestTrace && latestTrace.tool === step.tool) latestTrace.newEvidenceRowCount = addedRows;
+        }
       }
+      const newChunkCount = memory.collectedChunks.filter((chunk) => !chunkIdsBeforeIteration.has(chunk.id)).length;
+      const newRowCount = memory.evidenceRows.length - rowsBeforeIteration;
       const reconciliation = computePulseReconciliation(memory.evidenceRows);
       status = await this.model.judgePulseEvidenceSufficiency({
         question,
@@ -227,19 +277,11 @@ export class PulseEvidenceController {
       memory.sufficiencyHistory.push(status);
       memory.gaps = status.gaps;
       if (status.sufficient) break;
-      const gapQueries = status.gaps.flatMap((gap) => gap.suggestedQueries).filter(Boolean);
-      if (mode === "full" && iteration >= 0 && gapQueries.length === 0) break;
-      if (gapQueries.length === 0) continue;
-      plan = {
-        objective: "Retrieve evidence for sufficiency gaps.",
-        steps: gapQueries.slice(0, mode === "progressive" ? 4 : 6).flatMap((query) => [
-          { tool: "semanticSearch", query, purpose: "Gap retrieval from sufficiency judge.", expectedResult: "Additional source chunks for the gap." },
-          { tool: "fullTextSearch", query, purpose: "Literal gap retrieval from sufficiency judge.", expectedResult: "Exact source matches for the gap." },
-        ]),
-        stopCondition: "Stop when gaps are closed or must be exposed.",
-        expectedEvidenceShape: "Additional cited chunks and EvidenceRows for gaps.",
-        maxIterations,
-      };
+      if (iteration + 1 >= maxIterations) break;
+      if (iteration > 0 && (newChunkCount === 0 || newRowCount === 0)) break;
+      const nextPlan = this.buildGapContinuationPlan(question, mode, memory, status, maxIterations);
+      if (nextPlan.steps.length === 0) break;
+      plan = nextPlan;
     }
 
     const finalStatus = status ?? {
@@ -273,7 +315,7 @@ export class PulseEvidenceController {
     if (!verification.passed) {
       output = this.guardedAnswer(question, memory, finalStatus, verification);
     }
-    return { ...output, hits: [...hitMap.values()] };
+    return { ...output, hits: [...hitMap.values()], evidencePack: this.buildEvidencePack(question, memory, finalStatus) };
   }
 
   private createMemory(question: string, questionPlan: PulseQuestionPlan, seed: PulseSeedContext): PulseEvidenceMemory {
@@ -293,9 +335,13 @@ export class PulseEvidenceController {
       collectedChunks: [...chunkMap.values()],
       graphNodes: [...nodeMap.values()],
       graphRelations: [...relationMap.values()],
+      treeNodes: [],
+      parentChunks: [],
+      summaryNodes: [],
       evidenceRows: [],
       citedChunkIds: [],
       retrievalHistory: [],
+      retrievalTrace: [],
       currentFindings: [],
       gaps: [],
       sufficiencyHistory: [],
@@ -304,7 +350,15 @@ export class PulseEvidenceController {
 
   private validSteps(plan: PulseEvidencePlan): PulseEvidenceStep[] {
     const allowed = new Set<PulseEvidenceTool>(allowedTools);
-    return plan.steps.filter((step) => allowed.has(step.tool));
+    return plan.steps.flatMap((step) => {
+      const tool = toolAliases.get(step.tool) ?? step.tool;
+      return allowed.has(tool) ? [{ ...step, tool }] : [];
+    });
+  }
+
+  private evidenceChunkLimit(mode: PulseInputMode, memory: PulseEvidenceMemory): number {
+    if (mode !== "progressive") return 12;
+    return memory.questionPlan.riskLevel === "high" && memory.questionPlan.requiresExhaustiveEvidence ? 12 : 10;
   }
 
   private async executeStep(
@@ -316,40 +370,98 @@ export class PulseEvidenceController {
     mode: PulseInputMode,
     iteration: number,
   ): Promise<Chunk[]> {
-    const limit = mode === "progressive" ? 6 : 12;
+    const limit = this.evidenceChunkLimit(mode, memory);
     const query = step.query?.trim() || question;
     let chunks: Chunk[] = [];
-    if (step.tool === "semanticSearch") {
+    const rowCountBefore = memory.evidenceRows.length;
+    const inputIds = [...(step.basedOnChunkIds ?? []), ...(step.basedOnNodeIds ?? [])];
+    if (step.tool === "semanticSearchChildChunks") {
       const [embedding] = await this.model.embed([query]);
       chunks = embedding ? this.vectors.search(libraryId, embedding, limit).map((result) => result.chunk) : [];
-    } else if (step.tool === "fullTextSearch") {
+    } else if (step.tool === "fullTextSearchChildChunks") {
       chunks = this.mergeResults([
         ...this.db.searchText(libraryId, query, limit),
         ...this.db.searchChunksFuzzy(libraryId, query, limit),
       ], limit).map((result) => result.chunk);
-    } else if (step.tool === "readChunks") {
+    } else if (step.tool === "retrieveParentChunks") {
       chunks = this.db.getChunksByIds(step.basedOnChunkIds ?? memory.collectedChunks.slice(0, limit).map((chunk) => chunk.id));
-    } else if (step.tool === "readNeighborChunks") {
-      chunks = this.db.getNeighborChunks(step.basedOnChunkIds ?? memory.collectedChunks.slice(0, limit).map((chunk) => chunk.id), mode === "progressive" ? 1 : 2).slice(0, mode === "progressive" ? 8 : 30);
-    } else if (step.tool === "readSameSectionChunks") {
-      chunks = this.db.getSameSectionChunks(step.basedOnChunkIds ?? memory.collectedChunks.slice(0, limit).map((chunk) => chunk.id), mode === "progressive" ? 8 : 30);
+      const parentLinks = this.db.getParentChildChunks(chunks.map((chunk) => chunk.id));
+      this.addParentChunks(memory, parentLinks);
+      chunks = this.mergeChunkList([
+        ...chunks,
+        ...this.db.getChunksByIds(parentLinks.map((link) => link.parentChunkId)),
+      ], mode === "progressive" ? limit : 30);
+    } else if (step.tool === "retrieveSiblingNodes") {
+      chunks = this.db.getNeighborChunks(step.basedOnChunkIds ?? memory.collectedChunks.slice(0, limit).map((chunk) => chunk.id), mode === "progressive" ? 1 : 2).slice(0, mode === "progressive" ? limit : 30);
+      const siblingNodeIds = [...new Set(chunks.flatMap((chunk) => chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : []))];
+      this.addTreeNodes(memory, siblingNodeIds.flatMap((id) => this.db.getSiblingTreeNodes(id, 3)));
+    } else if (step.tool === "retrieveSectionSubtree") {
+      chunks = this.db.getSameSectionChunks(step.basedOnChunkIds ?? memory.collectedChunks.slice(0, limit).map((chunk) => chunk.id), mode === "progressive" ? limit : 30);
+      const sectionIds = [...new Set(chunks.flatMap((chunk) => chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : []))];
+      this.addTreeNodes(memory, sectionIds.flatMap((id) => {
+        const node = this.db.getDocumentTreeNodesByIds([id])[0];
+        const sectionId = node?.nodeType === "section" ? node.id : node?.parentId;
+        return sectionId ? this.db.getSectionSubtree(sectionId) : [];
+      }));
+    } else if (step.tool === "retrieveRemainingNodesAfter") {
+      const anchors = this.db.getChunksByIds(step.basedOnChunkIds ?? this.continuationAnchorIds(memory, mode));
+      const byId = new Map<string, Chunk>();
+      for (const anchor of anchors) {
+        for (const chunk of this.db.getRemainingChunksAfter(anchor.versionId, anchor.id, limit)) {
+          if (!byId.has(chunk.id)) byId.set(chunk.id, chunk);
+        }
+        if (anchor.documentTreeNodeId) this.addTreeNodes(memory, this.db.getRemainingTreeNodesAfter(anchor.documentTreeNodeId, limit));
+      }
+      chunks = [...byId.values()].sort((left, right) => left.ordinal - right.ordinal).slice(0, limit);
     } else if (step.tool === "graphExpand") {
       chunks = this.graphExpand(libraryId, step.basedOnNodeIds ?? memory.graphNodes.map((node) => node.id).slice(0, 12), memory, hitMap, iteration);
-    } else if (step.tool === "getChunkEvidenceAround") {
-      chunks = this.mergeResults([
-        ...this.db.searchText(libraryId, query, limit),
-        ...this.db.searchChunksFuzzy(libraryId, query, limit),
-      ], limit).map((result) => result.chunk);
-      chunks = this.db.getNeighborChunks(chunks.map((chunk) => chunk.id), 1).slice(0, mode === "progressive" ? 8 : 24);
-    } else if (step.tool === "getGraphContext") {
+    } else if (step.tool === "graphSearch") {
       chunks = this.getGraphContext(libraryId, query, memory, hitMap, iteration);
-    } else if (step.tool === "getDocumentOutline") {
+    } else if (step.tool === "retrieveEvidenceForGraphNodes") {
+      chunks = (step.basedOnNodeIds ?? memory.graphNodes.map((node) => node.id).slice(0, 12))
+        .flatMap((nodeId) => this.db.getNodeEvidenceChunks(nodeId, 4));
+    } else if (step.tool === "retrieveDocumentTreeNodes") {
+      const treeNodes = this.db.searchDocumentTreeNodes(libraryId, query, limit);
+      this.addTreeNodes(memory, treeNodes);
+      chunks = this.db.getChunksByIds(treeNodes.flatMap((node) => node.sourceChunkIds)).slice(0, limit);
       const outline = this.db.getDocumentOutlineForLibrary(libraryId);
-      memory.currentFindings.push(`Document outline entries: ${outline.slice(0, 20).map((entry) => `${entry.documentName}/${entry.headingPath ?? "untitled"}(${entry.chunkCount})`).join("; ")}`);
+      memory.currentFindings.push(`Document tree entries: ${outline.slice(0, 20).map((entry) => `${entry.documentName}/${entry.headingPath ?? "untitled"}(${entry.chunkCount})`).join("; ")}`);
+    } else if (step.tool === "retrieveSummaryTree") {
+      let summaries: SummaryTreeNode[] = [];
+      const [embedding] = await this.model.embed([query]);
+      if (embedding) summaries = this.vectors.searchSummaries(libraryId, embedding, limit).map((result) => result.summary);
+      summaries = this.mergeSummaries([...summaries, ...this.db.searchSummaryTree(libraryId, query, limit)], limit);
+      this.addSummaryNodes(memory, summaries);
+      const sourceNodeIds = [...new Set(summaries.flatMap((summary) => summary.sourceNodeIds))];
+      const treeNodes = this.db.getDocumentTreeNodesByIds(sourceNodeIds);
+      this.addTreeNodes(memory, treeNodes);
+      chunks = this.db.getChunksByIds(treeNodes.flatMap((node) => node.sourceChunkIds)).slice(0, limit);
+    } else if (step.tool === "buildEvidencePack") {
+      chunks = [];
     }
+    const parentLinks = this.db.getParentChildChunks(chunks.map((chunk) => chunk.id));
+    this.addParentChunks(memory, parentLinks);
+    this.addTreeNodes(memory, this.db.getDocumentTreeNodesByIds([
+      ...chunks.flatMap((chunk) => chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : []),
+      ...parentLinks.map((link) => link.documentTreeNodeId),
+    ]));
     this.addChunks(memory, chunks);
     memory.retrievalHistory.push({ tool: step.tool, ...(step.query ? { query: step.query } : {}), chunkIds: chunks.map((chunk) => chunk.id), purpose: step.purpose });
     for (const chunk of chunks) this.addChunkHit(hitMap, chunk, step, iteration);
+    memory.retrievalTrace ??= [];
+    memory.retrievalTrace.push({
+      stepIndex: 20 + iteration,
+      tool: step.tool,
+      purpose: step.purpose,
+      ...(step.query ? { query: step.query } : {}),
+      inputIds,
+      outputIds: [
+        ...chunks.map((chunk) => chunk.id),
+        ...(memory.summaryNodes ?? []).slice(-limit).map((summary) => summary.id),
+      ],
+      newEvidenceRowCount: Math.max(0, memory.evidenceRows.length - rowCountBefore),
+      status: chunks.length > 0 || (memory.summaryNodes ?? []).length > 0 ? "success" : "empty",
+    });
     return chunks;
   }
 
@@ -439,7 +551,7 @@ export class PulseEvidenceController {
     memory: PulseEvidenceMemory,
     purpose: string,
     chunks = memory.collectedChunks,
-  ): Promise<void> {
+  ): Promise<number> {
     const supplied = chunks.map((chunk) => ({
       id: chunk.id,
       text: chunk.text.slice(0, 1800),
@@ -454,13 +566,99 @@ export class PulseEvidenceController {
       existingRows: memory.evidenceRows,
     });
     const existing = new Set(memory.evidenceRows.map(rowDedupeKey));
+    let added = 0;
     for (const row of rows) {
       const key = rowDedupeKey(row);
       if (existing.has(key)) continue;
       existing.add(key);
       memory.evidenceRows.push(row);
+      added += 1;
       if (!memory.citedChunkIds.includes(row.evidenceChunkId)) memory.citedChunkIds.push(row.evidenceChunkId);
     }
+    return added;
+  }
+
+  private continuationAnchorIds(memory: PulseEvidenceMemory, mode: PulseInputMode): string[] {
+    const evidenceIds = new Set(memory.evidenceRows.map((row) => row.evidenceChunkId));
+    const candidateIds = [...new Set([
+      ...memory.evidenceRows.map((row) => row.evidenceChunkId),
+      ...memory.citedChunkIds,
+      ...memory.collectedChunks.map((chunk) => chunk.id),
+    ])];
+    const chunks = this.db.getChunksByIds(candidateIds);
+    const limit = mode === "progressive" ? 4 : 2;
+    return chunks
+      .sort((left, right) => {
+        const evidenceWeight = Number(evidenceIds.has(right.id)) - Number(evidenceIds.has(left.id));
+        if (evidenceWeight !== 0) return evidenceWeight;
+        return right.ordinal - left.ordinal;
+      })
+      .slice(0, limit)
+      .map((chunk) => chunk.id);
+  }
+
+  private buildGapContinuationPlan(
+    question: string,
+    mode: PulseInputMode,
+    memory: PulseEvidenceMemory,
+    status: PulseEvidenceStatus,
+    maxIterations: number,
+  ): PulseEvidencePlan {
+    const gapQueries = [...new Set(status.gaps.flatMap((gap) => gap.suggestedQueries).map((query) => query.trim()).filter(Boolean))];
+    const hasContinuationGap = status.gaps.some((gap) => continuationGapTypes.has(gap.type));
+    const anchors = this.continuationAnchorIds(memory, mode);
+    const steps: PulseEvidenceStep[] = [];
+    if (hasContinuationGap && anchors.length > 0) {
+      steps.push(
+        {
+          tool: "retrieveRemainingNodesAfter",
+          basedOnChunkIds: anchors,
+          purpose: "Continue reading after the latest covered source chunks for unresolved exhaustive evidence gaps.",
+          expectedResult: "Later chunks from the same document version that may contain remaining itemized evidence.",
+        },
+        {
+          tool: "retrieveSectionSubtree",
+          basedOnChunkIds: anchors,
+          purpose: "Read the same source section to recover omitted list items or adjacent facts.",
+          expectedResult: "All available chunks in the same section as already cited evidence.",
+        },
+        {
+          tool: "retrieveSiblingNodes",
+          basedOnChunkIds: anchors,
+          purpose: "Read neighboring chunks around cited evidence for continuation context.",
+          expectedResult: "Immediate neighboring source chunks around the gap anchors.",
+        },
+      );
+    }
+    if (anchors.length > 0 && steps.length === 0 && status.status !== "partial_answer_only") {
+      steps.push({
+        tool: "retrieveSiblingNodes",
+        basedOnChunkIds: anchors,
+        purpose: "Read nearby chunks for unresolved sufficiency gaps.",
+        expectedResult: "Adjacent chunks that may close remaining evidence gaps.",
+      });
+    }
+    for (const query of gapQueries.slice(0, mode === "progressive" ? 3 : 4)) {
+      steps.push(
+        { tool: "semanticSearchChildChunks", query, purpose: "Secondary gap retrieval from sufficiency judge.", expectedResult: "Additional source chunks for the gap." },
+        { tool: "fullTextSearchChildChunks", query, purpose: "Secondary literal gap retrieval from sufficiency judge.", expectedResult: "Exact source matches for the gap." },
+      );
+    }
+    if (steps.length === 0 && status.status === "needs_gap_retrieval" && anchors.length > 0) {
+      steps.push({
+        tool: "retrieveParentChunks",
+        basedOnChunkIds: anchors,
+        purpose: "Re-read anchored chunks before deciding the gap cannot continue.",
+        expectedResult: "Previously anchored source chunks for final extraction pass.",
+      });
+    }
+    return {
+      objective: "Continue generic retrieval for unresolved sufficiency gaps.",
+      steps,
+      stopCondition: "Stop when gaps are closed, retrieval returns no new chunks, no new EvidenceRows are extracted, or budget is exhausted.",
+      expectedEvidenceShape: "Additional cited chunks and EvidenceRows for unresolved gaps.",
+      maxIterations,
+    };
   }
 
   private addChunks(memory: PulseEvidenceMemory, chunks: Chunk[]): void {
@@ -469,6 +667,36 @@ export class PulseEvidenceController {
       if (existing.has(chunk.id)) continue;
       existing.add(chunk.id);
       memory.collectedChunks.push(compactChunk(chunk));
+    }
+  }
+
+  private addTreeNodes(memory: PulseEvidenceMemory, nodes: NonNullable<PulseEvidenceMemory["treeNodes"]>): void {
+    memory.treeNodes ??= [];
+    const existing = new Set(memory.treeNodes.map((node) => node.id));
+    for (const node of nodes) {
+      if (existing.has(node.id)) continue;
+      existing.add(node.id);
+      memory.treeNodes.push(node);
+    }
+  }
+
+  private addParentChunks(memory: PulseEvidenceMemory, links: NonNullable<PulseEvidenceMemory["parentChunks"]>): void {
+    memory.parentChunks ??= [];
+    const existing = new Set(memory.parentChunks.map((link) => link.childChunkId));
+    for (const link of links) {
+      if (existing.has(link.childChunkId)) continue;
+      existing.add(link.childChunkId);
+      memory.parentChunks.push(link);
+    }
+  }
+
+  private addSummaryNodes(memory: PulseEvidenceMemory, summaries: NonNullable<PulseEvidenceMemory["summaryNodes"]>): void {
+    memory.summaryNodes ??= [];
+    const existing = new Set(memory.summaryNodes.map((summary) => summary.id));
+    for (const summary of summaries) {
+      if (existing.has(summary.id)) continue;
+      existing.add(summary.id);
+      memory.summaryNodes.push(summary);
     }
   }
 
@@ -496,6 +724,18 @@ export class PulseEvidenceController {
       if (!previous || result.score > previous.score) byId.set(result.chunk.id, result);
     }
     return [...byId.values()].sort((left, right) => right.score - left.score).slice(0, limit);
+  }
+
+  private mergeChunkList(chunks: Chunk[], limit: number): Chunk[] {
+    const byId = new Map<string, Chunk>();
+    for (const chunk of chunks) if (!byId.has(chunk.id)) byId.set(chunk.id, chunk);
+    return [...byId.values()].sort((left, right) => left.ordinal - right.ordinal).slice(0, limit);
+  }
+
+  private mergeSummaries(summaries: SummaryTreeNode[], limit: number): SummaryTreeNode[] {
+    const byId = new Map<string, SummaryTreeNode>();
+    for (const summary of summaries) if (!byId.has(summary.id)) byId.set(summary.id, summary);
+    return [...byId.values()].slice(0, limit);
   }
 
   private memorySummary(memory: PulseEvidenceMemory): PulseEvidenceMemory {
@@ -533,6 +773,48 @@ export class PulseEvidenceController {
         citedChunkIds: memory.citedChunkIds,
         warnings: [...(output.diagnostics?.warnings ?? []), ...warnings],
       },
+    };
+  }
+
+  private buildEvidencePack(
+    question: string,
+    memory: PulseEvidenceMemory,
+    evidenceStatus: PulseEvidenceStatus,
+  ): EvidencePack {
+    const treeNodes = memory.treeNodes ?? [];
+    const nodeById = new Map(treeNodes.map((node) => [node.id, node]));
+    const chunkById = new Map(memory.collectedChunks.map((chunk) => [chunk.id, chunk]));
+    const citations: EvidenceCitation[] = memory.evidenceRows.flatMap((row) => {
+      const chunk = chunkById.get(row.evidenceChunkId);
+      const treeNodeId = row.treeNodeId ?? chunk?.documentTreeNodeId ?? null;
+      const treeNode = treeNodeId ? nodeById.get(treeNodeId) : undefined;
+      return [{
+        chunkId: row.evidenceChunkId,
+        treeNodeId,
+        quote: row.evidenceQuote,
+        headingPath: treeNode?.headingPath ?? chunk?.headingPath ?? null,
+        pageNumber: chunk?.pageNumber ?? null,
+      }];
+    });
+    return {
+      id: `evidence-pack-${Date.now()}`,
+      question,
+      treeNodes,
+      parentChunks: memory.parentChunks ?? [],
+      semanticNodes: memory.graphNodes.flatMap((node) => {
+        const full = this.db.getAbstractNode(node.id);
+        return full ? [full] : [];
+      }),
+      semanticRelations: memory.graphRelations.flatMap((relation) => {
+        const full = this.db.getRelation(relation.id);
+        return full ? [full] : [];
+      }),
+      summaryNodes: memory.summaryNodes ?? [],
+      evidenceRows: memory.evidenceRows,
+      citations,
+      gaps: evidenceStatus.gaps,
+      retrievalTrace: memory.retrievalTrace ?? [],
+      ...(evidenceStatus.reconciliation ? { reconciliation: evidenceStatus.reconciliation } : {}),
     };
   }
 

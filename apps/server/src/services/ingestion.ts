@@ -3,7 +3,8 @@ import { readFile } from "node:fs/promises";
 import type { Chunk, GraphRulesSummary, IngestJob } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 import { AgentDatabase } from "../db.js";
-import { chunkSections, parseTextSections } from "../domain/chunker.js";
+import { parseTextSections } from "../domain/chunker.js";
+import { buildDocumentIndex } from "../domain/document-tree.js";
 import { isWordMediaType } from "../domain/files.js";
 import { parseMarkdownStructure } from "../domain/source-structure.js";
 import type { GraphRulesResult } from "./graphRules.js";
@@ -170,27 +171,42 @@ export class IngestionQueue extends EventEmitter {
       }
 
       this.setStage(jobId, "chunking", 0.34);
-      const chunks = this.db.replaceChunks(source.libraryId, source.version.id, chunkSections(sections));
+      const documentIndex = buildDocumentIndex({
+        libraryId: source.libraryId,
+        documentId: source.documentId,
+        versionId: source.version.id,
+        documentName: source.documentName,
+        sections,
+      });
+      const chunks = this.db.replaceChunks(source.libraryId, source.version.id, documentIndex.chunks);
+      this.db.saveDocumentIndex(documentIndex, chunks);
       if (chunks.length === 0) throw new Error("文档中没有可处理的文本内容");
 
       this.setStage(jobId, "embedding", 0.48);
-      for (let start = 0; start < chunks.length; start += 32) {
-        const batch = chunks.slice(start, start + 32);
+      const childChunks = chunks.filter((chunk) => chunk.nodeType === null || chunk.nodeType === "paragraph" || chunk.nodeType === "sentence" || chunk.nodeType === "unknown");
+      for (let start = 0; start < childChunks.length; start += 32) {
+        const batch = childChunks.slice(start, start + 32);
         const embeddings = await this.model.embed(batch.map((chunk) => chunk.text));
         if (embeddings.length !== batch.length) throw new Error("Embedding 返回数量与 chunk 不一致");
         batch.forEach((chunk, index) => this.vectors.save(chunk, embeddings[index] ?? []));
       }
+      for (let start = 0; start < documentIndex.summaryNodes.length; start += 32) {
+        const batch = documentIndex.summaryNodes.slice(start, start + 32);
+        const embeddings = await this.model.embed(batch.map((summary) => summary.summary));
+        if (embeddings.length !== batch.length) throw new Error("Summary embedding 返回数量与 summary 不一致");
+        batch.forEach((summary, index) => this.vectors.saveSummary(source.libraryId, summary, embeddings[index] ?? []));
+      }
 
       this.setStage(jobId, "extracting", 0.7);
-      const currentVersionChunkIds = new Set(chunks.map((chunk) => chunk.id));
+      const currentVersionChunkIds = new Set(childChunks.map((chunk) => chunk.id));
       const affectedExistingChunks = new Map<string, { chunk: Chunk; newContext: Map<string, Chunk> }>();
       const neighboringChunks = (chunk: Chunk) => chunks.filter((candidate) => (
         candidate.id !== chunk.id && Math.abs(candidate.ordinal - chunk.ordinal) <= 1
       ));
-      const primaryBatchCount = Math.max(1, Math.ceil(chunks.length / 10));
-      for (let start = 0; start < chunks.length; start += 10) {
+      const primaryBatchCount = Math.max(1, Math.ceil(childChunks.length / 10));
+      for (let start = 0; start < childChunks.length; start += 10) {
         const batchIndex = Math.floor(start / 10) + 1;
-        const batch = chunks.slice(start, start + 10);
+        const batch = childChunks.slice(start, start + 10);
         const related = new Map<string, typeof chunks>();
         for (const chunk of batch) {
           const embedding = await this.model.embed([chunk.text]);

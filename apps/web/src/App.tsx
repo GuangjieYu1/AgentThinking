@@ -3,8 +3,12 @@ import type {
   AuthSession,
   Citation,
   Document,
+  GraphRuleStage,
+  GraphRulesSummary,
+  GraphRuleTrace,
   IngestJob,
   Library,
+  LibraryStreamEvent,
   LibrarySettings,
   MappingAudit,
   MappingAuditFinding,
@@ -39,6 +43,56 @@ const mappingAuditSeverityLabels: Record<MappingAuditFinding["severity"], string
   medium: "中",
   high: "高",
 };
+
+const graphRuleCategoryLabels: Record<NonNullable<MappingAuditFinding["ruleCategory"]>, string> = {
+  graph_validity: "图合法性",
+  relation_algebra: "关系代数",
+  semantic_coverage: "语义覆盖",
+  graph_evolution: "图演化",
+};
+
+const mappingAuditFindingStatusLabels: Record<NonNullable<MappingAuditFinding["status"]>, string> = {
+  open: "待处理",
+  accepted: "已接受",
+  dismissed: "已忽略",
+  fixed: "已修复",
+};
+
+function mappingAuditSeverityCounts(findings: MappingAuditFinding[]): { high: number; medium: number; low: number } {
+  return findings.reduce((counts, finding) => {
+    counts[finding.severity] += 1;
+    return counts;
+  }, { high: 0, medium: 0, low: 0 });
+}
+
+interface RuleGovernanceFeed {
+  stage?: GraphRuleStage;
+  summary?: GraphRulesSummary;
+  traces: GraphRuleTrace[];
+}
+
+function isLegacyJobEvent(value: unknown): value is IngestJob {
+  return Boolean(value && typeof value === "object" && "id" in value && "stage" in value && !("type" in value));
+}
+
+function mergeRuleSummary(current: GraphRulesSummary | undefined, next: GraphRulesSummary): GraphRulesSummary {
+  if (!current) return next;
+  return {
+    totalRelations: next.totalRelations,
+    keptCount: next.keptCount,
+    downgradedCount: next.downgradedCount,
+    excludedCount: next.excludedCount ?? next.droppedCount,
+    droppedCount: next.droppedCount ?? next.excludedCount,
+    reviewCount: next.reviewCount,
+    warningCount: next.warningCount,
+    categoryCounts: {
+      graph_validity: next.categoryCounts.graph_validity,
+      relation_algebra: next.categoryCounts.relation_algebra,
+      semantic_coverage: next.categoryCounts.semantic_coverage,
+      graph_evolution: next.categoryCounts.graph_evolution,
+    },
+  };
+}
 
 export function App() {
   const [libraries, setLibraries] = useState<Library[]>([]);
@@ -286,6 +340,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
     graphRebuildLoading?: boolean;
     audit?: MappingAudit;
   }>();
+  const [ruleGovernanceFeed, setRuleGovernanceFeed] = useState<RuleGovernanceFeed>({ traces: [] });
   const [resourcePanelCollapsed, setResourcePanelCollapsed] = useState(false);
   const activeJobs = useMemo(() => jobs.filter((job) => !["completed", "failed"].includes(job.stage)), [jobs]);
 
@@ -305,13 +360,32 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
     void reload().catch((cause: Error) => onError(cause.message));
     const stream = new EventSource(`/api/libraries/${library.id}/events`);
     stream.onmessage = (event) => {
-      const update = JSON.parse(event.data) as IngestJob | { type: string };
-      if ("id" in update) {
-        setJobs((current) => [update, ...current.filter((job) => job.id !== update.id)]);
-        if (update.stage === "completed") {
+      const update = JSON.parse(event.data) as LibraryStreamEvent | IngestJob;
+      const job = isLegacyJobEvent(update) ? update : "type" in update && update.type === "job" ? update.job : undefined;
+      if (job) {
+        setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+        if (job.stage === "completed") {
           void api.documents(library.id).then(setDocuments);
           setRefreshGraph((value) => value + 1);
         }
+        return;
+      }
+      if (!("type" in update)) return;
+      const streamUpdate = update;
+      if (streamUpdate.type === "graph_rule_trace" || streamUpdate.type === "graph_rebuild_rule_trace") {
+        setRuleGovernanceFeed((current) => ({
+          ...(streamUpdate.stage ?? current.stage ? { stage: streamUpdate.stage ?? current.stage } : {}),
+          summary: mergeRuleSummary(current.summary, streamUpdate.summary),
+          traces: [...current.traces, ...streamUpdate.traces].slice(-20),
+        }));
+        return;
+      }
+      if (streamUpdate.type === "graph_rule_summary" || streamUpdate.type === "graph_rebuild_summary" || streamUpdate.type === "graph_candidate_batch_ready") {
+        setRuleGovernanceFeed((current) => ({
+          ...(streamUpdate.stage ?? current.stage ? { stage: streamUpdate.stage ?? current.stage } : {}),
+          summary: mergeRuleSummary(current.summary, streamUpdate.summary),
+          traces: current.traces,
+        }));
       }
     };
     return () => stream.close();
@@ -586,7 +660,14 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
             <button className={activeWorkspace === "analysis" ? "selected" : ""} onClick={() => setActiveWorkspace("analysis")}>分析笔记审核</button>
           </nav>
           {activeWorkspace === "graph" ? (
-            <GraphWorkspace key={library.id} libraryId={library.id} refreshKey={refreshGraph} onError={onError} onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)} />
+            <GraphWorkspace
+              key={library.id}
+              libraryId={library.id}
+              refreshKey={refreshGraph}
+              ruleGovernanceFeed={ruleGovernanceFeed}
+              onError={onError}
+              onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)}
+            />
           ) : activeWorkspace === "timeline" ? (
             <TimelineWorkspace
               libraryId={library.id}
@@ -640,6 +721,7 @@ function MappingAuditPanel({
   onSaveComment: (findingIndex: number, userComment: string) => Promise<void>;
 }) {
   const audit = view.audit;
+  const findings = Array.isArray(audit?.findings) ? audit.findings : [];
   const summary = audit ? displayMappingAuditSummary(audit) : "";
   const [commentMessage, setCommentMessage] = useState<string>();
   const [savingCommentIndex, setSavingCommentIndex] = useState<number | null>(null);
@@ -666,7 +748,7 @@ function MappingAuditPanel({
           <div className="mapping-audit-actions">
             <button
               className="ghost"
-              disabled={view.loading || view.graphRebuildLoading || !audit || audit.findings.length === 0}
+              disabled={view.loading || view.graphRebuildLoading || !audit || findings.length === 0}
               onClick={onRebuildGraph}
             >
               {view.graphRebuildLoading ? "重构中..." : "重构图谱"}
@@ -684,7 +766,7 @@ function MappingAuditPanel({
           <>
             {commentMessage && <div className="mapping-audit-tool-message">{commentMessage}</div>}
             <section className={`mapping-audit-summary ${audit.status}`}>
-              <span>{mappingAuditStatusLabels[audit.status]}</span>
+              <MappingAuditSeverityPills audit={audit} findings={findings} />
               <p>{summary}</p>
               {audit.status === "failed" && (
                 <p className="mapping-audit-failure-note">语义重构会尽量保留；失败通常来自模型结构化输出异常，不会修改你的原文或图谱。</p>
@@ -710,13 +792,17 @@ function MappingAuditPanel({
             </section>
             <section className="mapping-audit-findings">
               <h3>发现的问题</h3>
-              {audit.findings.length === 0 ? (
+              {findings.length === 0 ? (
                 <p className="muted">没有发现明显语义分歧。</p>
-              ) : audit.findings.map((finding, index) => (
+              ) : findings.map((finding, index) => (
                 <article className={`mapping-finding ${finding.severity}`} key={`${finding.kind}-${index}`}>
                   <div className="mapping-finding-heading">
                     <strong>{finding.title}</strong>
                     <span>{mappingAuditKindLabels[finding.kind]} / {mappingAuditSeverityLabels[finding.severity]}</span>
+                  </div>
+                  <div className="mapping-finding-tags">
+                    <span>{graphRuleCategoryLabels[finding.ruleCategory ?? "semantic_coverage"]}</span>
+                    <span>{mappingAuditFindingStatusLabels[finding.status ?? "open"]}</span>
                   </div>
                   <p>{displayMappingAuditText(finding.description, "模型结构化输出校验失败，无法展示可靠说明，请重新运行审计。")}</p>
                   <small>{displayMappingAuditText(finding.suggestion, "请重新运行审计；如果反复失败，可缩短输入文档或更换模型。")}</small>
@@ -735,6 +821,20 @@ function MappingAuditPanel({
           <p className="muted">尚未运行映射审计。</p>
         )}
       </section>
+    </div>
+  );
+}
+
+function MappingAuditSeverityPills({ audit, findings }: { audit: MappingAudit; findings: MappingAuditFinding[] }) {
+  if (findings.length === 0) {
+    return <div className="mapping-audit-severity-pills"><span className="severity-pill clean">{mappingAuditStatusLabels[audit.status]}</span></div>;
+  }
+  const counts = mappingAuditSeverityCounts(findings);
+  return (
+    <div className="mapping-audit-severity-pills" aria-label="审计问题严重度统计">
+      <span className="severity-pill high">{counts.high} 个红色问题</span>
+      <span className="severity-pill medium">{counts.medium} 个黄色问题</span>
+      <span className="severity-pill low">{counts.low} 个蓝色问题</span>
     </div>
   );
 }
@@ -759,20 +859,23 @@ function displayMappingAuditSummary(audit: MappingAudit): string {
 }
 
 function MappingFindingRefs({ finding, onOpenChunk }: { finding: MappingAuditFinding; onOpenChunk: (chunkId: string) => void }) {
-  const hasRefs = finding.evidenceChunkIds.length > 0 || finding.nodeIds.length > 0 || finding.relationIds.length > 0;
+  const evidenceChunkIds = Array.isArray(finding.evidenceChunkIds) ? finding.evidenceChunkIds : [];
+  const nodeIds = Array.isArray(finding.nodeIds) ? finding.nodeIds : [];
+  const relationIds = Array.isArray(finding.relationIds) ? finding.relationIds : [];
+  const hasRefs = evidenceChunkIds.length > 0 || nodeIds.length > 0 || relationIds.length > 0;
   if (!hasRefs) return null;
   return (
     <div className="mapping-finding-refs">
-      {finding.evidenceChunkIds.length > 0 && (
+      {evidenceChunkIds.length > 0 && (
         <div>
           <span>Chunk</span>
-          {finding.evidenceChunkIds.map((chunkId) => (
+          {evidenceChunkIds.map((chunkId) => (
             <button className="ghost" key={chunkId} onClick={() => onOpenChunk(chunkId)}>{chunkId.slice(0, 8)}</button>
           ))}
         </div>
       )}
-      {finding.nodeIds.length > 0 && <div><span>节点</span><code>{finding.nodeIds.map((id) => id.slice(0, 8)).join(", ")}</code></div>}
-      {finding.relationIds.length > 0 && <div><span>关系</span><code>{finding.relationIds.map((id) => id.slice(0, 8)).join(", ")}</code></div>}
+      {nodeIds.length > 0 && <div><span>节点</span><code>{nodeIds.map((id) => id.slice(0, 8)).join(", ")}</code></div>}
+      {relationIds.length > 0 && <div><span>关系</span><code>{relationIds.map((id) => id.slice(0, 8)).join(", ")}</code></div>}
     </div>
   );
 }
@@ -788,9 +891,9 @@ function MappingFindingComment({
   saving: boolean;
   onSave: (userComment: string) => void;
 }) {
-  const [draft, setDraft] = useState(finding.userComment);
+  const [draft, setDraft] = useState(finding.userComment ?? "");
   useEffect(() => {
-    setDraft(finding.userComment);
+    setDraft(finding.userComment ?? "");
   }, [finding.userComment]);
   return (
     <div className="mapping-finding-comment">

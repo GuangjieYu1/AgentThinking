@@ -41,6 +41,7 @@ import type { ModelProvider } from "./services/models.js";
 import { IngestionQueue } from "./services/ingestion.js";
 import { VectorStore } from "./services/vector-store.js";
 import { AnalysisPublisher } from "./services/analysis.js";
+import { LibraryEventBus } from "./services/library-events.js";
 import { MappingAuditService } from "./services/mapping-audit.js";
 import { PulseEngine } from "./services/pulse.js";
 
@@ -50,6 +51,7 @@ export interface AppServices {
   vectors: VectorStore;
   model: ModelProvider;
   queue: IngestionQueue;
+  events?: LibraryEventBus;
 }
 
 declare module "fastify" {
@@ -128,9 +130,10 @@ function isPublicApi(method: string, url: string): boolean {
 export async function createApp(services: AppServices): Promise<FastifyInstance> {
   const app = Fastify({ logger: true, bodyLimit: 4 * 1024 * 1024 });
   const { config, db, vectors, model, queue } = services;
+  const events = services.events ?? new LibraryEventBus();
   const publisher = new AnalysisPublisher(db, config);
   const pulseEngine = new PulseEngine(db, vectors, model);
-  const mappingAudit = new MappingAuditService(db, model);
+  const mappingAudit = new MappingAuditService(db, model, events);
   await app.register(cors, { origin: true, credentials: true });
   await app.register(multipart, { limits: { files: 100, fileSize: 60 * 1024 * 1024 } });
 
@@ -380,15 +383,21 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       Connection: "keep-alive",
     });
     const send = (data: unknown) => reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
-    const listener = (job: { libraryId: string }) => {
-      if (job.libraryId === libraryId) send(job);
+    const listener = (event: { libraryId?: string; job?: { libraryId: string } }) => {
+      const eventLibraryId = "job" in event && event.job ? event.job.libraryId : event.libraryId;
+      if (eventLibraryId === libraryId) send(event);
     };
-    queue.on("job", listener);
+    const unsubscribe = services.events
+      ? events.subscribe(listener as (event: import("@agent-thinking/contracts").LibraryStreamEvent) => void)
+      : (() => {
+          queue.on("job", listener as (job: { libraryId: string }) => void);
+          return () => queue.off("job", listener as (job: { libraryId: string }) => void);
+        })();
     send({ type: "connected" });
     const heartbeat = setInterval(() => reply.raw.write(": keep-alive\n\n"), 15000);
     request.raw.on("close", () => {
       clearInterval(heartbeat);
-      queue.off("job", listener);
+      unsubscribe();
     });
   });
 

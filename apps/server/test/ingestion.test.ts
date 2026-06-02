@@ -6,6 +6,7 @@ import type { Chunk } from "@agent-thinking/contracts";
 import { getConfig } from "../src/config.js";
 import { AgentDatabase } from "../src/db.js";
 import { IngestionQueue } from "../src/services/ingestion.js";
+import { LibraryEventBus } from "../src/services/library-events.js";
 import { FakeModelProvider } from "../src/services/models.js";
 import { VectorStore } from "../src/services/vector-store.js";
 
@@ -28,7 +29,12 @@ describe("ingestion pipeline", () => {
     const job = db.createJob(library.id, version.id);
     const vectors = new VectorStore(db);
     expect(vectors.usesSqliteVec).toBe(true);
-    const queue = new IngestionQueue(db, vectors, new FakeModelProvider(), config);
+    const events = new LibraryEventBus();
+    const governanceEvents: string[] = [];
+    events.subscribe((event) => {
+      if (event.type === "graph_rule_trace" || event.type === "graph_rule_summary") governanceEvents.push(event.type);
+    });
+    const queue = new IngestionQueue(db, vectors, new FakeModelProvider(), config, events);
     const completed = new Promise<void>((resolve, reject) => {
       queue.on("job", (update: { stage: string; error?: string }) => {
         if (update.stage === "completed") resolve();
@@ -43,6 +49,8 @@ describe("ingestion pipeline", () => {
     const [queryEmbedding] = await new FakeModelProvider().embed(["结论"]);
     expect(vectors.search(library.id, queryEmbedding!, 3).length).toBeGreaterThan(0);
     expect(db.listJobs(library.id)[0]?.stage).toBe("completed");
+    expect(governanceEvents).toContain("graph_rule_trace");
+    expect(governanceEvents).toContain("graph_rule_summary");
     db.close();
   });
 

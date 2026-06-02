@@ -25,6 +25,7 @@ import type {
   LibrarySettings,
   MappingAudit,
   MappingAuditFinding,
+  MappingAuditMetrics,
   MappingAuditResult,
   OcrMode,
   Pulse,
@@ -222,6 +223,7 @@ function parseMappingAuditFindings(value: Row[string] | undefined): MappingAudit
       return [{
         kind: String(finding.kind) as MappingAuditFinding["kind"],
         severity: String(finding.severity) as MappingAuditFinding["severity"],
+        ...(typeof finding.ruleCategory === "string" ? { ruleCategory: finding.ruleCategory as MappingAuditFinding["ruleCategory"] } : {}),
         title: String(finding.title),
         description: typeof finding.description === "string" ? finding.description : "",
         suggestion: typeof finding.suggestion === "string" ? finding.suggestion : "",
@@ -229,6 +231,9 @@ function parseMappingAuditFindings(value: Row[string] | undefined): MappingAudit
         nodeIds: Array.isArray(finding.nodeIds) ? finding.nodeIds.filter((id): id is string => typeof id === "string") : [],
         relationIds: Array.isArray(finding.relationIds) ? finding.relationIds.filter((id): id is string => typeof id === "string") : [],
         userComment: typeof finding.userComment === "string" ? finding.userComment : "",
+        status: typeof finding.status === "string" ? finding.status : "open",
+        ...(typeof finding.resolutionNote === "string" ? { resolutionNote: finding.resolutionNote } : {}),
+        ...(typeof finding.fixedByRebuildId === "string" ? { fixedByRebuildId: finding.fixedByRebuildId } : {}),
       }];
     });
   } catch {
@@ -236,7 +241,19 @@ function parseMappingAuditFindings(value: Row[string] | undefined): MappingAudit
   }
 }
 
+function parseMappingAuditMetrics(value: Row[string] | undefined): MappingAuditMetrics | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return parsed as MappingAuditMetrics;
+  } catch {
+    return undefined;
+  }
+}
+
 function mappingAuditFrom(r: Row): MappingAudit {
+  const metrics = parseMappingAuditMetrics(r.metrics_json);
   return {
     id: String(r.id),
     libraryId: String(r.library_id),
@@ -245,6 +262,7 @@ function mappingAuditFrom(r: Row): MappingAudit {
     summary: String(r.summary),
     reconstruction: String(r.reconstruction),
     findings: parseMappingAuditFindings(r.findings_json),
+    ...(metrics ? { metrics } : {}),
     graphRebuildReport: r.graph_rebuild_report === null ? "" : String(r.graph_rebuild_report ?? ""),
     graphRebuiltAt: r.graph_rebuilt_at === null ? null : String(r.graph_rebuilt_at),
     createdAt: String(r.created_at),
@@ -494,6 +512,7 @@ export class AgentDatabase {
         summary TEXT NOT NULL,
         reconstruction TEXT NOT NULL,
         findings_json TEXT NOT NULL DEFAULT '[]',
+        metrics_json TEXT,
         graph_rebuild_report TEXT NOT NULL DEFAULT '',
         graph_rebuilt_at TEXT,
         created_at TEXT NOT NULL
@@ -579,6 +598,7 @@ export class AgentDatabase {
     this.addColumn("pulse_hits", "step_index", "INTEGER");
     this.addColumn("pulse_hits", "observation", "TEXT");
     this.addColumn("pulse_hits", "rationale", "TEXT");
+    this.addColumn("mapping_audits", "metrics_json", "TEXT");
     this.addColumn("mapping_audits", "graph_rebuild_report", "TEXT NOT NULL DEFAULT ''");
     this.addColumn("mapping_audits", "graph_rebuilt_at", "TEXT");
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
@@ -1032,8 +1052,8 @@ export class AgentDatabase {
     const createdAt = now();
     this.sql.prepare(`
       INSERT INTO mapping_audits
-        (id, library_id, version_id, status, summary, reconstruction, findings_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (id, library_id, version_id, status, summary, reconstruction, findings_json, metrics_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(version_id) DO UPDATE SET
         id = excluded.id,
         library_id = excluded.library_id,
@@ -1041,6 +1061,7 @@ export class AgentDatabase {
         summary = excluded.summary,
         reconstruction = excluded.reconstruction,
         findings_json = excluded.findings_json,
+        metrics_json = excluded.metrics_json,
         graph_rebuild_report = '',
         graph_rebuilt_at = NULL,
         created_at = excluded.created_at
@@ -1052,6 +1073,7 @@ export class AgentDatabase {
       result.summary,
       result.reconstruction,
       JSON.stringify(result.findings),
+      result.metrics ? JSON.stringify(result.metrics) : null,
       createdAt,
     );
     return this.getMappingAudit(versionId) as MappingAudit;
@@ -1302,8 +1324,111 @@ export class AgentDatabase {
   getChunksByIds(ids: string[]): Chunk[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
+    const order = new Map(ids.map((id, index) => [id, index]));
     return rows(this.sql.prepare(`SELECT * FROM chunks WHERE id IN (${placeholders})`), ...ids)
-      .map(chunkFrom);
+      .map(chunkFrom)
+      .sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
+  }
+
+  getNeighborChunks(chunkIds: string[], window: number): Chunk[] {
+    if (chunkIds.length === 0) return [];
+    const seeds = this.getChunksByIds(chunkIds);
+    const seen = new Set<string>();
+    const result: Chunk[] = [];
+    const boundedWindow = Math.min(Math.max(Math.trunc(window), 0), 8);
+    for (const seed of seeds) {
+      for (const chunk of rows(
+        this.sql.prepare(`
+          SELECT * FROM chunks
+          WHERE library_id = ? AND version_id = ? AND ordinal BETWEEN ? AND ?
+          ORDER BY ordinal
+        `),
+        seed.libraryId,
+        seed.versionId,
+        Math.max(0, seed.ordinal - boundedWindow),
+        seed.ordinal + boundedWindow,
+      ).map(chunkFrom)) {
+        if (seen.has(chunk.id)) continue;
+        seen.add(chunk.id);
+        result.push(chunk);
+      }
+    }
+    return result;
+  }
+
+  getSameSectionChunks(chunkIds: string[], limit = 30): Chunk[] {
+    if (chunkIds.length === 0) return [];
+    const seeds = this.getChunksByIds(chunkIds);
+    const seen = new Set<string>();
+    const result: Chunk[] = [];
+    for (const seed of seeds) {
+      const sectionLimit = Math.max(1, Math.min(limit, 80));
+      const sectionRows = seed.headingPath
+        ? rows(
+          this.sql.prepare(`
+            SELECT * FROM chunks
+            WHERE library_id = ? AND version_id = ? AND heading_path = ?
+            ORDER BY ordinal LIMIT ?
+          `),
+          seed.libraryId,
+          seed.versionId,
+          seed.headingPath,
+          sectionLimit,
+        )
+        : rows(
+          this.sql.prepare(`
+            SELECT * FROM chunks
+            WHERE library_id = ? AND version_id = ?
+            ORDER BY ordinal LIMIT ?
+          `),
+          seed.libraryId,
+          seed.versionId,
+          sectionLimit,
+        );
+      for (const chunk of sectionRows.map(chunkFrom)) {
+        if (seen.has(chunk.id)) continue;
+        seen.add(chunk.id);
+        result.push(chunk);
+      }
+    }
+    return result.slice(0, Math.max(1, Math.min(limit, 80)));
+  }
+
+  getDocumentOutlineForLibrary(libraryId: string, versionId?: string): Array<{
+    versionId: string;
+    documentName: string;
+    headingPath: string | null;
+    chunkCount: number;
+    firstOrdinal: number;
+    lastOrdinal: number;
+  }> {
+    const filters = ["c.library_id = ?"];
+    const params: Array<string | number> = [libraryId];
+    if (versionId) {
+      filters.push("c.version_id = ?");
+      params.push(versionId);
+    }
+    return rows(
+      this.sql.prepare(`
+        SELECT c.version_id, d.name AS document_name, c.heading_path,
+          COUNT(*) AS chunk_count, MIN(c.ordinal) AS first_ordinal, MAX(c.ordinal) AS last_ordinal
+        FROM chunks c
+        JOIN document_versions v ON v.id = c.version_id
+        JOIN documents d ON d.id = v.document_id
+        WHERE ${filters.join(" AND ")}
+        GROUP BY c.version_id, d.name, c.heading_path
+        ORDER BY d.name, first_ordinal
+        LIMIT 200
+      `),
+      ...params,
+    ).map((entry) => ({
+      versionId: String(entry.version_id),
+      documentName: String(entry.document_name),
+      headingPath: entry.heading_path === null ? null : String(entry.heading_path),
+      chunkCount: Number(entry.chunk_count),
+      firstOrdinal: Number(entry.first_ordinal),
+      lastOrdinal: Number(entry.last_ordinal),
+    }));
   }
 
   searchText(libraryId: string, query: string, limit: number): SearchResult[] {

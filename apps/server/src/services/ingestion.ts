@@ -1,11 +1,13 @@
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
-import type { Chunk, IngestJob } from "@agent-thinking/contracts";
+import type { Chunk, GraphRulesSummary, IngestJob } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 import { AgentDatabase } from "../db.js";
 import { chunkSections, parseTextSections } from "../domain/chunker.js";
 import { isWordMediaType } from "../domain/files.js";
 import { parseMarkdownStructure } from "../domain/source-structure.js";
+import type { GraphRulesResult } from "./graphRules.js";
+import { LibraryEventBus } from "./library-events.js";
 import type { ModelProvider } from "./models.js";
 import { parseDocument } from "./parser.js";
 import { VectorStore } from "./vector-store.js";
@@ -19,6 +21,7 @@ export class IngestionQueue extends EventEmitter {
     private readonly vectors: VectorStore,
     private readonly model: ModelProvider,
     private readonly config: AppConfig,
+    private readonly events?: LibraryEventBus,
   ) {
     super();
   }
@@ -58,7 +61,64 @@ export class IngestionQueue extends EventEmitter {
   ): IngestJob {
     const job = this.db.updateJob(jobId, stage, progress, error);
     this.emit("job", job);
+    this.events?.emitEvent({ type: "job", job });
     return job;
+  }
+
+  private emitGraphRuleEvents(
+    source: { libraryId: string; documentId: string; version: { id: string } },
+    jobId: string,
+    type: "graph_rule_trace" | "graph_rebuild_rule_trace",
+    result: GraphRulesResult,
+  ): void {
+    const createdAt = new Date().toISOString();
+    const traces = result.traces.slice(-8);
+    this.events?.emitEvent({
+      type,
+      libraryId: source.libraryId,
+      documentId: source.documentId,
+      versionId: source.version.id,
+      jobId,
+      stage: "extraction",
+      createdAt,
+      traces,
+      summary: result.summary,
+    });
+    this.events?.emitEvent({
+      type: "graph_rule_summary",
+      libraryId: source.libraryId,
+      documentId: source.documentId,
+      versionId: source.version.id,
+      jobId,
+      stage: "extraction",
+      createdAt,
+      summary: result.summary,
+    });
+  }
+
+  private emitCandidateReady(
+    source: { libraryId: string; documentId: string; version: { id: string } },
+    jobId: string,
+    batchIndex: number,
+    totalBatches: number,
+    summary: GraphRulesSummary,
+    counts: { nodes: number; relations: number; themes: number },
+  ): void {
+    this.events?.emitEvent({
+      type: "graph_candidate_batch_ready",
+      libraryId: source.libraryId,
+      documentId: source.documentId,
+      versionId: source.version.id,
+      jobId,
+      stage: "extraction",
+      createdAt: new Date().toISOString(),
+      batchIndex,
+      totalBatches,
+      nodeCount: counts.nodes,
+      relationCount: counts.relations,
+      themeCount: counts.themes,
+      summary,
+    });
   }
 
   private async process(jobId: string): Promise<void> {
@@ -124,22 +184,28 @@ export class IngestionQueue extends EventEmitter {
       this.setStage(jobId, "extracting", 0.7);
       const currentVersionChunkIds = new Set(chunks.map((chunk) => chunk.id));
       const affectedExistingChunks = new Map<string, { chunk: Chunk; newContext: Map<string, Chunk> }>();
-      for (let start = 0; start < chunks.length; start += 20) {
-        const batch = chunks.slice(start, start + 20);
+      const neighboringChunks = (chunk: Chunk) => chunks.filter((candidate) => (
+        candidate.id !== chunk.id && Math.abs(candidate.ordinal - chunk.ordinal) <= 1
+      ));
+      const primaryBatchCount = Math.max(1, Math.ceil(chunks.length / 10));
+      for (let start = 0; start < chunks.length; start += 10) {
+        const batchIndex = Math.floor(start / 10) + 1;
+        const batch = chunks.slice(start, start + 10);
         const related = new Map<string, typeof chunks>();
         for (const chunk of batch) {
           const embedding = await this.model.embed([chunk.text]);
-          const localCandidates = this.vectors.search(source.libraryId, embedding[0] ?? [], 4, new Set([chunk.id]))
+          const adjacentCandidates = neighboringChunks(chunk);
+          const localCandidates = this.vectors.search(source.libraryId, embedding[0] ?? [], 5, new Set([chunk.id]))
             .map((result) => result.chunk);
           const crossDocumentCandidates = this.vectors.search(
             source.libraryId,
             embedding[0] ?? [],
-            4,
+            6,
             currentVersionChunkIds,
           ).map((result) => result.chunk)
             .filter((candidate) => candidate.versionId !== source.version.id);
           const candidates = [...new Map(
-            [...localCandidates, ...crossDocumentCandidates].map((candidate) => [candidate.id, candidate]),
+            [...adjacentCandidates, ...localCandidates, ...crossDocumentCandidates].map((candidate) => [candidate.id, candidate]),
           ).values()];
           related.set(
             chunk.id,
@@ -154,19 +220,50 @@ export class IngestionQueue extends EventEmitter {
             affectedExistingChunks.set(candidate.id, affected);
           }
         }
-        const extraction = await this.model.extract(batch, related);
+        let graphRules: GraphRulesResult | undefined;
+        const extraction = await this.model.extract(batch, related, {
+          stage: "extraction",
+          onGraphRules: (result) => {
+            graphRules = result;
+            this.emitGraphRuleEvents(source, jobId, "graph_rule_trace", result);
+          },
+        });
         this.db.saveExtraction(source.libraryId, extraction, source.version.id);
+        if (graphRules) {
+          this.emitCandidateReady(source, jobId, batchIndex, primaryBatchCount, graphRules.summary, {
+            nodes: extraction.nodes.length,
+            relations: extraction.relations.length,
+            themes: extraction.themes?.length ?? 0,
+          });
+        }
       }
 
       // Existing chunks need a reciprocal look at new material so import order does not
       // determine whether a cross-document relationship can be proposed.
       const affected = [...affectedExistingChunks.values()];
+      const reciprocalBatchBase = primaryBatchCount;
+      const reciprocalBatchCount = Math.ceil(affected.length / 20);
       for (let start = 0; start < affected.length; start += 20) {
+        const batchIndex = reciprocalBatchBase + Math.floor(start / 20) + 1;
         const batch = affected.slice(start, start + 20);
         const anchors = batch.map((entry) => entry.chunk);
         const related = new Map(batch.map((entry) => [entry.chunk.id, [...entry.newContext.values()]]));
-        const extraction = await this.model.extract(anchors, related);
+        let graphRules: GraphRulesResult | undefined;
+        const extraction = await this.model.extract(anchors, related, {
+          stage: "extraction",
+          onGraphRules: (result) => {
+            graphRules = result;
+            this.emitGraphRuleEvents(source, jobId, "graph_rule_trace", result);
+          },
+        });
         this.db.saveExtraction(source.libraryId, extraction, source.version.id);
+        if (graphRules) {
+          this.emitCandidateReady(source, jobId, batchIndex, reciprocalBatchBase + reciprocalBatchCount, graphRules.summary, {
+            nodes: extraction.nodes.length,
+            relations: extraction.relations.length,
+            themes: extraction.themes?.length ?? 0,
+          });
+        }
       }
 
       this.setStage(jobId, "indexing", 0.94);

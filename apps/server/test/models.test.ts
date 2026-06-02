@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Chunk } from "@agent-thinking/contracts";
+import type { Chunk, MappingAudit } from "@agent-thinking/contracts";
 import { getConfig } from "../src/config.js";
 import { OpenAICompatibleProvider } from "../src/services/models.js";
 
@@ -57,6 +57,7 @@ describe("DeepSeek model configuration", () => {
     expect(body.model).toBe("deepseek-v4-flash");
     expect(body.thinking).toEqual({ type: "disabled" });
     expect(body.response_format).toEqual({ type: "json_object" });
+    expect((body.messages as Array<{ content: string }>)[0]!.content).toContain("Relation Governance Rules");
   });
 
   it("sanitizes extracted nodes that omit optional-but-required arrays", async () => {
@@ -105,7 +106,7 @@ describe("DeepSeek model configuration", () => {
         themes: [],
       }) } }] },
     ];
-    const fetchMock = vi.fn(async () =>
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       new Response(JSON.stringify(responses.shift()), { status: 200, headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
     const provider = new OpenAICompatibleProvider(config);
@@ -247,6 +248,116 @@ describe("DeepSeek model configuration", () => {
     const auditBody = JSON.parse(fetchMock.mock.calls[1]![1]?.body as string) as { messages: Array<{ content: string }> };
     expect(reconstructionBody.messages[0]!.content).toContain("Simplified Chinese");
     expect(auditBody.messages[0]!.content).toContain("Simplified Chinese");
+    expect(auditBody.messages[0]!.content).toContain("Semantic Coverage Rules");
+  });
+
+  it("runs dirty extraction relations through graph rules finalize path", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({
+          nodes: [
+            { key: "a", kind: "claim", title: "A", summary: "A", evidenceChunkIds: ["chunk-1"], aspects: ["claim"] },
+            { key: "b", kind: "claim", title: "B", summary: "B", evidenceChunkIds: ["chunk-1"], aspects: ["claim"] },
+          ],
+          relations: [{
+            sourceKey: "a",
+            targetKey: "b",
+            type: "causes",
+            reason: "dirty relation",
+            confidence: 2,
+            evidenceChunkIds: ["chunk-1"],
+          }],
+          themes: [],
+        }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const chunk: Chunk = {
+      id: "chunk-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      ordinal: 0,
+      headingPath: "Topic",
+      pageNumber: null,
+      startLine: 1,
+      endLine: 2,
+      blockId: null,
+      startChar: 0,
+      endChar: 8,
+      text: "source text",
+      aspects: [],
+    };
+    const graphRuleResults: Array<{ traces: Array<{ action: string }> }> = [];
+    const extraction = await provider.extract([chunk], new Map(), {
+      onGraphRules: (result) => graphRuleResults.push(result),
+    });
+    expect(extraction.relations[0]?.type).toBe("related_to");
+    expect(extraction.relations[0]?.confidence).toBeLessThanOrEqual(0.3);
+    expect(extraction.relations[0]?.originalType).toBe("causes");
+    expect(extraction.relations[0]?.originalConfidence).toBe(2);
+    expect(graphRuleResults[0]?.traces.some((trace) => trace.action === "relation_type_downgraded")).toBe(true);
+    expect(graphRuleResults[0]?.traces.some((trace) => trace.action === "confidence_normalized")).toBe(true);
+  });
+
+  it("adds graph evolution rules to rebuild prompts and finalizes rebuild output", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({
+          nodes: [
+            { key: "a", kind: "claim", title: "A", summary: "A", evidenceChunkIds: ["chunk-1"], aspects: ["claim"] },
+            { key: "b", kind: "claim", title: "B", summary: "B", evidenceChunkIds: ["chunk-1"], aspects: ["claim"] },
+          ],
+          relations: [{
+            sourceKey: "a",
+            targetKey: "b",
+            type: "related_to",
+            reason: "weak",
+            confidence: 0.95,
+            evidenceChunkIds: ["chunk-1"],
+          }],
+          themes: [],
+        }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const chunk: Chunk = {
+      id: "chunk-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      ordinal: 0,
+      headingPath: "Topic",
+      pageNumber: null,
+      startLine: 1,
+      endLine: 2,
+      blockId: null,
+      startChar: 0,
+      endChar: 8,
+      text: "source text",
+      aspects: [],
+    };
+    const audit: MappingAudit = {
+      id: "audit-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      status: "minor_issues",
+      summary: "summary",
+      reconstruction: "reconstruction",
+      findings: [],
+      graphRebuildReport: "",
+      graphRebuiltAt: null,
+      createdAt: new Date().toISOString(),
+    };
+    const context = {
+      versionId: "version-1",
+      documentName: "source.md",
+      chunks: [chunk],
+      nodes: [],
+      relations: [],
+    };
+    const extraction = await provider.rebuildGraphFromMappingAudit(audit, [chunk], context);
+    expect(extraction.relations[0]?.confidence).toBe(0.6);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as { messages: Array<{ content: string }> };
+    expect(body.messages[0]!.content).toContain("Graph Evolution Rules");
   });
 
   it("sanitizes overlong mapping audit text fields before validation", async () => {

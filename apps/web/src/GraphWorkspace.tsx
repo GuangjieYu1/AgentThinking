@@ -29,6 +29,9 @@ import {
   type Citation,
   type GraphEdge,
   type GraphNode,
+  type GraphRuleStage,
+  type GraphRulesSummary,
+  type GraphRuleTrace,
   type GraphResponse,
   type GraphView,
   type Pulse,
@@ -47,6 +50,11 @@ type VisualNode = Node<{ label: ReactNode; entity: GraphNode }>;
 type VisualEdge = Edge<{ entity: GraphEdge }>;
 type LayoutMode = "layered" | "network" | "tree";
 type PulseLayerMode = "normal" | "current" | "stats" | "wrong" | "correct";
+interface RuleGovernanceFeed {
+  stage?: GraphRuleStage;
+  summary?: GraphRulesSummary;
+  traces: GraphRuleTrace[];
+}
 type PulseHitRecord = PulseResponse["hits"][number];
 type PulseStreamHitRecord = PulseStreamHit;
 type PulseNavigationEvent = Extract<PulseStreamEvent, { type: "candidates" | "decision" | "backtrack" }>;
@@ -139,6 +147,26 @@ const aspectLabels: Record<AspectKind, string> = {
   time: "时间",
   other: "其他",
 };
+
+const graphRuleStageLabels: Record<GraphRuleStage, string> = {
+  extraction: "抽取",
+  mapping_audit: "映射审计",
+  rebuild: "重构",
+};
+
+const graphRuleCategoryLabels = {
+  graph_validity: "图合法性",
+  relation_algebra: "关系代数",
+  semantic_coverage: "语义覆盖",
+  graph_evolution: "图演化",
+} satisfies Record<GraphRuleTrace["category"], string>;
+
+const graphRuleDecisionLabels = {
+  kept: "保留",
+  downgraded: "降级",
+  excluded_from_graph: "排除",
+  needs_review: "待复核",
+} satisfies Record<GraphRuleTrace["decision"], string>;
 
 const pulseInitialRevealDelayMs = 455;
 const pulseRevealDelayMs = 1050;
@@ -815,11 +843,13 @@ function displayEdges(records: GraphEdge[], layout: LayoutMode, pulseMode: Pulse
 export function GraphWorkspace({
   libraryId,
   refreshKey,
+  ruleGovernanceFeed,
   onError,
   onOpenCitation,
 }: {
   libraryId: string;
   refreshKey: number;
+  ruleGovernanceFeed: RuleGovernanceFeed;
   onError: (message: string) => void;
   onOpenCitation: (citation: Citation) => void;
 }) {
@@ -1400,6 +1430,7 @@ export function GraphWorkspace({
           )}
         </div>
         <aside className="inspector">
+          <RuleGovernanceCard feed={ruleGovernanceFeed} />
           {!visibleCurrentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
             <div className="pulse-panel pulse-stream-panel">
               <div className="pulse-panel-heading">
@@ -1635,6 +1666,46 @@ export function GraphWorkspace({
         </aside>
       </div>
     </section>
+  );
+}
+
+function RuleGovernanceCard({ feed }: { feed: RuleGovernanceFeed }) {
+  const summary = feed.summary;
+  const traces = feed.traces.slice(-20).reverse();
+  return (
+    <div className="rule-governance-card">
+      <div className="rule-governance-heading">
+        <h3>关系规则治理</h3>
+        <small>{feed.stage ? graphRuleStageLabels[feed.stage] : "等待事件"}</small>
+      </div>
+      <div className="rule-governance-counts">
+        <span><strong>{summary?.categoryCounts.graph_validity ?? 0}</strong>图合法性</span>
+        <span><strong>{summary?.categoryCounts.relation_algebra ?? 0}</strong>关系代数</span>
+        <span><strong>{summary?.categoryCounts.semantic_coverage ?? 0}</strong>语义覆盖</span>
+        <span><strong>{summary?.categoryCounts.graph_evolution ?? 0}</strong>图演化</span>
+      </div>
+      <div className="rule-governance-decisions">
+        <span>kept {summary?.keptCount ?? 0}</span>
+        <span>downgraded {summary?.downgradedCount ?? 0}</span>
+        <span>excluded {summary?.excludedCount ?? 0}</span>
+        <span>needs_review {summary?.reviewCount ?? 0}</span>
+      </div>
+      <div className="rule-governance-traces">
+        {traces.length === 0 ? (
+          <p className="muted">暂无治理 trace。</p>
+        ) : traces.map((trace) => (
+          <div className={`rule-trace rule-trace-${trace.decision}`} key={trace.traceId}>
+            <span>{graphRuleCategoryLabels[trace.category]} · {graphRuleDecisionLabels[trace.decision]}</span>
+            <strong>
+              {trace.sourceKey && trace.targetKey
+                ? `${trace.sourceKey} → ${trace.targetKey}`
+                : trace.nodeId ?? trace.relationId ?? trace.action}
+            </strong>
+            <small>{trace.reason}</small>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

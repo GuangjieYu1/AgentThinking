@@ -4,6 +4,7 @@ import type {
   AnalysisDraft,
   AnalysisStatement,
   AuthSession,
+  ContextUnit,
   Document,
   DocumentTreeNode,
   EvidencePack,
@@ -25,8 +26,10 @@ import type {
   PulseResponse,
   PulseStreamEvent,
   PublishedAnalysis,
+  RetrievalUnit,
   SourceStructure,
   SummaryTreeNode,
+  V2IndexHealth,
 } from "@agent-thinking/contracts";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -120,6 +123,11 @@ export const api = {
     if (!response.ok) throw new Error("读取原文件失败");
     return response.text();
   },
+  v2IndexHealth: (versionId: string) => request<V2IndexHealth>(`/debug/versions/${versionId}/v2-index-health`),
+  debugContextUnits: (versionId: string, includeFullText = false) =>
+    request<ContextUnit[]>(`/debug/versions/${versionId}/context-units${includeFullText ? "?includeFullText=true" : ""}`),
+  debugRetrievalUnits: (versionId: string, includeFullText = false) =>
+    request<RetrievalUnit[]>(`/debug/versions/${versionId}/retrieval-units${includeFullText ? "?includeFullText=true" : ""}`),
   structure: (versionId: string) => request<SourceStructure>(`/versions/${versionId}/structure`),
   documentTree: (libraryId: string) => request<DocumentTreeNode[]>(`/libraries/${libraryId}/document-tree`),
   versionDocumentTree: (versionId: string) => request<DocumentTreeNode[]>(`/versions/${versionId}/document-tree`),

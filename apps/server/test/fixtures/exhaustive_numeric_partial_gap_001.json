@@ -1,0 +1,30 @@
+{
+  "caseId": "exhaustive_numeric_partial_gap_001",
+  "question": "What is the stated total and each itemized source value?",
+  "declaredTotal": 100,
+  "expectedItemizedSum": 40,
+  "expectedDifference": 60,
+  "unit": "unit",
+  "reconciliationShouldClose": false,
+  "items": [
+    {
+      "label": "declared total",
+      "value": 100,
+      "role": "declared_total",
+      "mustQuoteIncludes": ["Declared total is 100 units"],
+      "required": true,
+      "countedInAggregation": false
+    },
+    {
+      "label": "visible source item",
+      "value": 40,
+      "role": "itemized_value",
+      "mustQuoteIncludes": ["Source A contributes 40 units"],
+      "required": true,
+      "countedInAggregation": true
+    }
+  ],
+  "requiredGaps": ["missing itemized source values"],
+  "mustNotCountItems": [],
+  "forbiddenClaims": ["all source values are complete", "no gap remains"]
+}

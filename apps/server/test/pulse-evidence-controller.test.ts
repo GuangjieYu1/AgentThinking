@@ -52,7 +52,7 @@ function plan(): PulseQuestionPlan {
     allowedPartialAnswer: true,
     answerMustExposeGaps: true,
     evidenceTargets: ["金额总数", "分项金额"],
-    keyEntities: ["bribery"],
+    keyEntities: ["value aggregation"],
     expectedEvidenceTypes: ["amount", "quote"],
     riskLevel: "high",
     reasoning: "金额问题需要结构化证据和闭合校验。",
@@ -70,9 +70,9 @@ class RecordingPulseModel extends FakeModelProvider {
 
   async planPulseEvidence(): Promise<PulseEvidencePlan> {
     return {
-      objective: "Find bribery totals and itemized facts.",
+      objective: "Find value aggregation totals and itemized facts.",
       steps: [
-        { tool: "semanticSearch", query: "bribery total", purpose: "semantic", expectedResult: "chunks" },
+        { tool: "semanticSearch", query: "value aggregation total", purpose: "semantic", expectedResult: "chunks" },
         { tool: "fullTextSearch", query: "617.496083", purpose: "literal", expectedResult: "chunks" },
         { tool: "readNeighborChunks", basedOnChunkIds: [], purpose: "neighbors", expectedResult: "nearby chunks" },
         { tool: "readSameSectionChunks", basedOnChunkIds: [], purpose: "section", expectedResult: "section chunks" },
@@ -120,7 +120,7 @@ class RecordingPulseModel extends FakeModelProvider {
 
   async synthesizePulseAnswer(): Promise<PulseAnswerOutput> {
     return {
-      answer: "引用：受贿总额 617.496083 万。差额来源 606.42607。",
+      answer: "引用：声明总额 617.496083 万。差额来源 606.42607。",
       summary: "sufficient",
     };
   }
@@ -134,7 +134,7 @@ function seed(db: AgentDatabase): { libraryId: string; chunks: Chunk[] } {
   const library = db.createLibrary("Pulse evidence");
   const version = db.createDocumentVersion(library.id, "case.md", "text/markdown", "case", "case").version;
   const chunks = db.replaceChunks(library.id, version.id, [
-    { ordinal: 0, headingPath: "Facts", pageNumber: null, startChar: 0, endChar: 20, text: "受贿总额 617.496083 万。" },
+    { ordinal: 0, headingPath: "Facts", pageNumber: null, startChar: 0, endChar: 20, text: "声明总额 617.496083 万。" },
     { ordinal: 1, headingPath: "Facts", pageNumber: null, startChar: 21, endChar: 48, text: "差额来源 606.42607。" },
     { ordinal: 2, headingPath: "Other", pageNumber: null, startChar: 49, endChar: 70, text: "unrelated" },
   ]);
@@ -146,14 +146,14 @@ function seedTwentyOneItems(db: AgentDatabase): { libraryId: string; chunks: Chu
   const version = db.createDocumentVersion(library.id, "case-21.md", "text/markdown", "case-21", "case-21").version;
   const itemAmounts = [556.782683, 144.8512, ...Array.from({ length: 18 }, () => 25), 72.28827];
   const pending = [
-    { ordinal: 0, headingPath: "受贿事实", pageNumber: null, startChar: 0, endChar: 20, text: "受贿总额 1223.922153 万。" },
+    { ordinal: 0, headingPath: "数值清单", pageNumber: null, startChar: 0, endChar: 20, text: "声明总额 1223.922153 万。" },
     ...itemAmounts.map((amount, index) => ({
       ordinal: index + 1,
-      headingPath: "受贿事实",
+      headingPath: "数值清单",
       pageNumber: null,
       startChar: 21 + index * 20,
       endChar: 40 + index * 20,
-      text: `第 ${index + 1} 笔来源：行贿人 ${index + 1}，金额 ${amount} 万。`,
+      text: `第 ${index + 1} 笔来源：来源 ${index + 1}，金额 ${amount} 万。`,
     })),
   ];
   const chunks = db.replaceChunks(library.id, version.id, pending);
@@ -260,7 +260,7 @@ class TwentyOneItemPulseModel extends FakeModelProvider {
     const rows = memory.evidenceRows ?? [];
     const itemizedCount = rows.filter((row) => row.evidenceType === "amount" && (row.structuredValue as { role?: string } | undefined)?.role !== "declared_total").length;
     return {
-      answer: `受贿总额 1223.922153 万。受贿总额 1223.922153 万。已列明 ${itemizedCount} 笔，分项合计 ${input.evidenceStatus.reconciliation?.itemizedSum} 万。`,
+      answer: `声明总额 1223.922153 万。声明总额 1223.922153 万。已列明 ${itemizedCount} 笔，分项合计 ${input.evidenceStatus.reconciliation?.itemizedSum} 万。`,
       summary: "sufficient",
     };
   }
@@ -298,9 +298,9 @@ describe("PulseEvidenceController", () => {
       evidenceRows: [{
         rowId: "quote",
         evidenceType: "quote" as const,
-        claimText: "受贿总额 617.496083 万",
+        claimText: "声明总额 617.496083 万",
         evidenceChunkId: "chunk-1",
-        evidenceQuote: "受贿总额 617.496083 万",
+        evidenceQuote: "声明总额 617.496083 万",
         confidence: 0.9,
       }],
       citedChunkIds: ["chunk-1"],
@@ -335,7 +335,7 @@ describe("PulseEvidenceController", () => {
 
     const result = await new PulseEvidenceController(db, vectors, model).answer(
       libraryId,
-      "受贿总额是多少?",
+      "声明总额是多少?",
       "progressive",
       {
         hits: [{
@@ -382,7 +382,7 @@ describe("PulseEvidenceController", () => {
 
     const result = await new PulseEvidenceController(db, vectors, model).answer(
       libraryId,
-      "此受贿案的总共受贿金额是多少？列出每一笔来源",
+      "此汇总事项的总共汇总金额是多少？列出每一笔来源",
       "progressive",
       {
         hits: chunks.slice(0, 3).map((chunk, index) => ({

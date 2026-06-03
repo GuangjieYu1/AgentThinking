@@ -23,6 +23,31 @@ export const pulseStatuses = ["unreviewed", "correct", "wrong"] as const;
 export const pulseHitTargetTypes = ["node", "relation", "chunk"] as const;
 export const pulsePathRoles = ["direct", "expanded", "bridge"] as const;
 export const pulseInputModes = ["full", "progressive"] as const;
+export const indexProfiles = ["v1", "v2", "dual"] as const;
+export const activeIndexProfiles = ["v1", "v2"] as const;
+export const indexBuildStatuses = ["building", "ready", "failed", "partial", "abandoned"] as const;
+export const indexProfileStatuses = ["not_started", ...indexBuildStatuses] as const;
+export const vectorTargetTypes = ["legacy_chunk", "retrieval_unit", "summary_node", "context_unit_optional"] as const;
+export const quoteMatchLevels = ["exact", "normalized", "fuzzy", "not_found"] as const;
+export const contextBlockTypes = ["paragraph", "list_item", "table", "heading", "unknown"] as const;
+export const genericEvidenceRoles = [
+  "declared_total",
+  "stated_total",
+  "itemized_value",
+  "component_value",
+  "source_value",
+  "normalized_value",
+  "derived_value",
+  "approximate_value",
+  "excluded_value",
+  "disputed_value",
+  "background_value",
+  "unexpanded_value",
+  "supporting_claim",
+  "contradicting_claim",
+  "contextual_fact",
+] as const;
+export const answerModes = ["evidence_heavy", "citation_supported", "summary_answer"] as const;
 export const documentTreeNodeTypes = ["document", "section", "paragraph", "sentence", "table", "unknown"] as const;
 export const summaryTreeLevels = ["paragraph", "section", "document", "cluster"] as const;
 export const mappingAuditStatuses = ["clean", "minor_issues", "major_issues", "failed"] as const;
@@ -89,6 +114,15 @@ export type PulseStatus = (typeof pulseStatuses)[number];
 export type PulseHitTargetType = (typeof pulseHitTargetTypes)[number];
 export type PulsePathRole = (typeof pulsePathRoles)[number];
 export type PulseInputMode = (typeof pulseInputModes)[number];
+export type IndexProfile = (typeof indexProfiles)[number];
+export type ActiveIndexProfile = (typeof activeIndexProfiles)[number];
+export type IndexBuildStatus = (typeof indexBuildStatuses)[number];
+export type IndexProfileBuildStatus = (typeof indexProfileStatuses)[number];
+export type VectorTargetType = (typeof vectorTargetTypes)[number];
+export type QuoteMatchLevel = (typeof quoteMatchLevels)[number];
+export type ContextBlockType = (typeof contextBlockTypes)[number];
+export type GenericEvidenceRole = (typeof genericEvidenceRoles)[number];
+export type AnswerMode = (typeof answerModes)[number];
 export type DocumentTreeNodeType = (typeof documentTreeNodeTypes)[number];
 export type SummaryTreeLevel = (typeof summaryTreeLevels)[number];
 export type MappingAuditStatus = (typeof mappingAuditStatuses)[number];
@@ -140,7 +174,43 @@ export interface DocumentVersion {
   contentHash: string;
   storagePath: string;
   status: "queued" | "processing" | "completed" | "failed";
+  indexSchemaVersion?: 1 | 2 | undefined;
+  latestReadyV1BuildId?: string | null | undefined;
+  latestReadyV2BuildId?: string | null | undefined;
+  activeIndexProfile?: ActiveIndexProfile | undefined;
+  indexWarnings?: string[] | undefined;
   createdAt: string;
+}
+
+export interface IndexBuildRecord {
+  buildId: string;
+  versionId: string;
+  profile: ActiveIndexProfile;
+  status: IndexBuildStatus;
+  startedAt: string;
+  finishedAt?: string | undefined;
+  errorMessage?: string | undefined;
+  errorStack?: string | undefined;
+  contextUnitCount?: number | undefined;
+  retrievalUnitCount?: number | undefined;
+  vectorCount?: number | undefined;
+  summaryVectorCount?: number | undefined;
+  qualityReportJson?: string | undefined;
+  performanceReportJson?: string | undefined;
+  indexerVersion: string;
+  schemaVersion: number;
+}
+
+export interface IndexProfileStatus {
+  v1: IndexProfileBuildStatus;
+  v2: IndexProfileBuildStatus;
+  activeProfile: ActiveIndexProfile;
+  latestReadyV1BuildId?: string | null | undefined;
+  latestReadyV2BuildId?: string | null | undefined;
+  warnings: string[];
+  lastV1BuildAt?: string | undefined;
+  lastV2BuildAt?: string | undefined;
+  lastV2Error?: string | undefined;
 }
 
 export interface Chunk {
@@ -190,6 +260,111 @@ export interface ParentChildChunk {
   parentText: string;
   childOrdinal: number;
   parentOrdinal: number;
+}
+
+export interface SourceRange {
+  startSourceNodeId: string;
+  endSourceNodeId: string;
+  startChar: number;
+  endChar: number;
+}
+
+export interface ContextBlock {
+  blockId: string;
+  type: ContextBlockType;
+  startChar: number;
+  endChar: number;
+  sourceNodeId?: string | undefined;
+  ordinal: number;
+  textPreview?: string | undefined;
+  tableFormat?: "markdown" | "html" | "csv" | "plain" | undefined;
+  rawTableTextRef?: string | undefined;
+}
+
+export interface ContextUnit {
+  id: string;
+  stableKey: string;
+  buildId: string;
+  versionId: string;
+  sourceNodeIds: string[];
+  primarySourceNodeId?: string | null | undefined;
+  sourceRange: SourceRange;
+  headingPath: string[];
+  displayHeadingPath: string[];
+  ordinal: number;
+  ordinalInPrimarySource?: number | undefined;
+  text: string;
+  blocks: ContextBlock[];
+  retrievalUnitIds: string[];
+  estimatedTokens?: number | undefined;
+  boundaryReason: string;
+}
+
+export interface RetrievalUnit {
+  id: string;
+  stableKey: string;
+  buildId: string;
+  versionId: string;
+  contextUnitId: string;
+  text: string;
+  headingPath: string[];
+  ordinal: number;
+  startChar?: number | null | undefined;
+  endChar?: number | null | undefined;
+  startLine?: number | null | undefined;
+  endLine?: number | null | undefined;
+  pageNumber?: number | null | undefined;
+  estimatedTokens?: number | undefined;
+}
+
+export interface ContextUnitQualityReport {
+  contextUnitCount: number;
+  retrievalUnitCount: number;
+  avgContextChars: number;
+  avgRetrievalChars: number;
+  p50ContextChars: number;
+  p90ContextChars: number;
+  maxContextChars: number;
+  avgRetrievalPerContext: number;
+  p90RetrievalPerContext: number;
+  boundaryReasonDistribution: Record<string, number>;
+  strongBoundaryViolations: Array<{ contextUnitId: string; reason: string }>;
+  overBudgetContextUnits: Array<{ contextUnitId: string; estimatedTokens: number; budget: number }>;
+  suspiciousTinyContextUnits: string[];
+  suspiciousHugeRetrievalUnits: string[];
+  generatedAt: string;
+}
+
+export interface IndexingPerformanceReport {
+  parseTimeMs?: number | undefined;
+  v1IndexTimeMs?: number | undefined;
+  v2ContextBuildTimeMs?: number | undefined;
+  v2RetrievalBuildTimeMs?: number | undefined;
+  embeddingTimeMs?: number | undefined;
+  vectorWriteTimeMs?: number | undefined;
+  dbSizeDeltaBytes?: number | undefined;
+  contextUnitCount: number;
+  retrievalUnitCount: number;
+  vectorCount: number;
+}
+
+export interface V2IndexHealth {
+  status: IndexProfileStatus;
+  buildId?: string | undefined;
+  retrievalUnitCount: number;
+  contextUnitCount: number;
+  vectorCount: number;
+  summaryVectorCount: number;
+  qualityReport?: ContextUnitQualityReport | undefined;
+  performanceReport?: IndexingPerformanceReport | undefined;
+  buildHistory: Array<{
+    buildId: string;
+    status: string;
+    startedAt: string;
+    finishedAt?: string | undefined;
+    errorMessage?: string | undefined;
+  }>;
+  warnings: string[];
 }
 
 export interface SummaryTreeNode {
@@ -269,6 +444,11 @@ export interface AbstractNode {
   source: "ai" | "user";
   citations: Citation[];
   evidenceNodeIds?: string[] | undefined;
+  citationLocators?: CitationLocator[] | undefined;
+  evidenceContextUnitIds?: string[] | undefined;
+  graphExtractorVersion?: string | undefined;
+  promptVersion?: string | undefined;
+  validatorVersion?: string | undefined;
   createdAt: string;
   updatedAt: string;
 }
@@ -293,6 +473,11 @@ export interface Relation {
   createdBy: "ai" | "user";
   evidenceChunkIds: string[];
   evidenceNodeIds?: string[] | undefined;
+  citationLocators?: CitationLocator[] | undefined;
+  evidenceContextUnitIds?: string[] | undefined;
+  graphExtractorVersion?: string | undefined;
+  promptVersion?: string | undefined;
+  validatorVersion?: string | undefined;
   ruleWarnings?: string[] | undefined;
   ruleDecision?: GraphRuleDecision | undefined;
   originalType?: string | undefined;
@@ -488,7 +673,10 @@ export type PulseQuestionType =
   | "numerical_aggregation"
   | "timeline"
   | "entity_relation"
-  | "legal_fact_breakdown"
+  | "causal_explanation"
+  | "claim_support"
+  | "summary"
+  | "critique"
   | "comparison"
   | "mixed";
 
@@ -515,7 +703,79 @@ export type PulseEvidenceTool =
   | "getChunkEvidenceAround"
   | "getGraphContext";
 
-export type PulseEvidenceType = "fact" | "amount" | "date" | "entity_relation" | "claim" | "quote" | "other";
+export type PulseEvidenceType = "fact" | "amount" | "date" | "entity_relation" | "claim" | "quote" | "timeline_event" | "table_value" | "other";
+
+export interface TokenBudget {
+  maxInputTokens: number;
+  reservedForSystem: number;
+  reservedForQuestion: number;
+  reservedForInstructions: number;
+  reservedForEvidenceJson: number;
+  reservedForOutput: number;
+  reservedForVerification?: number | undefined;
+  availableForContext: number;
+}
+
+export interface ModelContextProfile {
+  provider: string;
+  model: string;
+  maxInputTokens: number;
+  preferredContextTokens: number;
+  strategy: "long-context" | "retrieval-compact";
+  allowDocumentPack: boolean;
+  allowSectionPack: boolean;
+  allowMultiContextUnitPack: boolean;
+  compactExcerptTokens?: number | undefined;
+  tokenBudget: TokenBudget;
+}
+
+export interface PipelineVersion {
+  indexerVersion: string;
+  contextUnitBuilderVersion: string;
+  retrievalUnitBuilderVersion: string;
+  packBuilderVersion: string;
+  evidenceExtractorVersion: string;
+  validatorVersion: string;
+  promptVersion: string;
+}
+
+export interface CitationLocator {
+  versionId: string;
+  contextUnitId: string;
+  contextUnitStableKey?: string | undefined;
+  retrievalUnitId?: string | null | undefined;
+  sourceNodeId?: string | null | undefined;
+  quote: string;
+  normalizedQuote: string;
+  quoteHash: string;
+  locatorHash: string;
+  occurrenceIndex?: number | undefined;
+  beforeText?: string | undefined;
+  afterText?: string | undefined;
+  startChar?: number | null | undefined;
+  endChar?: number | null | undefined;
+  pageNumber?: number | null | undefined;
+  startLine?: number | null | undefined;
+  endLine?: number | null | undefined;
+  matchLevel?: QuoteMatchLevel | undefined;
+  validationWarnings?: string[] | undefined;
+}
+
+export interface NumericStructuredValue {
+  originalText: string;
+  originalUnit?: string | undefined;
+  originalValue?: number | undefined;
+  normalizedValue?: number | undefined;
+  normalizedUnit?: string | undefined;
+  approximate: boolean;
+  lowerBound?: number | undefined;
+  upperBound?: number | undefined;
+  exactForAggregation: boolean;
+  valueKind?: "money" | "count" | "percentage" | "date_duration" | "measurement" | "other" | undefined;
+  sourceEntity?: string | undefined;
+  targetEntity?: string | undefined;
+  normalizationWarnings?: string[] | undefined;
+}
 
 export interface PulseQuestionPlan {
   questionType: PulseQuestionType;
@@ -562,8 +822,16 @@ export interface PulseEvidenceRow {
   evidenceChunkId: string;
   treeNodeId?: string | null | undefined;
   evidenceQuote: string;
+  role?: GenericEvidenceRole | string | undefined;
+  contextUnitId?: string | undefined;
+  retrievalUnitId?: string | null | undefined;
+  citation?: CitationLocator | undefined;
+  documentId?: string | undefined;
+  versionId?: string | undefined;
+  headingPath?: string[] | undefined;
   confidence: number;
   countedInAnswer?: boolean | undefined;
+  countedInAggregation?: boolean | undefined;
   dedupeKey?: string | undefined;
   warnings?: string[] | undefined;
 }
@@ -582,6 +850,19 @@ export interface RetrievalTrace {
 export interface EvidencePack {
   id: string;
   question: string;
+  evidencePackSchemaVersion?: 1 | 2 | undefined;
+  pipeline?: {
+    indexProfile: ActiveIndexProfile;
+    packBuilder: "legacy" | "v2";
+    model: string;
+    promptVersion: string;
+  } | undefined;
+  pipelineVersion?: PipelineVersion | undefined;
+  answerMode?: AnswerMode | undefined;
+  answerModeReason?: string | undefined;
+  answerModeOverridden?: boolean | undefined;
+  contextUnits?: ContextUnit[] | undefined;
+  retrievalUnits?: RetrievalUnit[] | undefined;
   treeNodes: DocumentTreeNode[];
   parentChunks: ParentChildChunk[];
   semanticNodes: AbstractNode[];
@@ -612,10 +893,14 @@ export interface PulseEvidenceGap {
 export interface PulseEvidenceReconciliation {
   declaredTotal?: number | undefined;
   itemizedSum?: number | undefined;
+  exactItemizedSum?: number | undefined;
+  approximateItemizedLower?: number | undefined;
+  approximateItemizedUpper?: number | undefined;
   difference?: number | undefined;
   unit?: string | undefined;
   closed: boolean;
   explanation: string;
+  warnings?: string[] | undefined;
 }
 
 export interface PulseEvidenceStatus {
@@ -996,8 +1281,30 @@ export const mappingAuditResultSchema = z.object({
 
 export type MappingAuditResult = z.infer<typeof mappingAuditResultSchema>;
 
+export const citationLocatorSchema = z.object({
+  versionId: z.string().trim().min(1),
+  contextUnitId: z.string().trim().min(1),
+  contextUnitStableKey: z.string().trim().min(1).optional(),
+  retrievalUnitId: z.string().trim().min(1).nullable().optional(),
+  sourceNodeId: z.string().trim().min(1).nullable().optional(),
+  quote: z.string().trim().min(1).max(1200),
+  normalizedQuote: z.string().trim().min(1).max(1200),
+  quoteHash: z.string().trim().min(1),
+  locatorHash: z.string().trim().min(1),
+  occurrenceIndex: z.coerce.number().int().min(0).optional(),
+  beforeText: z.string().max(500).optional(),
+  afterText: z.string().max(500).optional(),
+  startChar: z.number().int().min(0).nullable().optional(),
+  endChar: z.number().int().min(0).nullable().optional(),
+  pageNumber: z.number().int().min(1).nullable().optional(),
+  startLine: z.number().int().min(1).nullable().optional(),
+  endLine: z.number().int().min(1).nullable().optional(),
+  matchLevel: z.enum(quoteMatchLevels).optional(),
+  validationWarnings: z.array(z.string().trim().min(1).max(300)).optional(),
+});
+
 export const pulseQuestionPlanSchema = z.object({
-  questionType: z.enum(["normal", "exhaustive_list", "numerical_aggregation", "timeline", "entity_relation", "legal_fact_breakdown", "comparison", "mixed"]),
+  questionType: z.enum(["normal", "exhaustive_list", "numerical_aggregation", "timeline", "entity_relation", "causal_explanation", "claim_support", "summary", "critique", "comparison", "mixed"]),
   requiresExhaustiveEvidence: z.boolean(),
   requiresStructuredEvidence: z.boolean(),
   requiresNumericalReconciliation: z.boolean(),
@@ -1056,7 +1363,7 @@ export const pulseEvidencePlanSchema = z.object({
 
 export const pulseEvidenceRowSchema = z.object({
   rowId: z.string().trim().min(1),
-  evidenceType: z.enum(["fact", "amount", "date", "entity_relation", "claim", "quote", "other"]),
+  evidenceType: z.enum(["fact", "amount", "date", "entity_relation", "claim", "quote", "timeline_event", "table_value", "other"]),
   claimText: z.string().trim().min(1).max(2000),
   structuredValue: z.unknown().optional(),
   sourceEntity: z.string().trim().max(300).optional(),
@@ -1065,8 +1372,16 @@ export const pulseEvidenceRowSchema = z.object({
   evidenceChunkId: z.string().trim().min(1),
   treeNodeId: z.string().trim().min(1).nullable().optional(),
   evidenceQuote: z.string().trim().min(1).max(1200),
+  role: z.string().trim().max(120).optional(),
+  contextUnitId: z.string().trim().min(1).optional(),
+  retrievalUnitId: z.string().trim().min(1).nullable().optional(),
+  citation: citationLocatorSchema.optional(),
+  documentId: z.string().trim().min(1).optional(),
+  versionId: z.string().trim().min(1).optional(),
+  headingPath: z.array(z.string()).optional(),
   confidence: z.coerce.number().min(0).max(1),
   countedInAnswer: z.boolean().optional(),
+  countedInAggregation: z.boolean().optional(),
   dedupeKey: z.string().trim().max(300).optional(),
   warnings: z.array(z.string().trim().min(1).max(300)).optional(),
 });
@@ -1086,10 +1401,14 @@ export const pulseEvidenceStatusSchema = z.object({
   reconciliation: z.object({
     declaredTotal: z.number().optional(),
     itemizedSum: z.number().optional(),
+    exactItemizedSum: z.number().optional(),
+    approximateItemizedLower: z.number().optional(),
+    approximateItemizedUpper: z.number().optional(),
     difference: z.number().optional(),
     unit: z.string().optional(),
     closed: z.boolean(),
     explanation: z.string().trim().min(1).max(1000),
+    warnings: z.array(z.string().trim().min(1).max(300)).optional(),
   }).optional(),
 });
 

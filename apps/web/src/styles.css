@@ -962,6 +962,19 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   color: #b7c7df;
   background: #101b2f;
 }
+.pipeline-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+}
+.pipeline-strip span {
+  border: 1px solid #263750;
+  border-radius: 6px;
+  padding: 5px 7px;
+  color: #b7c7df;
+  background: #101b2f;
+}
 .evidence-gaps {
   border-top: 1px solid #202d44;
   padding-top: 8px;

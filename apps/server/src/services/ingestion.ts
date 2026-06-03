@@ -4,6 +4,7 @@ import type { Chunk, GraphRulesSummary, IngestJob } from "@agent-thinking/contra
 import type { AppConfig } from "../config.js";
 import { AgentDatabase } from "../db.js";
 import { parseTextSections } from "../domain/chunker.js";
+import { buildContextIndex } from "../domain/context-units.js";
 import { buildDocumentIndex } from "../domain/document-tree.js";
 import { isWordMediaType } from "../domain/files.js";
 import { parseMarkdownStructure } from "../domain/source-structure.js";
@@ -181,6 +182,38 @@ export class IngestionQueue extends EventEmitter {
       const chunks = this.db.replaceChunks(source.libraryId, source.version.id, documentIndex.chunks);
       this.db.saveDocumentIndex(documentIndex, chunks);
       if (chunks.length === 0) throw new Error("文档中没有可处理的文本内容");
+      if (this.config.enableContextUnits || this.config.indexProfile === "dual" || this.config.indexProfile === "v2") {
+        const build = this.db.createIndexBuild(source.version.id, "v2");
+        try {
+          const contextIndex = buildContextIndex({
+            buildId: build.buildId,
+            versionId: source.version.id,
+            chunks,
+            treeNodes: documentIndex.treeNodes,
+            contextTokenBudget: this.config.modelPreferredContextTokens,
+          });
+          this.db.saveContextIndex(
+            build.buildId,
+            contextIndex.contextUnits,
+            contextIndex.retrievalUnits,
+            contextIndex.qualityReport,
+            contextIndex.performanceReport,
+          );
+          let vectorCount = 0;
+          for (let start = 0; start < contextIndex.retrievalUnits.length; start += 32) {
+            const batch = contextIndex.retrievalUnits.slice(start, start + 32);
+            const embeddings = await this.model.embed(batch.map((unit) => unit.text));
+            if (embeddings.length !== batch.length) throw new Error("RetrievalUnit embedding 返回数量与输入不一致");
+            batch.forEach((unit, index) => {
+              this.vectors.saveRetrievalUnit(source.libraryId, unit, embeddings[index] ?? []);
+              vectorCount += 1;
+            });
+          }
+          this.db.markIndexBuildReady(build.buildId, { vectorCount });
+        } catch (error) {
+          this.db.markIndexBuildFailed(build.buildId, error);
+        }
+      }
 
       this.setStage(jobId, "embedding", 0.48);
       const childChunks = chunks.filter((chunk) => chunk.nodeType === null || chunk.nodeType === "paragraph" || chunk.nodeType === "sentence" || chunk.nodeType === "unknown");

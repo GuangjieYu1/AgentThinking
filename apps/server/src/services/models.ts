@@ -1276,7 +1276,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "Pulse Question Planner. Analyze the user question semantically. Do not answer it. " +
             "Decide what evidence is required: exhaustive evidence, structured evidence, numerical reconciliation, source quotes, timeline completeness, or entity coverage. " +
             "Do not use or request question-specific regex rules. Return JSON only with exactly these fields: " +
-            '{"questionType":"normal|exhaustive_list|numerical_aggregation|timeline|entity_relation|legal_fact_breakdown|comparison|mixed","requiresExhaustiveEvidence":true,"requiresStructuredEvidence":true,"requiresNumericalReconciliation":false,"requiresSourceQuotes":true,"requiresTimelineCompleteness":false,"requiresEntityCoverage":false,"allowedPartialAnswer":true,"answerMustExposeGaps":true,"evidenceTargets":["..."],"keyEntities":["..."],"expectedEvidenceTypes":["..."],"riskLevel":"low|medium|high","reasoning":"..."}.',
+            '{"questionType":"normal|exhaustive_list|numerical_aggregation|timeline|entity_relation|causal_explanation|claim_support|summary|critique|comparison|mixed","requiresExhaustiveEvidence":true,"requiresStructuredEvidence":true,"requiresNumericalReconciliation":false,"requiresSourceQuotes":true,"requiresTimelineCompleteness":false,"requiresEntityCoverage":false,"allowedPartialAnswer":true,"answerMustExposeGaps":true,"evidenceTargets":["..."],"keyEntities":["..."],"expectedEvidenceTypes":["..."],"riskLevel":"low|medium|high","reasoning":"..."}.',
         },
         { role: "user", content: JSON.stringify({ question, mode }) },
       ],

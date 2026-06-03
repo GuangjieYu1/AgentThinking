@@ -1,0 +1,54 @@
+{
+  "caseId": "exhaustive_numeric_negative_roles_001",
+  "question": "Which values count toward the exact aggregation?",
+  "declaredTotal": 100,
+  "expectedItemizedSum": 40,
+  "expectedDifference": 60,
+  "unit": "unit",
+  "reconciliationShouldClose": false,
+  "items": [
+    {
+      "label": "declared total",
+      "value": 100,
+      "role": "declared_total",
+      "mustQuoteIncludes": ["Declared total is 100 units"],
+      "required": true,
+      "countedInAggregation": false
+    },
+    {
+      "label": "counted source item",
+      "value": 40,
+      "role": "itemized_value",
+      "mustQuoteIncludes": ["Source A contributes 40 units"],
+      "required": true,
+      "countedInAggregation": true
+    },
+    {
+      "label": "excluded source item",
+      "value": 20,
+      "role": "excluded_value",
+      "mustQuoteIncludes": ["Excluded value is 20 units"],
+      "required": true,
+      "countedInAggregation": false
+    },
+    {
+      "label": "approximate source item",
+      "value": 30,
+      "role": "approximate_value",
+      "mustQuoteIncludes": ["Approximately 30 units"],
+      "required": true,
+      "countedInAggregation": false
+    },
+    {
+      "label": "disputed source item",
+      "value": 10,
+      "role": "disputed_value",
+      "mustQuoteIncludes": ["Disputed value is 10 units"],
+      "required": true,
+      "countedInAggregation": false
+    }
+  ],
+  "requiredGaps": ["excluded and approximate values do not close the exact total"],
+  "mustNotCountItems": ["excluded source item", "approximate source item", "disputed source item"],
+  "forbiddenClaims": ["approximate values close the exact total"]
+}

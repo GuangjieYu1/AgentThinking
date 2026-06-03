@@ -120,6 +120,18 @@ function requireLibraryAccess(db: AgentDatabase, libraryId: string | undefined, 
   return libraryId;
 }
 
+function isLocalRequest(request: FastifyRequest): boolean {
+  const host = request.hostname.split(":")[0];
+  return host === "127.0.0.1" || host === "localhost" || request.ip === "127.0.0.1" || request.ip === "::1";
+}
+
+function requireDebugAccess(config: AppConfig, request: FastifyRequest): void {
+  if (!config.showDebugRetrieval) throw new Error("Debug API 未启用");
+  if (config.authRequired && request.user) return;
+  if (!config.authRequired && config.debugApiAllowUnauthLocal && isLocalRequest(request)) return;
+  throw new Error("Debug API 需要认证或显式本地开发开关");
+}
+
 function isPublicApi(method: string, url: string): boolean {
   const path = url.split("?")[0] ?? url;
   if (path === "/api/health" || path === "/api/auth/session") return true;
@@ -309,6 +321,35 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       documentTree: db.getDocumentTreeForVersion(request.params.versionId),
       summaryTree: db.getSummaryTreeForVersion(request.params.versionId),
     };
+  });
+  app.get<{ Params: { versionId: string } }>("/api/debug/versions/:versionId/v2-index-health", async (request) => {
+    requireDebugAccess(config, request);
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    return db.getV2IndexHealth(request.params.versionId);
+  });
+  app.get<{ Params: { versionId: string }; Querystring: { includeFullText?: string } }>("/api/debug/versions/:versionId/context-units", async (request) => {
+    requireDebugAccess(config, request);
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    const includeFullText = request.query.includeFullText === "true";
+    return db.getReadyContextUnits(request.params.versionId).map((unit) => ({
+      ...unit,
+      text: includeFullText ? unit.text.slice(0, config.debugMaxTextLength) : unit.text.slice(0, Math.min(240, config.debugMaxTextLength)),
+    }));
+  });
+  app.get<{ Params: { versionId: string }; Querystring: { includeFullText?: string } }>("/api/debug/versions/:versionId/retrieval-units", async (request) => {
+    requireDebugAccess(config, request);
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    const includeFullText = request.query.includeFullText === "true";
+    return db.getReadyRetrievalUnits(request.params.versionId).map((unit) => ({
+      ...unit,
+      text: includeFullText ? unit.text.slice(0, config.debugMaxTextLength) : unit.text.slice(0, Math.min(240, config.debugMaxTextLength)),
+    }));
   });
   app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/document-tree", async (request) => {
     const source = db.getVersionSource(request.params.versionId);

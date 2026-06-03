@@ -1,4 +1,4 @@
-import type { Chunk, SearchResult, SummaryTreeNode } from "@agent-thinking/contracts";
+import type { Chunk, RetrievalUnit, SearchResult, SummaryTreeNode } from "@agent-thinking/contracts";
 import * as sqliteVec from "sqlite-vec";
 import { AgentDatabase } from "../db.js";
 
@@ -48,6 +48,10 @@ export class VectorStore {
 
   saveSummary(libraryId: string, summary: SummaryTreeNode, embedding: number[]): void {
     this.db.saveSummaryEmbedding(libraryId, summary.id, embedding.length, toBlob(embedding));
+  }
+
+  saveRetrievalUnit(libraryId: string, unit: RetrievalUnit, embedding: number[]): void {
+    this.db.saveVectorRecord(libraryId, unit.versionId, unit.buildId, 2, "retrieval_unit", unit.id, embedding.length, toBlob(embedding));
   }
 
   search(
@@ -104,6 +108,22 @@ export class VectorStore {
     }
     return this.db.listSummaryEmbeddings(libraryId, queryEmbedding.length)
       .map(({ summary, embedding }) => ({ summary, score: cosine(queryEmbedding, fromBlob(embedding)) }))
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit);
+  }
+
+  searchRetrievalUnits(
+    libraryId: string,
+    buildId: string,
+    queryEmbedding: number[],
+    units: Map<string, RetrievalUnit>,
+    limit: number,
+  ): Array<{ unit: RetrievalUnit; score: number }> {
+    return this.db.listVectorRecords(libraryId, buildId, "retrieval_unit", queryEmbedding.length)
+      .flatMap(({ targetId, embedding }) => {
+        const unit = units.get(targetId);
+        return unit ? [{ unit, score: cosine(queryEmbedding, fromBlob(embedding)) }] : [];
+      })
       .sort((left, right) => right.score - left.score)
       .slice(0, limit);
   }

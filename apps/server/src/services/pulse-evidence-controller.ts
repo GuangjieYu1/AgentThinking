@@ -21,6 +21,7 @@ import type {
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
 import type { VectorStore } from "./vector-store.js";
+import { computeGenericReconciliation, normalizeAnswerMode, overclaimErrors } from "./evidence-v2.js";
 
 type PulseEventSink = (event: { type: "stage"; message: string }) => void | Promise<void>;
 
@@ -139,6 +140,7 @@ function amountWan(row: PulseEvidenceRow): number | undefined {
 
 function isDeclaredTotal(row: PulseEvidenceRow): boolean {
   const value = structuredRecord(row.structuredValue);
+  if (row.role === "declared_total" || row.role === "stated_total") return true;
   if (value.isDeclaredTotal === true) return true;
   const role = typeof value.role === "string" ? value.role.toLowerCase() : "";
   const kind = typeof value.kind === "string" ? value.kind.toLowerCase() : "";
@@ -146,6 +148,8 @@ function isDeclaredTotal(row: PulseEvidenceRow): boolean {
 }
 
 export function computePulseReconciliation(rows: PulseEvidenceRow[]): PulseEvidenceReconciliation | undefined {
+  const generic = computeGenericReconciliation(rows);
+  if (generic) return generic;
   const amountRows = rows.filter((row) => amountWan(row) !== undefined);
   if (amountRows.length === 0) return undefined;
   const declaredTotals = amountRows.filter(isDeclaredTotal).map((row) => amountWan(row)!).filter(Number.isFinite);
@@ -192,6 +196,7 @@ export function verifyPulseAnswer(
   if (!evidenceStatus.sufficient && /全部|每一笔|完整|穷尽|所有|无遗漏|complete|all|every/i.test(answer)) {
     errors.push("证据不足时不能声称完整、全部或无遗漏。");
   }
+  errors.push(...overclaimErrors(answer, questionPlan, evidenceStatus.sufficient));
   const reconciliation = evidenceStatus.reconciliation;
   if (questionPlan.requiresNumericalReconciliation && reconciliation && !reconciliation.closed) {
     const diff = reconciliation.difference;
@@ -796,9 +801,29 @@ export class PulseEvidenceController {
         pageNumber: chunk?.pageNumber ?? null,
       }];
     });
+    const answerMode = normalizeAnswerMode(memory.questionPlan);
     return {
       id: `evidence-pack-${Date.now()}`,
       question,
+      evidencePackSchemaVersion: 1,
+      pipeline: {
+        indexProfile: "v1",
+        packBuilder: "legacy",
+        model: this.model.name,
+        promptVersion: "pulse-evidence-v1-generic",
+      },
+      pipelineVersion: {
+        indexerVersion: "legacy-v1",
+        contextUnitBuilderVersion: "not_used",
+        retrievalUnitBuilderVersion: "not_used",
+        packBuilderVersion: "legacy-v1",
+        evidenceExtractorVersion: "pulse-evidence-v1-generic",
+        validatorVersion: "pulse-evidence-v2-foundation",
+        promptVersion: "pulse-evidence-v1-generic",
+      },
+      answerMode: answerMode.answerMode,
+      answerModeReason: answerMode.reason,
+      answerModeOverridden: answerMode.overridden,
       treeNodes,
       parentChunks: memory.parentChunks ?? [],
       semanticNodes: memory.graphNodes.flatMap((node) => {

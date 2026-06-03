@@ -1,5 +1,7 @@
 import type {
   AbstractNodeKind,
+  AoriIndexingStage,
+  AoriRiskLevel,
   AspectKind,
   Chunk,
   Citation,
@@ -73,14 +75,37 @@ export interface MappingAuditContext {
   note?: string;
 }
 
+export interface AoriExtractionContext {
+  stage: AoriIndexingStage;
+  groupId: string;
+  documentName: string;
+  documentTokenEstimate: number;
+  inputTokenEstimate: number;
+  usedTokenEstimate: number;
+  preservedRanges: string[];
+  omittedRanges: string[];
+  truncated: boolean;
+  risk: AoriRiskLevel;
+  minTruncatedContextTokens: number;
+  evidenceBindingMinContextTokens: number;
+  allowSmallContextOnlyForQuoteLookup: boolean;
+}
+
 interface ExtractionRuleOptions {
   stage?: GraphRuleStage;
   onGraphRules?: (result: GraphRulesResult) => void;
+  aoriContext?: AoriExtractionContext | undefined;
 }
 
 interface FinalizedExtraction {
   output: ExtractionOutput;
   graphRules: GraphRulesResult;
+}
+
+interface ExtractionOutputLimits {
+  maxNodes: number;
+  maxRelations: number;
+  maxThemes: number;
 }
 
 type MappingAuditReview = Pick<MappingAuditResult, "status" | "summary" | "findings">;
@@ -284,13 +309,24 @@ function fallbackExtractionFromChunks(chunks: Chunk[], note = "模型结构化�
   return { nodes, relations: [], themes: [] };
 }
 
-function sanitizeExtractionOutput(value: unknown, allowedChunks: Chunk[], fallbackNote?: string): ExtractionOutput {
+function extractionOutputLimits(options: ExtractionRuleOptions): ExtractionOutputLimits {
+  return options.aoriContext
+    ? { maxNodes: 96, maxRelations: 192, maxThemes: 32 }
+    : { maxNodes: 32, maxRelations: 64, maxThemes: 12 };
+}
+
+function sanitizeExtractionOutput(
+  value: unknown,
+  allowedChunks: Chunk[],
+  fallbackNote?: string,
+  limits: ExtractionOutputLimits = { maxNodes: 32, maxRelations: 64, maxThemes: 12 },
+): ExtractionOutput {
   const allowedChunkIds = new Set(allowedChunks.map((chunk) => chunk.id));
   const source = value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
   const rawNodes = Array.isArray(source.nodes) ? source.nodes : [];
-  const nodes = rawNodes.slice(0, 32).map((entry, index) => {
+  const nodes = rawNodes.slice(0, limits.maxNodes).map((entry, index) => {
     const node = entry && typeof entry === "object" && !Array.isArray(entry)
       ? entry as Record<string, unknown>
       : {};
@@ -310,7 +346,7 @@ function sanitizeExtractionOutput(value: unknown, allowedChunks: Chunk[], fallba
   if (nodes.length === 0 && allowedChunks.length > 0) return fallbackExtractionFromChunks(allowedChunks, fallbackNote);
   const nodeKeys = new Set(nodes.map((node) => node.key));
   const rawRelations = Array.isArray(source.relations) ? source.relations : [];
-  const relations = rawRelations.slice(0, 64).flatMap((entry) => {
+  const relations = rawRelations.slice(0, limits.maxRelations).flatMap((entry) => {
     const relation = entry && typeof entry === "object" && !Array.isArray(entry)
       ? entry as Record<string, unknown>
       : {};
@@ -336,7 +372,7 @@ function sanitizeExtractionOutput(value: unknown, allowedChunks: Chunk[], fallba
     }];
   });
   const rawThemes = Array.isArray(source.themes) ? source.themes : [];
-  const themes = rawThemes.slice(0, 12).flatMap((entry, index) => {
+  const themes = rawThemes.slice(0, limits.maxThemes).flatMap((entry, index) => {
     const theme = entry && typeof entry === "object" && !Array.isArray(entry)
       ? entry as Record<string, unknown>
       : {};
@@ -361,7 +397,7 @@ function finalizeExtractionOutput(
   fallbackNote?: string,
   options: ExtractionRuleOptions = {},
 ): FinalizedExtraction {
-  const sanitized = sanitizeExtractionOutput(value, allowedChunks, fallbackNote);
+  const sanitized = sanitizeExtractionOutput(value, allowedChunks, fallbackNote, extractionOutputLimits(options));
   const graphRules = applyGraphRulesToExtraction(sanitized, {
     allowedChunks,
     ...(options.stage ? { mode: options.stage } : {}),
@@ -485,7 +521,7 @@ export class FakeModelProvider implements ModelProvider {
   }
 
   async extract(chunks: Chunk[], _relatedChunks: Map<string, Chunk[]> = new Map(), options: ExtractionRuleOptions = {}): Promise<ExtractionOutput> {
-    const selected = chunks.slice(0, 10);
+    const selected = chunks.slice(0, options.aoriContext ? 32 : 10);
     const nodes = selected.map((chunk, index) => {
       const opening = chunk.text.split(/[。\n.!?]/, 1)[0]?.trim() || `片段 ${index + 1}`;
       const kind = /因此|所以|therefore|conclusion|should|必须/i.test(chunk.text) ? "claim" as const : "concept" as const;
@@ -895,16 +931,55 @@ export class OpenAICompatibleProvider implements ModelProvider {
     options: ExtractionRuleOptions = {},
   ): Promise<ExtractionOutput> {
     if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const aori = options.aoriContext;
     const evidence = chunks.map((chunk) => ({
       id: chunk.id,
       source: chunk.headingPath ?? (chunk.pageNumber ? `PDF page ${chunk.pageNumber}` : ""),
-      text: chunk.text.slice(0, 2400),
+      ordinal: chunk.ordinal,
+      estimatedTokens: Math.max(1, Math.ceil(chunk.text.length / 4)),
+      text: aori ? chunk.text : chunk.text.slice(0, 2400),
       candidates: (relatedChunks.get(chunk.id) ?? []).map((candidate) => ({
         id: candidate.id,
         source: candidate.headingPath ?? (candidate.pageNumber ? `PDF page ${candidate.pageNumber}` : ""),
-        text: candidate.text.slice(0, 1200),
+        ordinal: candidate.ordinal,
+        estimatedTokens: Math.max(1, Math.ceil(candidate.text.length / 4)),
+        text: aori ? candidate.text : candidate.text.slice(0, 1200),
       })),
     }));
+    const compactExtractionPrompt =
+      "You extract a compact knowledge graph from evidence chunks. Return JSON with this shape: " +
+      '{"nodes":[{"key":"n1","kind":"concept","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["system"]}],' +
+      '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
+      '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
+      "Node kind is concept or claim. Relation type must be supports, contradicts, explains, depends_on, example_of, or related_to. " +
+      "Every node and theme must include an aspects array (it may be empty) chosen from person, operation, system, story, claim, conflict, time, other. " +
+      "Create a small number of themes only when multiple nodes share a defensible higher-level subject; themes organize navigation and must cite evidence. " +
+      "Candidate evidence may come from other documents and should be used to identify contradictions. " +
+      "Every node and relation must cite evidenceChunkIds from supplied evidence or candidate ids; only create defensible relationships. " +
+      "Use Simplified Chinese for every title, summary, and reason. Keep nodes atomic and source-faithful: preserve uncertainty, hearsay, temporal order, and who claims what. " +
+      "Do not turn enemy/opposition, sequence, or narrative tension into contradicts unless the source states a logical contradiction. " +
+      "Prefer 1-4 high-value relations for each central chunk when the source or candidate chunks explicitly support them; avoid isolated nodes when a clear relation exists. " +
+      "Relation Governance Rules: " +
+      "1. Only use allowed relation types. " +
+      "2. Co-occurrence is not a strong relation. " +
+      "3. Strong relations require direct evidence. " +
+      "4. related_to is the weakest fallback relation. " +
+      "5. Direction matters. " +
+      "6. Contradiction requires same scope. " +
+      "7. If unsure, omit the relation or use related_to with low confidence.";
+    const aoriExtractionPrompt =
+      "AORI indexing mode. First read the supplied full document or large context group globally, then generate aspects, aspect items, self-check questions, relation vocabulary, candidate nodes, themes, and relations. " +
+      "Do not treat the supplied chunks as independent small retrieval windows. They are source-locator and evidence-binding units only. " +
+      "If the context is truncated, reason from the preserved ranges and expose uncertainty in summaries or relation reasons where coverage may be incomplete. " +
+      "Never infer from omitted ranges. Do not use paragraph-sized or sentence-sized fragments as the main understanding unit; small chunks are only for quote lookup and evidence backtracking. " +
+      `When this group is truncated, its usedTokenEstimate must be at least ${aori?.minTruncatedContextTokens ?? 10_000} unless the remaining original text is smaller. ` +
+      "Return JSON with exactly this shape: " +
+      '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["person|operation|system|story|claim|conflict|time|other"]}],' +
+      '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
+      '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
+      "Every node, relation, and theme must cite evidenceChunkIds from supplied evidence ids. Use Simplified Chinese for every title, summary, and reason. " +
+      "Relation Governance Rules: only use allowed relation types; co-occurrence is not a strong relation; strong relations require direct evidence; direction matters; contradiction requires same scope; if unsure, omit the relation or use related_to with low confidence. " +
+      "Closure Check: before returning, check whether important sections in the supplied large context group are missing from nodes/themes, and prefer adding a source-faithful node over over-compressing unrelated meanings.";
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.1,
@@ -912,31 +987,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
       messages: [
         {
           role: "system",
-          content:
-            "You extract a compact knowledge graph from evidence chunks. Return JSON with this shape: " +
-            '{"nodes":[{"key":"n1","kind":"concept","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["system"]}],' +
-            '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
-            '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
-            "Node kind is concept or claim. Relation type must be supports, contradicts, explains, depends_on, example_of, or related_to. " +
-            "Every node and theme must include an aspects array (it may be empty) chosen from person, operation, system, story, claim, conflict, time, other. " +
-            "Create a small number of themes only when multiple nodes share a defensible higher-level subject; themes organize navigation and must cite evidence. " +
-            "Candidate evidence may come from other documents and should be used to identify contradictions. " +
-            "Every node and relation must cite evidenceChunkIds from supplied evidence or candidate ids; only create defensible relationships. " +
-            "Use Simplified Chinese for every title, summary, and reason. Keep nodes atomic and source-faithful: preserve uncertainty, hearsay, temporal order, and who claims what. " +
-            "Do not turn enemy/opposition, sequence, or narrative tension into contradicts unless the source states a logical contradiction. " +
-            "Prefer 1-4 high-value relations for each central chunk when the source or candidate chunks explicitly support them; avoid isolated nodes when a clear relation exists. " +
-            "Relation Governance Rules: " +
-            "1. Only use allowed relation types. " +
-            "2. Co-occurrence is not a strong relation. " +
-            "3. Strong relations require direct evidence. " +
-            "4. related_to is the weakest fallback relation. " +
-            "5. Direction matters. " +
-            "6. Contradiction requires same scope. " +
-            "7. If unsure, omit the relation or use related_to with low confidence.",
+          content: aori ? aoriExtractionPrompt : compactExtractionPrompt,
         },
-        { role: "user", content: JSON.stringify({ evidence }) },
+        { role: "user", content: JSON.stringify(aori ? { aoriContext: aori, evidence } : { evidence }) },
       ],
-      max_tokens: 4096,
+      max_tokens: aori ? 12000 : 4096,
     };
     if (this.config.provider === "deepseek") {
       body.thinking = { type: this.config.thinkingMode };

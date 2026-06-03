@@ -66,6 +66,15 @@ export const graphRuleCategories = [
   "semantic_coverage",
   "graph_evolution",
 ] as const;
+export const aoriIndexingStages = [
+  "global_reading",
+  "aspect_proposal",
+  "node_binding",
+  "relation_extraction",
+  "closure_check",
+] as const;
+export const aoriContextDecisionTypes = ["context_truncation"] as const;
+export const aoriRiskLevels = ["low", "medium", "high"] as const;
 export const graphRuleDecisions = ["kept", "downgraded", "excluded_from_graph", "needs_review"] as const;
 export const graphRuleActions = [
   "relation_type_validated",
@@ -129,6 +138,9 @@ export type MappingAuditStatus = (typeof mappingAuditStatuses)[number];
 export type MappingAuditFindingKind = (typeof mappingAuditFindingKinds)[number];
 export type MappingAuditSeverity = (typeof mappingAuditSeverities)[number];
 export type GraphRuleCategory = (typeof graphRuleCategories)[number];
+export type AoriIndexingStage = (typeof aoriIndexingStages)[number];
+export type AoriContextDecisionType = (typeof aoriContextDecisionTypes)[number];
+export type AoriRiskLevel = (typeof aoriRiskLevels)[number];
 export type GraphRuleDecision = (typeof graphRuleDecisions)[number];
 export type LegacyGraphRuleDecision = GraphRuleDecision | "dropped";
 export type GraphRuleAction = (typeof graphRuleActions)[number];
@@ -332,7 +344,36 @@ export interface ContextUnitQualityReport {
   overBudgetContextUnits: Array<{ contextUnitId: string; estimatedTokens: number; budget: number }>;
   suspiciousTinyContextUnits: string[];
   suspiciousHugeRetrievalUnits: string[];
+  aoriContextPolicy?: AoriContextPolicy | undefined;
+  aoriRationaleTrace?: AoriIndexingRationale[] | undefined;
+  reflectiveIndexReport?: ReflectiveIndexReport | undefined;
   generatedAt: string;
+}
+
+export interface AoriContextPolicy {
+  modelContextTokens: number;
+  globalReadMaxInputTokens: number;
+  minTruncatedContextTokens: number;
+  evidenceBindingMinContextTokens: number;
+  allowSmallContextOnlyForQuoteLookup: boolean;
+}
+
+export interface AoriIndexingRationale {
+  stage: AoriIndexingStage;
+  decisionType: AoriContextDecisionType;
+  summary: string;
+  inputTokenEstimate: number;
+  usedTokenEstimate: number;
+  omittedRanges: string[];
+  preservedRanges: string[];
+  risk: AoriRiskLevel;
+}
+
+export interface ReflectiveIndexReport {
+  summary: string;
+  completenessRisk: "none" | AoriRiskLevel;
+  warnings: string[];
+  truncationCount: number;
 }
 
 export interface IndexingPerformanceReport {

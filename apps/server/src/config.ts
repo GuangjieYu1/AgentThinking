@@ -41,6 +41,12 @@ export interface AppConfig {
   modelMaxInputTokens: number;
   modelPreferredContextTokens: number;
   compactExcerptTokens: number;
+  aoriModelContextTokens: number;
+  aoriGlobalReadMaxInputTokens: number;
+  aoriMinTruncatedContextTokens: number;
+  aoriEvidenceBindingMinContextTokens: number;
+  aoriAllowSmallContextOnlyForQuoteLookup: boolean;
+  recordIndexingRationale: boolean;
 }
 
 export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -99,6 +105,18 @@ export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     modelPreferredContextTokens: overrides.modelPreferredContextTokens ??
       Number(process.env.MODEL_PREFERRED_CONTEXT_TOKENS ?? 6000),
     compactExcerptTokens: overrides.compactExcerptTokens ?? Number(process.env.COMPACT_EXCERPT_TOKENS ?? 12000),
+    aoriModelContextTokens: overrides.aoriModelContextTokens ??
+      Number(process.env.AORI_MODEL_CONTEXT_TOKENS ?? 1_000_000),
+    aoriGlobalReadMaxInputTokens: overrides.aoriGlobalReadMaxInputTokens ??
+      Number(process.env.AORI_GLOBAL_READ_MAX_INPUT_TOKENS ?? 800_000),
+    aoriMinTruncatedContextTokens: overrides.aoriMinTruncatedContextTokens ??
+      Number(process.env.AORI_MIN_TRUNCATED_CONTEXT_TOKENS ?? 10_000),
+    aoriEvidenceBindingMinContextTokens: overrides.aoriEvidenceBindingMinContextTokens ??
+      Number(process.env.AORI_EVIDENCE_BINDING_MIN_CONTEXT_TOKENS ?? 10_000),
+    aoriAllowSmallContextOnlyForQuoteLookup: overrides.aoriAllowSmallContextOnlyForQuoteLookup ??
+      process.env.AORI_ALLOW_SMALL_CONTEXT_ONLY_FOR_QUOTE_LOOKUP !== "false",
+    recordIndexingRationale: overrides.recordIndexingRationale ??
+      (process.env.RECORD_INDEXING_RATIONALE === "true" || process.env.AORI_RECORD_INDEXING_RATIONALE === "true"),
   };
 }
 

@@ -60,6 +60,52 @@ describe("DeepSeek model configuration", () => {
     expect((body.messages as Array<{ content: string }>)[0]!.content).toContain("Relation Governance Rules");
   });
 
+  it("keeps full source text in AORI long-context extraction requests", async () => {
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ nodes: [], relations: [], themes: [] }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new OpenAICompatibleProvider(config);
+    const tailMarker = "AORI_TAIL_MARKER";
+    const chunk: Chunk = {
+      id: "chunk-1",
+      libraryId: "library-1",
+      versionId: "version-1",
+      ordinal: 0,
+      headingPath: "Long",
+      pageNumber: null,
+      startLine: null,
+      endLine: null,
+      blockId: null,
+      startChar: 0,
+      endChar: 4000,
+      text: `${"long-context ".repeat(260)}${tailMarker}`,
+      aspects: [],
+    };
+    await provider.extract([chunk], new Map(), {
+      aoriContext: {
+        stage: "global_reading",
+        groupId: "aori-global-1",
+        documentName: "long.md",
+        documentTokenEstimate: 1200,
+        inputTokenEstimate: 1200,
+        usedTokenEstimate: 1200,
+        preservedRanges: ["Long"],
+        omittedRanges: [],
+        truncated: false,
+        risk: "low",
+        minTruncatedContextTokens: 10000,
+        evidenceBindingMinContextTokens: 10000,
+        allowSmallContextOnlyForQuoteLookup: true,
+      },
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as { messages: Array<{ content: string }>; max_tokens: number };
+    expect(body.messages[0]!.content).toContain("AORI indexing mode");
+    expect(body.messages[1]!.content).toContain(tailMarker);
+    expect(body.max_tokens).toBe(12000);
+  });
+
   it("sanitizes extracted nodes that omit optional-but-required arrays", async () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       new Response(JSON.stringify({

@@ -1,6 +1,7 @@
 import type {
   AbstractNode,
   Chunk,
+  ContextUnit,
   EvidenceCitation,
   EvidencePack,
   PulseAnswerOutput,
@@ -15,13 +16,14 @@ import type {
   PulseQuestionPlan,
   PulseVerificationResult,
   Relation,
+  RetrievalUnit,
   SearchResult,
   SummaryTreeNode,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
 import type { VectorStore } from "./vector-store.js";
-import { computeGenericReconciliation, normalizeAnswerMode, overclaimErrors } from "./evidence-v2.js";
+import { computeGenericReconciliation, normalizeAnswerMode, overclaimErrors, validateEvidenceRow } from "./evidence-v2.js";
 
 type PulseEventSink = (event: { type: "stage"; message: string }) => void | Promise<void>;
 
@@ -113,6 +115,29 @@ function compactChunk(chunk: Chunk): PulseEvidenceMemory["collectedChunks"][numb
     parentChunkId: chunk.parentChunkId ?? null,
     documentTreeNodeId: chunk.documentTreeNodeId ?? null,
     nodeType: chunk.nodeType ?? null,
+  };
+}
+
+function contextUnitAsChunk(libraryId: string, unit: ContextUnit): Chunk {
+  return {
+    id: unit.id,
+    libraryId,
+    versionId: unit.versionId,
+    parentChunkId: null,
+    documentTreeNodeId: unit.primarySourceNodeId ?? null,
+    childOrdinal: null,
+    parentOrdinal: unit.ordinal,
+    nodeType: "section",
+    ordinal: unit.ordinal,
+    headingPath: unit.displayHeadingPath.join(" / ") || null,
+    pageNumber: null,
+    startLine: null,
+    endLine: null,
+    blockId: null,
+    startChar: unit.sourceRange.startChar,
+    endChar: unit.sourceRange.endChar,
+    text: unit.text,
+    aspects: [],
   };
 }
 
@@ -240,13 +265,14 @@ export class PulseEvidenceController {
     for (const hit of seedContext.hits) hitMap.set(`${hit.targetType}:${hit.targetId}`, hit);
 
     await this.extractRowsForChunks(question, memory, "Seed evidence from the existing pulse graph.");
-    const initialPlan = await this.model.planPulseEvidence({
+    const planned = await this.model.planPulseEvidence({
       question,
       mode,
       questionPlan,
       memorySummary: this.memorySummary(memory),
       tools: allowedTools,
     });
+    const initialPlan = this.withEvidenceHeavySteps(planned, questionPlan);
     const defaultMaxIterations = mode === "progressive"
       ? questionPlan.riskLevel === "high" && questionPlan.requiresExhaustiveEvidence ? 6 : 5
       : 2;
@@ -338,6 +364,11 @@ export class PulseEvidenceController {
       question,
       questionPlan,
       collectedChunks: [...chunkMap.values()],
+      legacyChunks: [...chunkMap.values()],
+      contextUnits: [],
+      retrievalUnits: [],
+      contextBlocks: [],
+      usedIndexProfile: "v1",
       graphNodes: [...nodeMap.values()],
       graphRelations: [...relationMap.values()],
       treeNodes: [],
@@ -361,9 +392,106 @@ export class PulseEvidenceController {
     });
   }
 
+  private withEvidenceHeavySteps(plan: PulseEvidencePlan, questionPlan: PulseQuestionPlan): PulseEvidencePlan {
+    const answerMode = normalizeAnswerMode(questionPlan);
+    if (answerMode.answerMode !== "evidence_heavy") return plan;
+    const hasTool = (tool: PulseEvidenceTool) => plan.steps.some((step) => (toolAliases.get(step.tool) ?? step.tool) === tool);
+    const required: PulseEvidenceStep[] = [];
+    if (!hasTool("retrieveParentChunks")) {
+      required.push({
+        tool: "retrieveParentChunks",
+        purpose: "Evidence-heavy mode requires source context for extracted evidence.",
+        expectedResult: "Context units or parent chunks around current evidence anchors.",
+      });
+    }
+    if (!hasTool("retrieveSectionSubtree")) {
+      required.push({
+        tool: "retrieveSectionSubtree",
+        purpose: "Evidence-heavy mode requires same-section coverage for exhaustive or numerical questions.",
+        expectedResult: "Same-section context units or chunks for structured evidence extraction.",
+      });
+    }
+    return {
+      ...plan,
+      steps: [...plan.steps, ...required],
+      maxIterations: Math.max(plan.maxIterations, questionPlan.requiresExhaustiveEvidence ? 4 : 2),
+    };
+  }
+
   private evidenceChunkLimit(mode: PulseInputMode, memory: PulseEvidenceMemory): number {
     if (mode !== "progressive") return 12;
     return memory.questionPlan.riskLevel === "high" && memory.questionPlan.requiresExhaustiveEvidence ? 12 : 10;
+  }
+
+  private readyV2Context(libraryId: string): {
+    buildId: string;
+    contextUnits: ContextUnit[];
+    retrievalUnits: RetrievalUnit[];
+    contextById: Map<string, ContextUnit>;
+    retrievalById: Map<string, RetrievalUnit>;
+  } | undefined {
+    const retrievalUnits = this.db.getReadyRetrievalUnitsForLibrary(libraryId);
+    if (retrievalUnits.length === 0) return undefined;
+    const contextUnits = this.db.getContextUnitsByIds([...new Set(retrievalUnits.map((unit) => unit.contextUnitId))]);
+    if (contextUnits.length === 0) return undefined;
+    const buildId = retrievalUnits[0]?.buildId;
+    if (!buildId) return undefined;
+    return {
+      buildId,
+      contextUnits,
+      retrievalUnits,
+      contextById: new Map(contextUnits.map((unit) => [unit.id, unit])),
+      retrievalById: new Map(retrievalUnits.map((unit) => [unit.id, unit])),
+    };
+  }
+
+  private addContextUnits(memory: PulseEvidenceMemory, units: ContextUnit[]): void {
+    memory.contextUnits ??= [];
+    memory.contextBlocks ??= [];
+    const existing = new Set(memory.contextUnits.map((unit) => unit.id));
+    for (const unit of units) {
+      if (existing.has(unit.id)) continue;
+      existing.add(unit.id);
+      memory.contextUnits.push(unit);
+      memory.contextBlocks.push(...unit.blocks);
+    }
+  }
+
+  private addRetrievalUnits(memory: PulseEvidenceMemory, units: RetrievalUnit[]): void {
+    memory.retrievalUnits ??= [];
+    const existing = new Set(memory.retrievalUnits.map((unit) => unit.id));
+    for (const unit of units) {
+      if (existing.has(unit.id)) continue;
+      existing.add(unit.id);
+      memory.retrievalUnits.push(unit);
+    }
+  }
+
+  private v2ChunksFromUnits(libraryId: string, memory: PulseEvidenceMemory, units: ContextUnit[], retrievalUnits: RetrievalUnit[] = []): Chunk[] {
+    this.addContextUnits(memory, units);
+    this.addRetrievalUnits(memory, retrievalUnits);
+    memory.usedIndexProfile = "v2";
+    return units.map((unit) => contextUnitAsChunk(libraryId, unit));
+  }
+
+  private mergeContextUnits(units: ContextUnit[], limit: number): ContextUnit[] {
+    const byId = new Map<string, ContextUnit>();
+    for (const unit of units) if (!byId.has(unit.id)) byId.set(unit.id, unit);
+    return [...byId.values()].sort((left, right) => left.ordinal - right.ordinal).slice(0, limit);
+  }
+
+  private contextAnchors(memory: PulseEvidenceMemory, limit: number): ContextUnit[] {
+    const byId = new Map((memory.contextUnits ?? []).map((unit) => [unit.id, unit]));
+    for (const row of memory.evidenceRows) {
+      if (row.contextUnitId && !byId.has(row.contextUnitId)) {
+        const unit = this.db.getContextUnitsByIds([row.contextUnitId])[0];
+        if (unit) byId.set(unit.id, unit);
+      }
+      if (byId.has(row.evidenceChunkId)) continue;
+      const unit = this.db.getContextUnitsByIds([row.evidenceChunkId])[0];
+      if (unit) byId.set(unit.id, unit);
+    }
+    return [...byId.values()].sort((left, right) => right.ordinal - left.ordinal).slice(0, limit);
   }
 
   private async executeStep(
@@ -380,15 +508,97 @@ export class PulseEvidenceController {
     let chunks: Chunk[] = [];
     const rowCountBefore = memory.evidenceRows.length;
     const inputIds = [...(step.basedOnChunkIds ?? []), ...(step.basedOnNodeIds ?? [])];
-    if (step.tool === "semanticSearchChildChunks") {
+    const v2 = this.readyV2Context(libraryId);
+    let actualIndexProfile: "v1" | "v2" = "v1";
+    let targetType: "legacy_chunk" | "retrieval_unit" = "legacy_chunk";
+    let buildId: string | undefined;
+    let outputRetrievalUnitIds: string[] = [];
+    let fallbackReason: string | undefined;
+    if (v2 && step.tool === "semanticSearchChildChunks") {
+      const [embedding] = await this.model.embed([query]);
+      const retrievalByBuild = new Map<string, RetrievalUnit[]>();
+      for (const unit of v2.retrievalUnits) {
+        const group = retrievalByBuild.get(unit.buildId) ?? [];
+        group.push(unit);
+        retrievalByBuild.set(unit.buildId, group);
+      }
+      const results = embedding
+        ? [...retrievalByBuild.entries()]
+          .flatMap(([groupBuildId, units]) => this.vectors.searchRetrievalUnits(
+            libraryId,
+            groupBuildId,
+            embedding,
+            new Map(units.map((unit) => [unit.id, unit])),
+            limit,
+          ))
+          .sort((left, right) => right.score - left.score)
+          .slice(0, limit)
+        : [];
+      const contextUnits = this.mergeContextUnits(results.flatMap((result) => v2.contextById.get(result.unit.contextUnitId) ?? []), limit);
+      outputRetrievalUnitIds = results.map((result) => result.unit.id);
+      chunks = this.v2ChunksFromUnits(libraryId, memory, contextUnits, results.map((result) => result.unit));
+      actualIndexProfile = "v2";
+      targetType = "retrieval_unit";
+      buildId = v2.buildId;
+    } else if (v2 && step.tool === "fullTextSearchChildChunks") {
+      const results = this.db.searchRetrievalUnitsText(libraryId, query, limit);
+      const contextUnits = this.mergeContextUnits(results.flatMap((result) => v2.contextById.get(result.unit.contextUnitId) ?? []), limit);
+      outputRetrievalUnitIds = results.map((result) => result.unit.id);
+      chunks = this.v2ChunksFromUnits(libraryId, memory, contextUnits, results.map((result) => result.unit));
+      actualIndexProfile = "v2";
+      targetType = "retrieval_unit";
+      buildId = v2.buildId;
+    } else if (v2 && step.tool === "retrieveParentChunks") {
+      const ids = step.basedOnChunkIds ?? this.contextAnchors(memory, limit).map((unit) => unit.id);
+      const direct = this.db.getContextUnitsByIds(ids);
+      const fromRetrieval = this.db.getRetrievalUnitsByIds(ids).flatMap((unit) => v2.contextById.get(unit.contextUnitId) ?? []);
+      const anchors = this.mergeContextUnits([...direct, ...fromRetrieval, ...this.contextAnchors(memory, limit)], mode === "progressive" ? limit : 30);
+      chunks = this.v2ChunksFromUnits(libraryId, memory, anchors);
+      actualIndexProfile = "v2";
+      targetType = "retrieval_unit";
+      buildId = v2.buildId;
+    } else if (v2 && step.tool === "retrieveSiblingNodes") {
+      const anchors = this.contextAnchors(memory, Math.max(1, Math.min(limit, 6)));
+      const anchorKeys = new Set(anchors.map((unit) => `${unit.versionId}:${unit.ordinal}`));
+      const siblings = this.mergeContextUnits(v2.contextUnits.filter((unit) => {
+        for (const anchor of anchors) {
+          if (unit.versionId === anchor.versionId && Math.abs(unit.ordinal - anchor.ordinal) <= (mode === "progressive" ? 1 : 2)) return true;
+        }
+        return anchorKeys.has(`${unit.versionId}:${unit.ordinal}`);
+      }), mode === "progressive" ? limit : 30);
+      chunks = this.v2ChunksFromUnits(libraryId, memory, siblings);
+      actualIndexProfile = "v2";
+      targetType = "retrieval_unit";
+      buildId = v2.buildId;
+    } else if (v2 && step.tool === "retrieveSectionSubtree") {
+      const anchors = this.contextAnchors(memory, Math.max(1, Math.min(limit, 6)));
+      const headings = new Set(anchors.map((unit) => `${unit.versionId}:${unit.headingPath.join(" / ")}`));
+      const sameSection = this.mergeContextUnits(v2.contextUnits.filter((unit) => headings.has(`${unit.versionId}:${unit.headingPath.join(" / ")}`)), mode === "progressive" ? limit : 30);
+      chunks = this.v2ChunksFromUnits(libraryId, memory, sameSection);
+      actualIndexProfile = "v2";
+      targetType = "retrieval_unit";
+      buildId = v2.buildId;
+    } else if (v2 && step.tool === "retrieveRemainingNodesAfter") {
+      const anchors = this.contextAnchors(memory, Math.max(1, Math.min(limit, 6)));
+      const remaining = this.mergeContextUnits(v2.contextUnits.filter((unit) => anchors.some((anchor) => (
+        unit.versionId === anchor.versionId && unit.ordinal > anchor.ordinal
+      ))), limit);
+      chunks = this.v2ChunksFromUnits(libraryId, memory, remaining);
+      actualIndexProfile = "v2";
+      targetType = "retrieval_unit";
+      buildId = v2.buildId;
+    } else if (step.tool === "semanticSearchChildChunks") {
+      fallbackReason = "v2 retrieval units unavailable";
       const [embedding] = await this.model.embed([query]);
       chunks = embedding ? this.vectors.search(libraryId, embedding, limit).map((result) => result.chunk) : [];
     } else if (step.tool === "fullTextSearchChildChunks") {
+      fallbackReason = "v2 retrieval units unavailable";
       chunks = this.mergeResults([
         ...this.db.searchText(libraryId, query, limit),
         ...this.db.searchChunksFuzzy(libraryId, query, limit),
       ], limit).map((result) => result.chunk);
     } else if (step.tool === "retrieveParentChunks") {
+      fallbackReason = "v2 context units unavailable";
       chunks = this.db.getChunksByIds(step.basedOnChunkIds ?? memory.collectedChunks.slice(0, limit).map((chunk) => chunk.id));
       const parentLinks = this.db.getParentChildChunks(chunks.map((chunk) => chunk.id));
       this.addParentChunks(memory, parentLinks);
@@ -397,10 +607,12 @@ export class PulseEvidenceController {
         ...this.db.getChunksByIds(parentLinks.map((link) => link.parentChunkId)),
       ], mode === "progressive" ? limit : 30);
     } else if (step.tool === "retrieveSiblingNodes") {
+      fallbackReason = "v2 context units unavailable";
       chunks = this.db.getNeighborChunks(step.basedOnChunkIds ?? memory.collectedChunks.slice(0, limit).map((chunk) => chunk.id), mode === "progressive" ? 1 : 2).slice(0, mode === "progressive" ? limit : 30);
       const siblingNodeIds = [...new Set(chunks.flatMap((chunk) => chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : []))];
       this.addTreeNodes(memory, siblingNodeIds.flatMap((id) => this.db.getSiblingTreeNodes(id, 3)));
     } else if (step.tool === "retrieveSectionSubtree") {
+      fallbackReason = "v2 context units unavailable";
       chunks = this.db.getSameSectionChunks(step.basedOnChunkIds ?? memory.collectedChunks.slice(0, limit).map((chunk) => chunk.id), mode === "progressive" ? limit : 30);
       const sectionIds = [...new Set(chunks.flatMap((chunk) => chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : []))];
       this.addTreeNodes(memory, sectionIds.flatMap((id) => {
@@ -409,6 +621,7 @@ export class PulseEvidenceController {
         return sectionId ? this.db.getSectionSubtree(sectionId) : [];
       }));
     } else if (step.tool === "retrieveRemainingNodesAfter") {
+      fallbackReason = "v2 context units unavailable";
       const anchors = this.db.getChunksByIds(step.basedOnChunkIds ?? this.continuationAnchorIds(memory, mode));
       const byId = new Map<string, Chunk>();
       for (const anchor of anchors) {
@@ -464,6 +677,11 @@ export class PulseEvidenceController {
         ...chunks.map((chunk) => chunk.id),
         ...(memory.summaryNodes ?? []).slice(-limit).map((summary) => summary.id),
       ],
+      actualIndexProfile,
+      targetType,
+      ...(buildId ? { buildId } : {}),
+      ...(outputRetrievalUnitIds.length > 0 ? { outputRetrievalUnitIds } : {}),
+      ...(fallbackReason && actualIndexProfile === "v1" ? { fallbackReason } : {}),
       newEvidenceRowCount: Math.max(0, memory.evidenceRows.length - rowCountBefore),
       status: chunks.length > 0 || (memory.summaryNodes ?? []).length > 0 ? "success" : "empty",
     });
@@ -571,19 +789,33 @@ export class PulseEvidenceController {
       existingRows: memory.evidenceRows,
     });
     const existing = new Set(memory.evidenceRows.map(rowDedupeKey));
+    const contextById = new Map((memory.contextUnits ?? []).map((unit) => [unit.id, unit]));
+    const retrievalByContextId = new Map<string, RetrievalUnit>();
+    for (const unit of memory.retrievalUnits ?? []) {
+      if (!retrievalByContextId.has(unit.contextUnitId)) retrievalByContextId.set(unit.contextUnitId, unit);
+    }
     let added = 0;
     for (const row of rows) {
-      const key = rowDedupeKey(row);
+      const contextUnit = row.contextUnitId
+        ? contextById.get(row.contextUnitId)
+        : contextById.get(row.evidenceChunkId);
+      const validated = contextUnit
+        ? validateEvidenceRow(row, contextUnit, retrievalByContextId.get(contextUnit.id))
+        : row;
+      const key = rowDedupeKey(validated);
       if (existing.has(key)) continue;
       existing.add(key);
-      memory.evidenceRows.push(row);
+      memory.evidenceRows.push(validated);
       added += 1;
-      if (!memory.citedChunkIds.includes(row.evidenceChunkId)) memory.citedChunkIds.push(row.evidenceChunkId);
+      if (!memory.citedChunkIds.includes(validated.evidenceChunkId)) memory.citedChunkIds.push(validated.evidenceChunkId);
     }
     return added;
   }
 
   private continuationAnchorIds(memory: PulseEvidenceMemory, mode: PulseInputMode): string[] {
+    if (memory.usedIndexProfile === "v2" && (memory.contextUnits ?? []).length > 0) {
+      return this.contextAnchors(memory, mode === "progressive" ? 4 : 2).map((unit) => unit.id);
+    }
     const evidenceIds = new Set(memory.evidenceRows.map((row) => row.evidenceChunkId));
     const candidateIds = [...new Set([
       ...memory.evidenceRows.map((row) => row.evidenceChunkId),
@@ -749,6 +981,9 @@ export class PulseEvidenceController {
       collectedChunks: memory.collectedChunks.slice(0, 80),
       graphNodes: memory.graphNodes.slice(0, 60),
       graphRelations: memory.graphRelations.slice(0, 80),
+      contextUnits: (memory.contextUnits ?? []).slice(0, 40),
+      retrievalUnits: (memory.retrievalUnits ?? []).slice(0, 80),
+      contextBlocks: (memory.contextBlocks ?? []).slice(0, 120),
       evidenceRows: memory.evidenceRows.slice(0, 120),
       currentFindings: memory.currentFindings.slice(-20),
       retrievalHistory: memory.retrievalHistory.slice(-30),
@@ -805,25 +1040,30 @@ export class PulseEvidenceController {
     return {
       id: `evidence-pack-${Date.now()}`,
       question,
-      evidencePackSchemaVersion: 1,
+      evidencePackSchemaVersion: memory.usedIndexProfile === "v2" ? 2 : 1,
       pipeline: {
-        indexProfile: "v1",
-        packBuilder: "legacy",
+        indexProfile: memory.usedIndexProfile ?? "v1",
+        packBuilder: memory.usedIndexProfile === "v2" ? "v2" : "legacy",
         model: this.model.name,
-        promptVersion: "pulse-evidence-v1-generic",
+        promptVersion: memory.usedIndexProfile === "v2" ? "pulse-evidence-v2-generic" : "pulse-evidence-v1-generic",
       },
       pipelineVersion: {
         indexerVersion: "legacy-v1",
         contextUnitBuilderVersion: "not_used",
         retrievalUnitBuilderVersion: "not_used",
-        packBuilderVersion: "legacy-v1",
-        evidenceExtractorVersion: "pulse-evidence-v1-generic",
-        validatorVersion: "pulse-evidence-v2-foundation",
-        promptVersion: "pulse-evidence-v1-generic",
+        packBuilderVersion: memory.usedIndexProfile === "v2" ? "context-pack-v2" : "legacy-v1",
+        evidenceExtractorVersion: memory.usedIndexProfile === "v2" ? "pulse-evidence-v2-generic" : "pulse-evidence-v1-generic",
+        validatorVersion: "evidence-row-validator-v2",
+        promptVersion: memory.usedIndexProfile === "v2" ? "pulse-evidence-v2-generic" : "pulse-evidence-v1-generic",
       },
       answerMode: answerMode.answerMode,
       answerModeReason: answerMode.reason,
       answerModeOverridden: answerMode.overridden,
+      questionPlan: memory.questionPlan,
+      usedIndexProfile: memory.usedIndexProfile ?? "v1",
+      sufficiencyHistory: memory.sufficiencyHistory,
+      contextUnits: memory.contextUnits ?? [],
+      retrievalUnits: memory.retrievalUnits ?? [],
       treeNodes,
       parentChunks: memory.parentChunks ?? [],
       semanticNodes: memory.graphNodes.flatMap((node) => {

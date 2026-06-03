@@ -1736,11 +1736,18 @@ export class AgentDatabase {
   markIndexBuildFailed(buildId: string, error: unknown, status: "failed" | "partial" | "abandoned" = "failed"): IndexBuildRecord | undefined {
     const message = error instanceof Error ? error.message : String(error);
     const stack = error instanceof Error ? error.stack : undefined;
+    const build = this.getIndexBuild(buildId);
     this.sql.prepare(`
       UPDATE index_builds
       SET status = ?, finished_at = ?, error_message = ?, error_stack = ?
       WHERE build_id = ?
     `).run(status, now(), message, stack ?? null, buildId);
+    if (build) {
+      const version = this.getVersion(build.versionId);
+      const warnings = [...new Set([...(version?.indexWarnings ?? []), `${build.profile} index build ${status}: ${message}`])];
+      this.sql.prepare("UPDATE document_versions SET index_warnings_json = ? WHERE id = ?")
+        .run(JSON.stringify(warnings), build.versionId);
+    }
     return this.getIndexBuild(buildId);
   }
 
@@ -1764,6 +1771,74 @@ export class AgentDatabase {
       this.sql.prepare("SELECT * FROM retrieval_units WHERE build_id = ? ORDER BY ordinal"),
       buildId,
     ).map(retrievalUnitFrom);
+  }
+
+  getContextUnitsByIds(ids: string[]): ContextUnit[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    return rows(
+      this.sql.prepare(`SELECT * FROM context_units WHERE id IN (${placeholders}) ORDER BY ordinal`),
+      ...ids,
+    ).map(contextUnitFrom);
+  }
+
+  getRetrievalUnitsByIds(ids: string[]): RetrievalUnit[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    return rows(
+      this.sql.prepare(`SELECT * FROM retrieval_units WHERE id IN (${placeholders}) ORDER BY ordinal`),
+      ...ids,
+    ).map(retrievalUnitFrom);
+  }
+
+  getReadyContextUnitsForLibrary(libraryId: string): ContextUnit[] {
+    return rows(
+      this.sql.prepare(`
+        SELECT cu.* FROM context_units cu
+        JOIN document_versions v ON v.id = cu.version_id AND v.latest_ready_v2_build_id = cu.build_id
+        JOIN index_builds b ON b.build_id = cu.build_id AND b.status = 'ready'
+        JOIN documents d ON d.id = v.document_id
+        WHERE d.library_id = ?
+        ORDER BY v.created_at, cu.ordinal
+      `),
+      libraryId,
+    ).map(contextUnitFrom);
+  }
+
+  getReadyRetrievalUnitsForLibrary(libraryId: string): RetrievalUnit[] {
+    return rows(
+      this.sql.prepare(`
+        SELECT ru.* FROM retrieval_units ru
+        JOIN document_versions v ON v.id = ru.version_id AND v.latest_ready_v2_build_id = ru.build_id
+        JOIN index_builds b ON b.build_id = ru.build_id AND b.status = 'ready'
+        JOIN documents d ON d.id = v.document_id
+        WHERE d.library_id = ?
+        ORDER BY v.created_at, ru.ordinal
+      `),
+      libraryId,
+    ).map(retrievalUnitFrom);
+  }
+
+  searchRetrievalUnitsText(libraryId: string, query: string, limit = 12): Array<{ unit: RetrievalUnit; score: number }> {
+    const normalizedQuery = normalizeSearchText(query);
+    if (!normalizedQuery) return [];
+    const tokens = searchTokens(query);
+    const candidates = this.getReadyRetrievalUnitsForLibrary(libraryId);
+    return candidates
+      .map((unit) => {
+        const text = normalizeSearchText(unit.text);
+        const heading = normalizeSearchText(unit.headingPath.join(" / "));
+        let score = text.includes(normalizedQuery) ? 0.55 : 0;
+        if (heading.includes(normalizedQuery)) score += 0.35;
+        if (tokens.length > 0) {
+          const hits = tokens.filter((token) => text.includes(token) || heading.includes(token)).length;
+          score += (hits / tokens.length) * 0.45;
+        }
+        return { unit, score: Math.min(1, score) };
+      })
+      .filter((result) => result.score > 0)
+      .sort((left, right) => right.score - left.score || left.unit.ordinal - right.unit.ordinal)
+      .slice(0, limit);
   }
 
   getContextUnitsBySourceNodeId(sourceNodeId: string): ContextUnit[] {
@@ -1839,6 +1914,43 @@ export class AgentDatabase {
         ...(entry.errorMessage ? { errorMessage: entry.errorMessage } : {}),
       })),
       warnings: status.warnings,
+    };
+  }
+
+  getIndexStatusReport(versionId: string): {
+    versionId: string;
+    activeIndexProfile: "v1" | "v2";
+    latestReadyV1BuildId: string | null;
+    latestReadyV2BuildId: string | null;
+    chunkCount: number;
+    contextUnitCount: number;
+    retrievalUnitCount: number;
+    chunkVectorCount: number;
+    retrievalUnitVectorCount: number;
+    summaryVectorCount: number;
+    qualityReport?: ContextUnitQualityReport | undefined;
+    warnings: string[];
+  } {
+    const version = this.getVersion(versionId);
+    if (!version) throw new Error("导入版本不存在");
+    const v2Health = this.getV2IndexHealth(versionId);
+    const chunkCount = Number(row(this.sql.prepare("SELECT COUNT(*) AS count FROM chunks WHERE version_id = ?"), versionId)?.count ?? 0);
+    const chunkVectorCount = Number(row(this.sql.prepare(`
+      SELECT COUNT(*) AS count FROM chunk_embeddings e JOIN chunks c ON c.id = e.chunk_id WHERE c.version_id = ?
+    `), versionId)?.count ?? 0);
+    return {
+      versionId,
+      activeIndexProfile: version.activeIndexProfile ?? "v1",
+      latestReadyV1BuildId: version.latestReadyV1BuildId ?? null,
+      latestReadyV2BuildId: version.latestReadyV2BuildId ?? null,
+      chunkCount,
+      contextUnitCount: v2Health.contextUnitCount,
+      retrievalUnitCount: v2Health.retrievalUnitCount,
+      chunkVectorCount,
+      retrievalUnitVectorCount: version.latestReadyV2BuildId ? this.countVectorRecords(version.latestReadyV2BuildId, "retrieval_unit") : 0,
+      summaryVectorCount: version.latestReadyV2BuildId ? this.countVectorRecords(version.latestReadyV2BuildId, "summary_node") : 0,
+      ...(v2Health.qualityReport ? { qualityReport: v2Health.qualityReport } : {}),
+      warnings: v2Health.warnings,
     };
   }
 

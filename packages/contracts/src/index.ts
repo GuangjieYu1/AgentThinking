@@ -843,6 +843,11 @@ export interface RetrievalTrace {
   query?: string | undefined;
   inputIds: string[];
   outputIds: string[];
+  actualIndexProfile?: ActiveIndexProfile | undefined;
+  targetType?: VectorTargetType | "legacy_chunk" | undefined;
+  buildId?: string | undefined;
+  outputRetrievalUnitIds?: string[] | undefined;
+  fallbackReason?: string | undefined;
   newEvidenceRowCount: number;
   status: "success" | "empty" | "error" | "skipped";
 }
@@ -861,6 +866,9 @@ export interface EvidencePack {
   answerMode?: AnswerMode | undefined;
   answerModeReason?: string | undefined;
   answerModeOverridden?: boolean | undefined;
+  questionPlan?: PulseQuestionPlan | undefined;
+  usedIndexProfile?: ActiveIndexProfile | undefined;
+  sufficiencyHistory?: PulseEvidenceStatus[] | undefined;
   contextUnits?: ContextUnit[] | undefined;
   retrievalUnits?: RetrievalUnit[] | undefined;
   treeNodes: DocumentTreeNode[];
@@ -915,6 +923,11 @@ export interface PulseEvidenceMemory {
   question: string;
   questionPlan: PulseQuestionPlan;
   collectedChunks: Array<{ id: string; versionId: string; text: string; headingPath: string | null; pageNumber: number | null; ordinal: number; parentChunkId?: string | null; documentTreeNodeId?: string | null; nodeType?: DocumentTreeNodeType | null }>;
+  legacyChunks?: Array<{ id: string; versionId: string; text: string; headingPath: string | null; pageNumber: number | null; ordinal: number; parentChunkId?: string | null; documentTreeNodeId?: string | null; nodeType?: DocumentTreeNodeType | null }> | undefined;
+  contextUnits?: ContextUnit[] | undefined;
+  retrievalUnits?: RetrievalUnit[] | undefined;
+  contextBlocks?: ContextBlock[] | undefined;
+  usedIndexProfile?: ActiveIndexProfile | undefined;
   graphNodes: Array<{ id: string; title: string; summary: string }>;
   graphRelations: Array<{ id: string; type: RelationType; sourceTitle: string; targetTitle: string; reason: string }>;
   treeNodes?: DocumentTreeNode[] | undefined;

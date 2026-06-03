@@ -189,6 +189,9 @@ export const api = {
   pulse: (libraryId: string, pulseId: string) => request<PulseResponse>(`/libraries/${libraryId}/pulses/${pulseId}`),
   pulseEvidencePack: (libraryId: string, pulseId: string) =>
     request<EvidencePack>(`/libraries/${libraryId}/pulses/${pulseId}/evidence-pack`),
+  pulseRetrievalTrace: (libraryId: string, pulseId: string) =>
+    request<EvidencePack["retrievalTrace"]>(`/libraries/${libraryId}/pulses/${pulseId}/retrieval-trace`),
+  indexStatus: (versionId: string) => request<unknown>(`/versions/${versionId}/index-status`),
   clearPulses: (libraryId: string) =>
     request<{ deleted: number }>(`/libraries/${libraryId}/pulses`, { method: "DELETE" }),
   createPulse: (libraryId: string, question: string, mode: PulseInputMode = "full") =>

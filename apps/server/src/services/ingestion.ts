@@ -182,7 +182,7 @@ export class IngestionQueue extends EventEmitter {
       const chunks = this.db.replaceChunks(source.libraryId, source.version.id, documentIndex.chunks);
       this.db.saveDocumentIndex(documentIndex, chunks);
       if (chunks.length === 0) throw new Error("文档中没有可处理的文本内容");
-      if (this.config.enableContextUnits || this.config.indexProfile === "dual" || this.config.indexProfile === "v2") {
+      {
         const build = this.db.createIndexBuild(source.version.id, "v2");
         try {
           const contextIndex = buildContextIndex({
@@ -223,6 +223,8 @@ export class IngestionQueue extends EventEmitter {
         if (embeddings.length !== batch.length) throw new Error("Embedding 返回数量与 chunk 不一致");
         batch.forEach((chunk, index) => this.vectors.save(chunk, embeddings[index] ?? []));
       }
+      const v1Build = this.db.createIndexBuild(source.version.id, "v1");
+      this.db.markIndexBuildReady(v1Build.buildId, { vectorCount: childChunks.length });
       for (let start = 0; start < documentIndex.summaryNodes.length; start += 32) {
         const batch = documentIndex.summaryNodes.slice(start, start + 32);
         const embeddings = await this.model.embed(batch.map((summary) => summary.summary));

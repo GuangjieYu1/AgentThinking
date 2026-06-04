@@ -1,0 +1,38 @@
+{
+  "caseId": "exhaustive_numeric_complete_001",
+  "question": "What is the stated total and each itemized source value?",
+  "declaredTotal": 100,
+  "expectedItemizedSum": 100,
+  "expectedDifference": 0,
+  "unit": "unit",
+  "reconciliationShouldClose": true,
+  "items": [
+    {
+      "label": "declared total",
+      "value": 100,
+      "role": "declared_total",
+      "mustQuoteIncludes": ["Declared total is 100 units"],
+      "required": true,
+      "countedInAggregation": false
+    },
+    {
+      "label": "source item A",
+      "value": 40,
+      "role": "itemized_value",
+      "mustQuoteIncludes": ["Source A contributes 40 units"],
+      "required": true,
+      "countedInAggregation": true
+    },
+    {
+      "label": "source item B",
+      "value": 60,
+      "role": "itemized_value",
+      "mustQuoteIncludes": ["Source B contributes 60 units"],
+      "required": true,
+      "countedInAggregation": true
+    }
+  ],
+  "requiredGaps": [],
+  "mustNotCountItems": [],
+  "forbiddenClaims": ["complete without source quotes"]
+}

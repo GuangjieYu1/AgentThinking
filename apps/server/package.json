@@ -25,6 +25,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "debug:index-status": "tsx src/debug-index-status.ts",
     "build": "tsup src/index.ts --format esm --platform node --target node24 --external node:sqlite --out-dir dist --sourcemap",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json"

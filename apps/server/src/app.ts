@@ -41,6 +41,7 @@ import type { ModelProvider } from "./services/models.js";
 import { IngestionQueue } from "./services/ingestion.js";
 import { VectorStore } from "./services/vector-store.js";
 import { AnalysisPublisher } from "./services/analysis.js";
+import { LibraryEventBus } from "./services/library-events.js";
 import { MappingAuditService } from "./services/mapping-audit.js";
 import { PulseEngine } from "./services/pulse.js";
 
@@ -50,6 +51,7 @@ export interface AppServices {
   vectors: VectorStore;
   model: ModelProvider;
   queue: IngestionQueue;
+  events?: LibraryEventBus;
 }
 
 declare module "fastify" {
@@ -118,6 +120,18 @@ function requireLibraryAccess(db: AgentDatabase, libraryId: string | undefined, 
   return libraryId;
 }
 
+function isLocalRequest(request: FastifyRequest): boolean {
+  const host = request.hostname.split(":")[0];
+  return host === "127.0.0.1" || host === "localhost" || request.ip === "127.0.0.1" || request.ip === "::1";
+}
+
+function requireDebugAccess(config: AppConfig, request: FastifyRequest): void {
+  if (!config.showDebugRetrieval) throw new Error("Debug API 未启用");
+  if (config.authRequired && request.user) return;
+  if (!config.authRequired && config.debugApiAllowUnauthLocal && isLocalRequest(request)) return;
+  throw new Error("Debug API 需要认证或显式本地开发开关");
+}
+
 function isPublicApi(method: string, url: string): boolean {
   const path = url.split("?")[0] ?? url;
   if (path === "/api/health" || path === "/api/auth/session") return true;
@@ -128,9 +142,10 @@ function isPublicApi(method: string, url: string): boolean {
 export async function createApp(services: AppServices): Promise<FastifyInstance> {
   const app = Fastify({ logger: true, bodyLimit: 4 * 1024 * 1024 });
   const { config, db, vectors, model, queue } = services;
+  const events = services.events ?? new LibraryEventBus();
   const publisher = new AnalysisPublisher(db, config);
   const pulseEngine = new PulseEngine(db, vectors, model);
-  const mappingAudit = new MappingAuditService(db, model);
+  const mappingAudit = new MappingAuditService(db, model, events);
   await app.register(cors, { origin: true, credentials: true });
   await app.register(multipart, { limits: { files: 100, fileSize: 60 * 1024 * 1024 } });
 
@@ -301,7 +316,87 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     const source = db.getVersionSource(request.params.versionId);
     if (!source) throw new Error("导入版本不存在");
     requireLibrary(db, source.libraryId, request.user);
-    return db.getSourceStructure(request.params.versionId);
+    return {
+      ...db.getSourceStructure(request.params.versionId),
+      documentTree: db.getDocumentTreeForVersion(request.params.versionId),
+      summaryTree: db.getSummaryTreeForVersion(request.params.versionId),
+    };
+  });
+  app.get<{ Params: { versionId: string } }>("/api/debug/versions/:versionId/v2-index-health", async (request) => {
+    requireDebugAccess(config, request);
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    return db.getV2IndexHealth(request.params.versionId);
+  });
+  app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/index-status", async (request) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    return db.getIndexStatusReport(request.params.versionId);
+  });
+  app.get<{ Params: { versionId: string }; Querystring: { includeFullText?: string } }>("/api/versions/:versionId/context-units", async (request) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    const includeFullText = request.query.includeFullText === "true";
+    if (includeFullText) requireDebugAccess(config, request);
+    return db.getReadyContextUnits(request.params.versionId).map((unit) => ({
+      ...unit,
+      text: includeFullText ? unit.text.slice(0, config.debugMaxTextLength) : unit.text.slice(0, Math.min(240, config.debugMaxTextLength)),
+    }));
+  });
+  app.get<{ Params: { versionId: string }; Querystring: { includeFullText?: string } }>("/api/versions/:versionId/retrieval-units", async (request) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    const includeFullText = request.query.includeFullText === "true";
+    if (includeFullText) requireDebugAccess(config, request);
+    return db.getReadyRetrievalUnits(request.params.versionId).map((unit) => ({
+      ...unit,
+      text: includeFullText ? unit.text.slice(0, config.debugMaxTextLength) : unit.text.slice(0, Math.min(240, config.debugMaxTextLength)),
+    }));
+  });
+  app.get<{ Params: { versionId: string }; Querystring: { includeFullText?: string } }>("/api/debug/versions/:versionId/context-units", async (request) => {
+    requireDebugAccess(config, request);
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    const includeFullText = request.query.includeFullText === "true";
+    return db.getReadyContextUnits(request.params.versionId).map((unit) => ({
+      ...unit,
+      text: includeFullText ? unit.text.slice(0, config.debugMaxTextLength) : unit.text.slice(0, Math.min(240, config.debugMaxTextLength)),
+    }));
+  });
+  app.get<{ Params: { versionId: string }; Querystring: { includeFullText?: string } }>("/api/debug/versions/:versionId/retrieval-units", async (request) => {
+    requireDebugAccess(config, request);
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    const includeFullText = request.query.includeFullText === "true";
+    return db.getReadyRetrievalUnits(request.params.versionId).map((unit) => ({
+      ...unit,
+      text: includeFullText ? unit.text.slice(0, config.debugMaxTextLength) : unit.text.slice(0, Math.min(240, config.debugMaxTextLength)),
+    }));
+  });
+  app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/document-tree", async (request) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    return db.getDocumentTreeForVersion(request.params.versionId);
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/document-tree", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    return db.getDocumentTreeForLibrary(request.params.libraryId);
+  });
+  app.get<{ Params: { nodeId: string } }>("/api/document-tree/:nodeId/subtree", async (request) => {
+    const nodes = db.getSectionSubtree(request.params.nodeId);
+    requireLibraryAccess(db, nodes[0]?.libraryId, request.user);
+    return nodes;
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/summary-tree", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    return db.getSummaryTreeForLibrary(request.params.libraryId);
   });
   app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/mapping-audit", async (request, reply) => {
     const source = db.getVersionSource(request.params.versionId);
@@ -380,15 +475,21 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       Connection: "keep-alive",
     });
     const send = (data: unknown) => reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
-    const listener = (job: { libraryId: string }) => {
-      if (job.libraryId === libraryId) send(job);
+    const listener = (event: { libraryId?: string; job?: { libraryId: string } }) => {
+      const eventLibraryId = "job" in event && event.job ? event.job.libraryId : event.libraryId;
+      if (eventLibraryId === libraryId) send(event);
     };
-    queue.on("job", listener);
+    const unsubscribe = services.events
+      ? events.subscribe(listener as (event: import("@agent-thinking/contracts").LibraryStreamEvent) => void)
+      : (() => {
+          queue.on("job", listener as (job: { libraryId: string }) => void);
+          return () => queue.off("job", listener as (job: { libraryId: string }) => void);
+        })();
     send({ type: "connected" });
     const heartbeat = setInterval(() => reply.raw.write(": keep-alive\n\n"), 15000);
     request.raw.on("close", () => {
       clearInterval(heartbeat);
-      queue.off("job", listener);
+      unsubscribe();
     });
   });
 
@@ -486,6 +587,18 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     if (!response) return reply.status(404).send({ error: "脉冲不存在" });
     return response;
   });
+  app.get<{ Params: { libraryId: string; pulseId: string } }>("/api/libraries/:libraryId/pulses/:pulseId/evidence-pack", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    const pulse = db.getPulse(request.params.pulseId);
+    if (!pulse || pulse.libraryId !== request.params.libraryId) return reply.status(404).send({ error: "脉冲不存在" });
+    return db.getPulseEvidencePack(request.params.pulseId) ?? { error: "该脉冲没有证据包" };
+  });
+  app.get<{ Params: { libraryId: string; pulseId: string } }>("/api/libraries/:libraryId/pulses/:pulseId/retrieval-trace", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    const pulse = db.getPulse(request.params.pulseId);
+    if (!pulse || pulse.libraryId !== request.params.libraryId) return reply.status(404).send({ error: "脉冲不存在" });
+    return db.getPulseEvidencePack(request.params.pulseId)?.retrievalTrace ?? [];
+  });
   app.patch<{ Params: { pulseId: string } }>("/api/pulses/:pulseId/review", async (request, reply) => {
     const { status } = reviewPulseSchema.parse(request.body);
     const existing = db.getPulse(request.params.pulseId);
@@ -503,6 +616,19 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       ...(body.title !== undefined ? { title: body.title } : {}),
       ...(body.summary !== undefined ? { summary: body.summary } : {}),
     });
+  });
+  app.get<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/evidence-detail", async (request) => {
+    requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);
+    const node = db.getAbstractNode(request.params.nodeId);
+    if (!node) throw new Error("抽象节点不存在");
+    const chunkIds = node.citations.map((citation) => citation.chunkId);
+    const parentChunks = db.getParentChildChunks(chunkIds);
+    const treeNodes = db.getDocumentTreeNodesByIds([
+      ...(node.evidenceNodeIds ?? []),
+      ...parentChunks.map((link) => link.documentTreeNodeId),
+    ]);
+    const relations = db.getIncidentRelations(node.libraryId, [node.id]);
+    return { node, relations, treeNodes, parentChunks };
   });
   app.post<{ Params: { nodeId: string } }>("/api/nodes/:nodeId/evidence", async (request) => {
     requireLibraryAccess(db, db.getLibraryIdForNode(request.params.nodeId), request.user);

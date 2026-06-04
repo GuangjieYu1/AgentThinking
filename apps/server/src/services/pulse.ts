@@ -9,6 +9,7 @@ import type {
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
+import { PulseEvidenceController } from "./pulse-evidence-controller.js";
 import type { VectorStore } from "./vector-store.js";
 
 type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
@@ -559,9 +560,10 @@ export class PulseEngine {
         left.label.localeCompare(right.label, "zh-CN"),
       )
       .slice(0, 80);
-    await emitPulse(eventSink, { type: "stage", message: "正在根据脉冲路径生成回答" });
-    const answer = await this.model.answerPulse(question, {
-      mode,
+    await emitPulse(eventSink, { type: "stage", message: "正在构建 EvidenceMemory" });
+    const controller = new PulseEvidenceController(this.db, this.vectors, this.model);
+    const answer = await controller.answer(libraryId, question, mode, {
+      hits: orderedHits,
       navigationTrace: orderedHits.map((hit, index) => ({
         stepIndex: hit.stepIndex ?? index + 1,
         targetType: hit.targetType,
@@ -573,40 +575,24 @@ export class PulseEngine {
         .filter((hit) => hit.targetType === "chunk")
         .flatMap((hit) => {
           const chunk = chunks.get(hit.targetId) ?? this.db.getChunk(hit.targetId);
-          return chunk ? [{
-            id: chunk.id,
-            text: chunk.text.slice(0, 1200),
-            score: hit.score,
-            headingPath: chunk.headingPath,
-            pageNumber: chunk.pageNumber,
-          }] : [];
+          return chunk ? [chunk] : [];
         }),
       nodes: orderedHits
         .filter((hit) => hit.targetType === "node")
         .flatMap((hit) => {
           const node = nodes.get(hit.targetId) ?? this.db.getAbstractNode(hit.targetId);
-          return node ? [{ id: node.id, title: node.title, summary: node.summary, score: hit.score }] : [];
+          return node ? [node] : [];
         }),
       relations: orderedHits
         .filter((hit) => hit.targetType === "relation")
         .flatMap((hit) => {
           const relation = relations.get(hit.targetId) ?? this.db.getRelation(hit.targetId);
-          if (!relation) return [];
-          const source = nodes.get(relation.sourceNodeId) ?? this.db.getAbstractNode(relation.sourceNodeId);
-          const target = nodes.get(relation.targetNodeId) ?? this.db.getAbstractNode(relation.targetNodeId);
-          return [{
-            id: relation.id,
-            type: relation.type,
-            sourceTitle: source?.title ?? relation.sourceNodeId,
-            targetTitle: target?.title ?? relation.targetNodeId,
-            reason: relation.reason,
-            score: hit.score,
-          }];
+          return relation ? [relation] : [];
         }),
-    });
+    }, eventSink);
     await emitPulse(eventSink, { type: "answer", answer: answer.answer, summary: answer.summary });
     await emitPulse(eventSink, { type: "stage", message: "正在保存脉冲结果" });
-    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits);
+    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits, answer.evidencePack);
     const response = this.db.getPulseResponse(libraryId, pulse.id);
     if (!response) throw new Error("脉冲创建后读取失败");
     return response;

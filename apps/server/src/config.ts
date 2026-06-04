@@ -29,6 +29,24 @@ export interface AppConfig {
   registrationKeys: string[];
   sessionDays: number;
   secureCookies: boolean;
+  indexProfile: "v1" | "v2" | "dual";
+  enableContextUnits: boolean;
+  enableV2PulsePack: boolean;
+  enableContextUnitGraphExtraction: boolean;
+  showDebugRetrieval: boolean;
+  debugApiAllowUnauthLocal: boolean;
+  debugMaxTextLength: number;
+  runRealModelTests: boolean;
+  modelContextStrategy: "long-context" | "retrieval-compact";
+  modelMaxInputTokens: number;
+  modelPreferredContextTokens: number;
+  compactExcerptTokens: number;
+  aoriModelContextTokens: number;
+  aoriGlobalReadMaxInputTokens: number;
+  aoriMinTruncatedContextTokens: number;
+  aoriEvidenceBindingMinContextTokens: number;
+  aoriAllowSmallContextOnlyForQuoteLookup: boolean;
+  recordIndexingRationale: boolean;
 }
 
 export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -70,6 +88,35 @@ export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
       (process.env.REGISTRATION_KEYS ?? "").split(",").map((key) => key.trim()).filter(Boolean),
     sessionDays: overrides.sessionDays ?? Number(process.env.AUTH_SESSION_DAYS ?? 30),
     secureCookies: overrides.secureCookies ?? process.env.AUTH_COOKIE_SECURE === "true",
+    indexProfile: overrides.indexProfile ??
+      (process.env.INDEX_PROFILE === "v2" ? "v2" : process.env.INDEX_PROFILE === "dual" ? "dual" : "v1"),
+    enableContextUnits: overrides.enableContextUnits ?? process.env.ENABLE_CONTEXT_UNITS === "true",
+    enableV2PulsePack: overrides.enableV2PulsePack ?? process.env.ENABLE_V2_PULSE_PACK === "true",
+    enableContextUnitGraphExtraction: overrides.enableContextUnitGraphExtraction ??
+      process.env.ENABLE_CONTEXT_UNIT_GRAPH_EXTRACTION === "true",
+    showDebugRetrieval: overrides.showDebugRetrieval ?? process.env.SHOW_DEBUG_RETRIEVAL === "true",
+    debugApiAllowUnauthLocal: overrides.debugApiAllowUnauthLocal ??
+      process.env.DEBUG_API_ALLOW_UNAUTH_LOCAL === "true",
+    debugMaxTextLength: overrides.debugMaxTextLength ?? Number(process.env.DEBUG_MAX_TEXT_LENGTH ?? 4000),
+    runRealModelTests: overrides.runRealModelTests ?? process.env.RUN_REAL_MODEL_TESTS === "true",
+    modelContextStrategy: overrides.modelContextStrategy ??
+      (process.env.MODEL_CONTEXT_STRATEGY === "long-context" ? "long-context" : "retrieval-compact"),
+    modelMaxInputTokens: overrides.modelMaxInputTokens ?? Number(process.env.MODEL_MAX_INPUT_TOKENS ?? 8192),
+    modelPreferredContextTokens: overrides.modelPreferredContextTokens ??
+      Number(process.env.MODEL_PREFERRED_CONTEXT_TOKENS ?? 6000),
+    compactExcerptTokens: overrides.compactExcerptTokens ?? Number(process.env.COMPACT_EXCERPT_TOKENS ?? 12000),
+    aoriModelContextTokens: overrides.aoriModelContextTokens ??
+      Number(process.env.AORI_MODEL_CONTEXT_TOKENS ?? 1_000_000),
+    aoriGlobalReadMaxInputTokens: overrides.aoriGlobalReadMaxInputTokens ??
+      Number(process.env.AORI_GLOBAL_READ_MAX_INPUT_TOKENS ?? 800_000),
+    aoriMinTruncatedContextTokens: overrides.aoriMinTruncatedContextTokens ??
+      Number(process.env.AORI_MIN_TRUNCATED_CONTEXT_TOKENS ?? 10_000),
+    aoriEvidenceBindingMinContextTokens: overrides.aoriEvidenceBindingMinContextTokens ??
+      Number(process.env.AORI_EVIDENCE_BINDING_MIN_CONTEXT_TOKENS ?? 10_000),
+    aoriAllowSmallContextOnlyForQuoteLookup: overrides.aoriAllowSmallContextOnlyForQuoteLookup ??
+      process.env.AORI_ALLOW_SMALL_CONTEXT_ONLY_FOR_QUOTE_LOOKUP !== "false",
+    recordIndexingRationale: overrides.recordIndexingRationale ??
+      (process.env.RECORD_INDEXING_RATIONALE === "true" || process.env.AORI_RECORD_INDEXING_RATIONALE === "true"),
   };
 }
 

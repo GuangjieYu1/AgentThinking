@@ -24,8 +24,8 @@ export function chunkSections(
   sections: SourceSection[],
   options: ChunkOptions = {},
 ): PendingChunk[] {
-  const target = options.targetCharacters ?? 3200;
-  const overlap = options.overlapCharacters ?? 400;
+  const target = options.targetCharacters ?? 2400;
+  const overlap = options.overlapCharacters ?? 280;
   const chunks: PendingChunk[] = [];
   let ordinal = 0;
 
@@ -40,11 +40,17 @@ export function chunkSections(
         const paragraphBreak = normalized.lastIndexOf("\n\n", end);
         const sentenceBreak = Math.max(
           normalized.lastIndexOf("。", end),
+          normalized.lastIndexOf("！", end),
+          normalized.lastIndexOf("？", end),
+          normalized.lastIndexOf("；", end),
           normalized.lastIndexOf(". ", end),
+          normalized.lastIndexOf("! ", end),
+          normalized.lastIndexOf("? ", end),
+          normalized.lastIndexOf("; ", end),
           normalized.lastIndexOf("\n", end),
         );
         const naturalBreak = Math.max(paragraphBreak, sentenceBreak);
-        if (naturalBreak > start + Math.floor(target * 0.55)) {
+        if (naturalBreak > start + Math.floor(target * 0.45)) {
           end = naturalBreak + 1;
         }
       }

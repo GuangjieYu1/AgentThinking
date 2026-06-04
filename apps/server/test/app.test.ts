@@ -1,11 +1,13 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import { getConfig } from "../src/config.js";
 import { AgentDatabase } from "../src/db.js";
 import { IngestionQueue } from "../src/services/ingestion.js";
+import { LibraryEventBus } from "../src/services/library-events.js";
 import { FakeModelProvider } from "../src/services/models.js";
 import { VectorStore } from "../src/services/vector-store.js";
 
@@ -144,6 +146,73 @@ describe("HTTP application", () => {
     db.close();
   });
 
+  it("streams typed library job and graph rule events", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-events-"));
+    dirs.push(dir);
+    const config = getConfig({
+      dataDir: dir,
+      filesDir: join(dir, "files"),
+      ocrCacheDir: join(dir, "ocr"),
+      provider: "fake",
+    });
+    const db = new AgentDatabase(dir);
+    const vectors = new VectorStore(db);
+    const model = new FakeModelProvider();
+    const events = new LibraryEventBus();
+    const queue = new IngestionQueue(db, vectors, model, config, events);
+    const app = await createApp({ config, db, vectors, model, queue, events });
+    const library = db.createLibrary("Events");
+    const version = db.createDocumentVersion(library.id, "events.txt", "text/plain", "events-hash", join(dir, "events.txt")).version;
+    const job = db.createJob(library.id, version.id);
+
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const address = app.server.address() as AddressInfo;
+    const controller = new AbortController();
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/libraries/${library.id}/events`, {
+      signal: controller.signal,
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+    events.emitEvent({ type: "job", job });
+    events.emitEvent({
+      type: "graph_rule_summary",
+      libraryId: library.id,
+      versionId: version.id,
+      jobId: job.id,
+      stage: "extraction",
+      createdAt: new Date().toISOString(),
+      summary: {
+        totalRelations: 1,
+        keptCount: 1,
+        downgradedCount: 0,
+        excludedCount: 0,
+        droppedCount: 0,
+        reviewCount: 0,
+        warningCount: 0,
+        categoryCounts: {
+          graph_validity: 1,
+          relation_algebra: 0,
+          semantic_coverage: 0,
+          graph_evolution: 0,
+        },
+      },
+    });
+    for (let attempt = 0; attempt < 10 && !body.includes("graph_rule_summary"); attempt += 1) {
+      const { value } = await reader.read();
+      body += decoder.decode(value);
+    }
+    controller.abort();
+    await reader.cancel().catch(() => undefined);
+    expect(body).toContain('"type":"connected"');
+    expect(body).toContain('"type":"job"');
+    expect(body).toContain('"type":"graph_rule_summary"');
+
+    await app.close();
+    db.close();
+  });
+
   it("imports a document through the API without disclosing server credentials", async () => {
     const dir = await mkdtemp(join(tmpdir(), "agent-thinking-api-"));
     dirs.push(dir);
@@ -216,10 +285,18 @@ describe("HTTP application", () => {
     const structure = (await app.inject({
       method: "GET",
       url: `/api/versions/${versionId}/structure`,
-    })).json<{ metadata: { title: string }; links: Array<{ type: string }>; chunks: Array<{ startLine: number }> }>();
+    })).json<{
+      metadata: { title: string };
+      links: Array<{ type: string }>;
+      chunks: Array<{ startLine: number; parentChunkId?: string | null; documentTreeNodeId?: string | null }>;
+      documentTree: Array<{ nodeType: string; headingPath: string[] }>;
+      summaryTree: Array<{ level: string; summary: string }>;
+    }>();
     expect(structure.metadata.title).toBe("Research Notes");
     expect(structure.links.map((link) => link.type)).toEqual(["markdown", "wiki", "block", "logseq"]);
     expect(structure.chunks[0]?.startLine).toBe(5);
+    expect(structure.documentTree.map((node) => node.nodeType)).toEqual(expect.arrayContaining(["document", "section", "paragraph", "sentence"]));
+    expect(structure.summaryTree.map((node) => node.level)).toEqual(expect.arrayContaining(["document", "section", "paragraph"]));
     const original = await app.inject({ method: "GET", url: `/api/versions/${versionId}/source` });
     expect(original.body).toContain("title: Research Notes");
     const graph = (await app.inject({
@@ -246,10 +323,18 @@ describe("HTTP application", () => {
       url: `/api/versions/${versionId}/mapping-audit`,
     });
     expect(mappingAudit.statusCode).toBe(200);
-    const audit = mappingAudit.json<{ id: string; status: string; reconstruction: string; findings: unknown[] }>();
+    const audit = mappingAudit.json<{
+      id: string;
+      status: string;
+      reconstruction: string;
+      findings: unknown[];
+      metrics?: { findingCount?: number; coverageScore?: number };
+    }>();
     expect(audit.status).toBe("minor_issues");
     expect(audit.reconstruction).toContain("演示语义重构");
     expect(audit.findings.length).toBeGreaterThan(0);
+    expect(audit.metrics?.findingCount).toBe(audit.findings.length);
+    expect(audit.metrics?.coverageScore).toBeGreaterThanOrEqual(0);
     const mappingAuditRead = (await app.inject({
       method: "GET",
       url: `/api/versions/${versionId}/mapping-audit`,
@@ -263,6 +348,11 @@ describe("HTTP application", () => {
     expect(graphRebuild.statusCode).toBe(200);
     const rebuiltAudit = graphRebuild.json<{ graphRebuildReport: string; graphRebuiltAt: string | null }>();
     expect(rebuiltAudit.graphRebuildReport).toContain("审计驱动图谱重构已完成");
+    expect(rebuiltAudit.graphRebuildReport).toContain("本次重构范围");
+    expect(rebuiltAudit.graphRebuildReport).toContain("四类规则治理结果");
+    expect(rebuiltAudit.graphRebuildReport).toContain("Before / After Diff");
+    expect(rebuiltAudit.graphRebuildReport).toContain("quick rule audit 只检查结构与规则问题");
+    expect(rebuiltAudit.graphRebuildReport).toContain("审计发现与本次处理");
     expect(rebuiltAudit.graphRebuiltAt).toBeTruthy();
     const pendingVersion = db.createDocumentVersion(library.id, "pending.txt", "text/plain", "pending-hash", "pending").version;
     const blockedAudit = await app.inject({
@@ -301,11 +391,22 @@ describe("HTTP application", () => {
     })).json<{
       pulse: { id: string; status: string; answer: string };
       hits: Array<{ targetType: string; pathRole: string }>;
+      evidencePack: { evidenceRows: unknown[]; treeNodes: unknown[]; semanticNodes: unknown[]; summaryNodes: unknown[]; retrievalTrace: unknown[] };
       graph: { nodes: Array<{ pulseRole?: string; pulseStats?: { correctCount: number; wrongCount: number } }> };
     }>();
     expect(createdPulse.pulse.status).toBe("unreviewed");
     expect(createdPulse.pulse.answer).toContain("演示脉冲回答");
     expect(createdPulse.hits.some((hit) => hit.targetType === "node" && hit.pathRole === "direct")).toBe(true);
+    expect(createdPulse.evidencePack.evidenceRows.length).toBeGreaterThan(0);
+    expect(createdPulse.evidencePack.treeNodes.length).toBeGreaterThan(0);
+    expect(createdPulse.evidencePack.summaryNodes.length).toBeGreaterThan(0);
+    expect(createdPulse.evidencePack.retrievalTrace.length).toBeGreaterThan(0);
+    const storedPack = (await app.inject({
+      method: "GET",
+      url: `/api/libraries/${library.id}/pulses/${createdPulse.pulse.id}/evidence-pack`,
+    })).json<{ question: string; evidenceRows: unknown[] }>();
+    expect(storedPack.question).toBe("claim follows");
+    expect(storedPack.evidenceRows.length).toBeGreaterThan(0);
     expect(createdPulse.graph.nodes.some((node) => node.pulseRole === "direct")).toBe(true);
     const listedPulses = (await app.inject({ method: "GET", url: `/api/libraries/${library.id}/pulses` }))
       .json<Array<{ id: string }>>();

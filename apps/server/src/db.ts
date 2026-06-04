@@ -12,19 +12,29 @@ import type {
   AnalysisStatement,
   Citation,
   Chunk,
+  ContextUnit,
+  ContextUnitQualityReport,
   Document,
+  DocumentTreeNode,
+  DocumentTreeNodeType,
   DocumentVersion,
+  EvidencePack,
   ExtractionOutput,
   GraphEdge,
   GraphNode,
   GraphResponse,
   FocusRole,
+  IndexBuildRecord,
+  IndexBuildStatus,
+  IndexingPerformanceReport,
+  IndexProfileStatus,
   IngestJob,
   JobStage,
   Library,
   LibrarySettings,
   MappingAudit,
   MappingAuditFinding,
+  MappingAuditMetrics,
   MappingAuditResult,
   OcrMode,
   Pulse,
@@ -35,18 +45,23 @@ import type {
   PulseResponse,
   PulseStats,
   PulseStatus,
+  ParentChildChunk,
   Relation,
   RelationStatus,
   RelationType,
   SearchResult,
+  SummaryTreeLevel,
+  SummaryTreeNode,
   StatementStatus,
   StatementPrecheckOutput,
   SourceLink,
   SourceMetadata,
   SourceStructure,
   PublishedAnalysis,
+  RetrievalUnit,
 } from "@agent-thinking/contracts";
 import type { PendingChunk } from "./domain/chunker.js";
+import type { PendingDocumentIndex } from "./domain/document-tree.js";
 import type { MappingAuditContext, MappingAuditNodeContext, MappingAuditRelationContext } from "./services/models.js";
 
 type Row = Record<string, string | number | null | Uint8Array>;
@@ -110,6 +125,11 @@ function chunkFrom(r: Row): Chunk {
     id: String(r.id),
     libraryId: String(r.library_id),
     versionId: String(r.version_id),
+    parentChunkId: r.parent_chunk_id === null || r.parent_chunk_id === undefined ? null : String(r.parent_chunk_id),
+    documentTreeNodeId: r.document_tree_node_id === null || r.document_tree_node_id === undefined ? null : String(r.document_tree_node_id),
+    childOrdinal: r.child_ordinal === null || r.child_ordinal === undefined ? null : Number(r.child_ordinal),
+    parentOrdinal: r.parent_ordinal === null || r.parent_ordinal === undefined ? null : Number(r.parent_ordinal),
+    nodeType: r.node_type === null || r.node_type === undefined ? null : String(r.node_type) as DocumentTreeNodeType,
     ordinal: Number(r.ordinal),
     headingPath: r.heading_path === null ? null : String(r.heading_path),
     pageNumber: r.page_number === null ? null : Number(r.page_number),
@@ -120,6 +140,100 @@ function chunkFrom(r: Row): Chunk {
     endChar: Number(r.end_char),
     text: String(r.text),
     aspects: parseAspects(r.aspects_json),
+  };
+}
+
+function documentTreeNodeFrom(r: Row): DocumentTreeNode {
+  return {
+    id: String(r.id),
+    libraryId: String(r.library_id),
+    documentId: String(r.document_id),
+    versionId: String(r.version_id),
+    nodeType: String(r.node_type) as DocumentTreeNode["nodeType"],
+    parentId: r.parent_id === null ? null : String(r.parent_id),
+    childrenIds: parseTextList(r.children_ids_json),
+    ordinal: Number(r.ordinal),
+    level: Number(r.level),
+    headingPath: parseTextList(r.heading_path_json),
+    text: String(r.text),
+    summary: String(r.summary),
+    prevId: r.prev_id === null ? null : String(r.prev_id),
+    nextId: r.next_id === null ? null : String(r.next_id),
+    sourceChunkIds: parseTextList(r.source_chunk_ids_json),
+  };
+}
+
+function summaryTreeNodeFrom(r: Row): SummaryTreeNode {
+  return {
+    id: String(r.id),
+    versionId: String(r.version_id),
+    level: String(r.level) as SummaryTreeLevel,
+    sourceNodeIds: parseTextList(r.source_node_ids_json),
+    summary: String(r.summary),
+    embeddingId: r.embedding_id === null ? null : String(r.embedding_id),
+    parentSummaryId: r.parent_summary_id === null ? null : String(r.parent_summary_id),
+    childSummaryIds: parseTextList(r.child_summary_ids_json),
+  };
+}
+
+function indexBuildFrom(r: Row): IndexBuildRecord {
+  return {
+    buildId: String(r.build_id),
+    versionId: String(r.version_id),
+    profile: String(r.profile) as IndexBuildRecord["profile"],
+    status: String(r.status) as IndexBuildStatus,
+    startedAt: String(r.started_at),
+    ...(r.finished_at === null || r.finished_at === undefined ? {} : { finishedAt: String(r.finished_at) }),
+    ...(r.error_message === null || r.error_message === undefined ? {} : { errorMessage: String(r.error_message) }),
+    ...(r.error_stack === null || r.error_stack === undefined ? {} : { errorStack: String(r.error_stack) }),
+    ...(r.context_unit_count === null || r.context_unit_count === undefined ? {} : { contextUnitCount: Number(r.context_unit_count) }),
+    ...(r.retrieval_unit_count === null || r.retrieval_unit_count === undefined ? {} : { retrievalUnitCount: Number(r.retrieval_unit_count) }),
+    ...(r.vector_count === null || r.vector_count === undefined ? {} : { vectorCount: Number(r.vector_count) }),
+    ...(r.summary_vector_count === null || r.summary_vector_count === undefined ? {} : { summaryVectorCount: Number(r.summary_vector_count) }),
+    ...(r.quality_report_json === null || r.quality_report_json === undefined ? {} : { qualityReportJson: String(r.quality_report_json) }),
+    ...(r.performance_report_json === null || r.performance_report_json === undefined ? {} : { performanceReportJson: String(r.performance_report_json) }),
+    indexerVersion: String(r.indexer_version),
+    schemaVersion: Number(r.schema_version),
+  };
+}
+
+function contextUnitFrom(r: Row): ContextUnit {
+  return {
+    id: String(r.id),
+    stableKey: String(r.stable_key),
+    buildId: String(r.build_id),
+    versionId: String(r.version_id),
+    sourceNodeIds: parseTextList(r.source_node_ids_json),
+    primarySourceNodeId: r.primary_source_node_id === null ? null : String(r.primary_source_node_id),
+    sourceRange: JSON.parse(String(r.source_range_json)) as ContextUnit["sourceRange"],
+    headingPath: parseTextList(r.heading_path_json),
+    displayHeadingPath: parseTextList(r.display_heading_path_json),
+    ordinal: Number(r.ordinal),
+    ordinalInPrimarySource: r.ordinal_in_primary_source === null || r.ordinal_in_primary_source === undefined ? undefined : Number(r.ordinal_in_primary_source),
+    text: String(r.text),
+    blocks: JSON.parse(String(r.blocks_json)) as ContextUnit["blocks"],
+    retrievalUnitIds: parseTextList(r.retrieval_unit_ids_json),
+    estimatedTokens: r.estimated_tokens === null || r.estimated_tokens === undefined ? undefined : Number(r.estimated_tokens),
+    boundaryReason: String(r.boundary_reason),
+  };
+}
+
+function retrievalUnitFrom(r: Row): RetrievalUnit {
+  return {
+    id: String(r.id),
+    stableKey: String(r.stable_key),
+    buildId: String(r.build_id),
+    versionId: String(r.version_id),
+    contextUnitId: String(r.context_unit_id),
+    text: String(r.text),
+    headingPath: parseTextList(r.heading_path_json),
+    ordinal: Number(r.ordinal),
+    startChar: r.start_char === null || r.start_char === undefined ? null : Number(r.start_char),
+    endChar: r.end_char === null || r.end_char === undefined ? null : Number(r.end_char),
+    startLine: r.start_line === null || r.start_line === undefined ? null : Number(r.start_line),
+    endLine: r.end_line === null || r.end_line === undefined ? null : Number(r.end_line),
+    pageNumber: r.page_number === null || r.page_number === undefined ? null : Number(r.page_number),
+    estimatedTokens: r.estimated_tokens === null || r.estimated_tokens === undefined ? undefined : Number(r.estimated_tokens),
   };
 }
 
@@ -222,6 +336,7 @@ function parseMappingAuditFindings(value: Row[string] | undefined): MappingAudit
       return [{
         kind: String(finding.kind) as MappingAuditFinding["kind"],
         severity: String(finding.severity) as MappingAuditFinding["severity"],
+        ...(typeof finding.ruleCategory === "string" ? { ruleCategory: finding.ruleCategory as MappingAuditFinding["ruleCategory"] } : {}),
         title: String(finding.title),
         description: typeof finding.description === "string" ? finding.description : "",
         suggestion: typeof finding.suggestion === "string" ? finding.suggestion : "",
@@ -229,6 +344,9 @@ function parseMappingAuditFindings(value: Row[string] | undefined): MappingAudit
         nodeIds: Array.isArray(finding.nodeIds) ? finding.nodeIds.filter((id): id is string => typeof id === "string") : [],
         relationIds: Array.isArray(finding.relationIds) ? finding.relationIds.filter((id): id is string => typeof id === "string") : [],
         userComment: typeof finding.userComment === "string" ? finding.userComment : "",
+        status: typeof finding.status === "string" ? finding.status : "open",
+        ...(typeof finding.resolutionNote === "string" ? { resolutionNote: finding.resolutionNote } : {}),
+        ...(typeof finding.fixedByRebuildId === "string" ? { fixedByRebuildId: finding.fixedByRebuildId } : {}),
       }];
     });
   } catch {
@@ -236,7 +354,19 @@ function parseMappingAuditFindings(value: Row[string] | undefined): MappingAudit
   }
 }
 
+function parseMappingAuditMetrics(value: Row[string] | undefined): MappingAuditMetrics | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return parsed as MappingAuditMetrics;
+  } catch {
+    return undefined;
+  }
+}
+
 function mappingAuditFrom(r: Row): MappingAudit {
+  const metrics = parseMappingAuditMetrics(r.metrics_json);
   return {
     id: String(r.id),
     libraryId: String(r.library_id),
@@ -245,6 +375,7 @@ function mappingAuditFrom(r: Row): MappingAudit {
     summary: String(r.summary),
     reconstruction: String(r.reconstruction),
     findings: parseMappingAuditFindings(r.findings_json),
+    ...(metrics ? { metrics } : {}),
     graphRebuildReport: r.graph_rebuild_report === null ? "" : String(r.graph_rebuild_report ?? ""),
     graphRebuiltAt: r.graph_rebuilt_at === null ? null : String(r.graph_rebuilt_at),
     createdAt: String(r.created_at),
@@ -318,6 +449,7 @@ export class AgentDatabase {
     this.sql = new DatabaseSync(join(dataDir, fileName), { allowExtension: true });
     this.sql.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
     this.migrate();
+    this.markStaleIndexBuildsAbandoned();
   }
 
   close(): void {
@@ -389,6 +521,112 @@ export class AgentDatabase {
       );
       CREATE TABLE IF NOT EXISTS chunk_embeddings (
         chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+        dimensions INTEGER NOT NULL,
+        embedding BLOB NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS index_builds (
+        build_id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        profile TEXT NOT NULL CHECK (profile IN ('v1','v2')),
+        status TEXT NOT NULL CHECK (status IN ('building','ready','failed','partial','abandoned')),
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        error_message TEXT,
+        error_stack TEXT,
+        context_unit_count INTEGER,
+        retrieval_unit_count INTEGER,
+        vector_count INTEGER,
+        summary_vector_count INTEGER,
+        quality_report_json TEXT,
+        performance_report_json TEXT,
+        indexer_version TEXT NOT NULL,
+        schema_version INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS context_units (
+        id TEXT PRIMARY KEY,
+        stable_key TEXT NOT NULL,
+        build_id TEXT NOT NULL REFERENCES index_builds(build_id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        source_node_ids_json TEXT NOT NULL DEFAULT '[]',
+        primary_source_node_id TEXT,
+        source_range_json TEXT NOT NULL,
+        heading_path_json TEXT NOT NULL DEFAULT '[]',
+        display_heading_path_json TEXT NOT NULL DEFAULT '[]',
+        ordinal INTEGER NOT NULL,
+        ordinal_in_primary_source INTEGER,
+        text TEXT NOT NULL,
+        blocks_json TEXT NOT NULL DEFAULT '[]',
+        retrieval_unit_ids_json TEXT NOT NULL DEFAULT '[]',
+        estimated_tokens INTEGER,
+        boundary_reason TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS retrieval_units (
+        id TEXT PRIMARY KEY,
+        stable_key TEXT NOT NULL,
+        build_id TEXT NOT NULL REFERENCES index_builds(build_id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        context_unit_id TEXT NOT NULL REFERENCES context_units(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        heading_path_json TEXT NOT NULL DEFAULT '[]',
+        ordinal INTEGER NOT NULL,
+        start_char INTEGER,
+        end_char INTEGER,
+        start_line INTEGER,
+        end_line INTEGER,
+        page_number INTEGER,
+        estimated_tokens INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS vector_records (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        build_id TEXT NOT NULL,
+        index_schema_version INTEGER NOT NULL,
+        target_type TEXT NOT NULL CHECK (target_type IN ('legacy_chunk','retrieval_unit','summary_node','context_unit_optional')),
+        target_id TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        embedding BLOB NOT NULL,
+        UNIQUE(build_id, target_type, target_id)
+      );
+      CREATE TABLE IF NOT EXISTS document_tree_nodes (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        node_type TEXT NOT NULL,
+        parent_id TEXT,
+        children_ids_json TEXT NOT NULL DEFAULT '[]',
+        ordinal INTEGER NOT NULL,
+        level INTEGER NOT NULL,
+        heading_path_json TEXT NOT NULL DEFAULT '[]',
+        text TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        prev_id TEXT,
+        next_id TEXT,
+        source_chunk_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS parent_child_chunks (
+        child_chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+        parent_chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+        document_tree_node_id TEXT NOT NULL REFERENCES document_tree_nodes(id) ON DELETE CASCADE,
+        child_text TEXT NOT NULL,
+        parent_text TEXT NOT NULL,
+        child_ordinal INTEGER NOT NULL,
+        parent_ordinal INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS summary_tree_nodes (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        level TEXT NOT NULL,
+        source_node_ids_json TEXT NOT NULL DEFAULT '[]',
+        summary TEXT NOT NULL,
+        embedding_id TEXT,
+        parent_summary_id TEXT,
+        child_summary_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS summary_embeddings (
+        summary_id TEXT PRIMARY KEY REFERENCES summary_tree_nodes(id) ON DELETE CASCADE,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
         dimensions INTEGER NOT NULL,
         embedding BLOB NOT NULL
       );
@@ -494,6 +732,7 @@ export class AgentDatabase {
         summary TEXT NOT NULL,
         reconstruction TEXT NOT NULL,
         findings_json TEXT NOT NULL DEFAULT '[]',
+        metrics_json TEXT,
         graph_rebuild_report TEXT NOT NULL DEFAULT '',
         graph_rebuilt_at TEXT,
         created_at TEXT NOT NULL
@@ -521,6 +760,7 @@ export class AgentDatabase {
         question TEXT NOT NULL,
         answer TEXT NOT NULL,
         summary TEXT NOT NULL,
+        evidence_pack_json TEXT,
         input_mode TEXT NOT NULL DEFAULT 'full' CHECK (input_mode IN ('full','progressive')),
         status TEXT NOT NULL CHECK (status IN ('unreviewed','correct','wrong')),
         reviewed_at TEXT,
@@ -559,12 +799,28 @@ export class AgentDatabase {
       CREATE INDEX IF NOT EXISTS idx_pulse_hits_pulse ON pulse_hits(pulse_id);
       CREATE INDEX IF NOT EXISTS idx_pulse_traces_library ON pulse_traces(library_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_user ON auth_sessions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_document_tree_library ON document_tree_nodes(library_id, version_id, ordinal);
+      CREATE INDEX IF NOT EXISTS idx_document_tree_parent ON document_tree_nodes(parent_id);
+      CREATE INDEX IF NOT EXISTS idx_summary_tree_version ON summary_tree_nodes(version_id);
+      CREATE INDEX IF NOT EXISTS idx_summary_embeddings_library ON summary_embeddings(library_id);
+      CREATE INDEX IF NOT EXISTS idx_index_builds_version_profile ON index_builds(version_id, profile, status);
+      CREATE INDEX IF NOT EXISTS idx_context_units_build ON context_units(build_id, version_id, ordinal);
+      CREATE INDEX IF NOT EXISTS idx_context_units_source ON context_units(primary_source_node_id);
+      CREATE INDEX IF NOT EXISTS idx_retrieval_units_build ON retrieval_units(build_id, version_id, ordinal);
+      CREATE INDEX IF NOT EXISTS idx_retrieval_units_context ON retrieval_units(context_unit_id);
+      CREATE INDEX IF NOT EXISTS idx_vector_records_target ON vector_records(library_id, build_id, target_type, dimensions);
     `);
     this.addColumn("libraries", "owner_user_id", "TEXT REFERENCES users(id) ON DELETE CASCADE");
     this.addColumn("chunks", "start_line", "INTEGER");
     this.addColumn("chunks", "end_line", "INTEGER");
     this.addColumn("chunks", "block_id", "TEXT");
     this.addColumn("chunks", "aspects_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumn("chunks", "parent_chunk_id", "TEXT REFERENCES chunks(id) ON DELETE SET NULL");
+    this.addColumn("chunks", "document_tree_node_id", "TEXT");
+    this.addColumn("chunks", "child_ordinal", "INTEGER");
+    this.addColumn("chunks", "parent_ordinal", "INTEGER");
+    this.addColumn("chunks", "node_type", "TEXT");
+    this.sql.exec("CREATE INDEX IF NOT EXISTS idx_chunks_tree_node ON chunks(document_tree_node_id)");
     this.addColumn("abstract_nodes", "level", "INTEGER NOT NULL DEFAULT 1");
     this.addColumn("abstract_nodes", "aspects_json", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("abstract_nodes", "manual_aspects_json", "TEXT");
@@ -576,9 +832,16 @@ export class AgentDatabase {
     this.addColumn("analysis_statements", "precheck_checked_at", "TEXT");
     this.addColumn("analysis_statements", "precheck_content_updated_at", "TEXT");
     this.addColumn("pulses", "input_mode", "TEXT NOT NULL DEFAULT 'full'");
+    this.addColumn("pulses", "evidence_pack_json", "TEXT");
+    this.addColumn("document_versions", "index_schema_version", "INTEGER NOT NULL DEFAULT 1");
+    this.addColumn("document_versions", "latest_ready_v1_build_id", "TEXT");
+    this.addColumn("document_versions", "latest_ready_v2_build_id", "TEXT");
+    this.addColumn("document_versions", "active_index_profile", "TEXT NOT NULL DEFAULT 'v1'");
+    this.addColumn("document_versions", "index_warnings_json", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("pulse_hits", "step_index", "INTEGER");
     this.addColumn("pulse_hits", "observation", "TEXT");
     this.addColumn("pulse_hits", "rationale", "TEXT");
+    this.addColumn("mapping_audits", "metrics_json", "TEXT");
     this.addColumn("mapping_audits", "graph_rebuild_report", "TEXT NOT NULL DEFAULT ''");
     this.addColumn("mapping_audits", "graph_rebuilt_at", "TEXT");
     this.sql.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)").run(now());
@@ -786,6 +1049,11 @@ export class AgentDatabase {
       contentHash: String(r.content_hash),
       storagePath: String(r.storage_path),
       status: String(r.status) as DocumentVersion["status"],
+      indexSchemaVersion: Number(r.index_schema_version ?? 1) === 2 ? 2 : 1,
+      latestReadyV1BuildId: r.latest_ready_v1_build_id === null || r.latest_ready_v1_build_id === undefined ? null : String(r.latest_ready_v1_build_id),
+      latestReadyV2BuildId: r.latest_ready_v2_build_id === null || r.latest_ready_v2_build_id === undefined ? null : String(r.latest_ready_v2_build_id),
+      activeIndexProfile: String(r.active_index_profile ?? "v1") === "v2" ? "v2" : "v1",
+      indexWarnings: parseTextList(r.index_warnings_json),
       createdAt: String(r.created_at),
     };
   }
@@ -1032,8 +1300,8 @@ export class AgentDatabase {
     const createdAt = now();
     this.sql.prepare(`
       INSERT INTO mapping_audits
-        (id, library_id, version_id, status, summary, reconstruction, findings_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (id, library_id, version_id, status, summary, reconstruction, findings_json, metrics_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(version_id) DO UPDATE SET
         id = excluded.id,
         library_id = excluded.library_id,
@@ -1041,6 +1309,7 @@ export class AgentDatabase {
         summary = excluded.summary,
         reconstruction = excluded.reconstruction,
         findings_json = excluded.findings_json,
+        metrics_json = excluded.metrics_json,
         graph_rebuild_report = '',
         graph_rebuilt_at = NULL,
         created_at = excluded.created_at
@@ -1052,6 +1321,7 @@ export class AgentDatabase {
       result.summary,
       result.reconstruction,
       JSON.stringify(result.findings),
+      result.metrics ? JSON.stringify(result.metrics) : null,
       createdAt,
     );
     return this.getMappingAudit(versionId) as MappingAudit;
@@ -1195,13 +1465,16 @@ export class AgentDatabase {
     this.sql.prepare("DELETE FROM chunks WHERE version_id = ?").run(versionId);
     const insert = this.sql.prepare(`
       INSERT INTO chunks
-        (id, library_id, version_id, ordinal, heading_path, page_number, start_line, end_line, block_id, start_char, end_char, text, aspects_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, library_id, version_id, parent_chunk_id, document_tree_node_id, child_ordinal, parent_ordinal, node_type,
+          ordinal, heading_path, page_number, start_line, end_line, block_id, start_char, end_char, text, aspects_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertFts = this.sql.prepare(
       "INSERT INTO chunks_fts (chunk_id, text, heading_path) VALUES (?, ?, ?)",
     );
     const result: Chunk[] = [];
+    const localToChunk = new Map<string, Chunk>();
+    const pendingByChunkId = new Map<string, PendingChunk & { localKey?: string; parentLocalKey?: string }>();
     for (const item of pending) {
       const chunk: Chunk = {
         id: randomUUID(),
@@ -1211,20 +1484,591 @@ export class AgentDatabase {
         startLine: item.startLine ?? null,
         endLine: item.endLine ?? null,
         blockId: item.blockId ?? null,
+        parentChunkId: item.parentChunkId ?? null,
+        documentTreeNodeId: item.documentTreeNodeId ?? null,
+        childOrdinal: item.childOrdinal ?? null,
+        parentOrdinal: item.parentOrdinal ?? null,
+        nodeType: item.nodeType ?? null,
         aspects: [],
       };
       insert.run(
-        chunk.id, libraryId, versionId, chunk.ordinal, chunk.headingPath, chunk.pageNumber,
+        chunk.id, libraryId, versionId, chunk.parentChunkId ?? null, chunk.documentTreeNodeId ?? null,
+        chunk.childOrdinal ?? null, chunk.parentOrdinal ?? null, chunk.nodeType ?? null,
+        chunk.ordinal, chunk.headingPath, chunk.pageNumber,
         chunk.startLine ?? null, chunk.endLine ?? null, chunk.blockId ?? null,
         chunk.startChar, chunk.endChar, chunk.text, JSON.stringify(chunk.aspects),
       );
       insertFts.run(chunk.id, chunk.text, chunk.headingPath ?? "");
       result.push(chunk);
+      const localKey = (item as { localKey?: string }).localKey;
+      if (localKey) localToChunk.set(localKey, chunk);
+      pendingByChunkId.set(chunk.id, item as PendingChunk & { localKey?: string; parentLocalKey?: string });
+    }
+    const updateParent = this.sql.prepare("UPDATE chunks SET parent_chunk_id = ? WHERE id = ?");
+    for (const chunk of result) {
+      const item = pendingByChunkId.get(chunk.id);
+      const parentLocalKey = item?.parentLocalKey;
+      if (!parentLocalKey) continue;
+      const parent = localToChunk.get(parentLocalKey);
+      if (!parent) continue;
+      updateParent.run(parent.id, chunk.id);
+      chunk.parentChunkId = parent.id;
     }
     return result;
   }
 
+  saveDocumentIndex(index: PendingDocumentIndex, chunks: Chunk[]): void {
+    const chunkByLocalKey = new Map<string, Chunk>();
+    for (const pending of index.chunks) {
+      const chunk = chunks.find((candidate) => candidate.ordinal === pending.ordinal);
+      if (chunk) chunkByLocalKey.set(pending.localKey, chunk);
+    }
+    const sourceIdsFor = (nodeId: string): string[] => {
+      const localIds = index.chunks
+        .filter((chunk) => chunk.documentTreeNodeId === nodeId)
+        .flatMap((chunk) => chunkByLocalKey.get(chunk.localKey)?.id ?? []);
+      return [...new Set(localIds)];
+    };
+    const insertNode = this.sql.prepare(`
+      INSERT INTO document_tree_nodes
+        (id, library_id, document_id, version_id, node_type, parent_id, children_ids_json, ordinal, level,
+          heading_path_json, text, summary, prev_id, next_id, source_chunk_ids_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const node of index.treeNodes) {
+      insertNode.run(
+        node.id,
+        node.libraryId,
+        node.documentId,
+        node.versionId,
+        node.nodeType,
+        node.parentId,
+        JSON.stringify(node.childrenIds),
+        node.ordinal,
+        node.level,
+        JSON.stringify(node.headingPath),
+        node.text,
+        node.summary,
+        node.prevId,
+        node.nextId,
+        JSON.stringify(sourceIdsFor(node.id)),
+      );
+    }
+    const insertLink = this.sql.prepare(`
+      INSERT OR REPLACE INTO parent_child_chunks
+        (child_chunk_id, parent_chunk_id, document_tree_node_id, child_text, parent_text, child_ordinal, parent_ordinal)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const link of index.parentChildLinks) {
+      const child = chunkByLocalKey.get(link.childLocalKey);
+      const parent = chunkByLocalKey.get(link.parentLocalKey);
+      if (!child || !parent) continue;
+      insertLink.run(
+        child.id,
+        parent.id,
+        link.documentTreeNodeId,
+        child.text,
+        parent.text,
+        child.childOrdinal ?? child.ordinal,
+        parent.ordinal,
+      );
+    }
+    const insertSummary = this.sql.prepare(`
+      INSERT INTO summary_tree_nodes
+        (id, version_id, level, source_node_ids_json, summary, embedding_id, parent_summary_id, child_summary_ids_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const summary of index.summaryNodes) {
+      insertSummary.run(
+        summary.id,
+        summary.versionId,
+        summary.level,
+        JSON.stringify(summary.sourceNodeIds),
+        summary.summary,
+        summary.embeddingId ?? summary.id,
+        summary.parentSummaryId,
+        JSON.stringify(summary.childSummaryIds),
+      );
+    }
+  }
+
+  createIndexBuild(versionId: string, profile: "v1" | "v2", indexerVersion = "graphrag-v6"): IndexBuildRecord {
+    const buildId = randomUUID();
+    const timestamp = now();
+    this.sql.prepare(`
+      INSERT INTO index_builds
+        (build_id, version_id, profile, status, started_at, indexer_version, schema_version)
+      VALUES (?, ?, ?, 'building', ?, ?, ?)
+    `).run(buildId, versionId, profile, timestamp, indexerVersion, profile === "v2" ? 2 : 1);
+    return this.getIndexBuild(buildId) as IndexBuildRecord;
+  }
+
+  getIndexBuild(buildId: string): IndexBuildRecord | undefined {
+    const result = row(this.sql.prepare("SELECT * FROM index_builds WHERE build_id = ?"), buildId);
+    return result ? indexBuildFrom(result) : undefined;
+  }
+
+  listIndexBuilds(versionId: string): IndexBuildRecord[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM index_builds WHERE version_id = ? ORDER BY started_at DESC LIMIT 20"),
+      versionId,
+    ).map(indexBuildFrom);
+  }
+
+  markStaleIndexBuildsAbandoned(olderThanMs = 60 * 60 * 1000): number {
+    const threshold = new Date(Date.now() - olderThanMs).toISOString();
+    return Number(this.sql.prepare(`
+      UPDATE index_builds
+      SET status = 'abandoned', finished_at = ?, error_message = COALESCE(error_message, 'Build abandoned during startup recovery.')
+      WHERE status = 'building' AND started_at < ?
+    `).run(now(), threshold).changes);
+  }
+
+  saveContextIndex(
+    buildId: string,
+    contextUnits: ContextUnit[],
+    retrievalUnits: RetrievalUnit[],
+    qualityReport: ContextUnitQualityReport,
+    performanceReport: IndexingPerformanceReport,
+  ): void {
+    const build = this.getIndexBuild(buildId);
+    if (!build) throw new Error("index build 不存在");
+    if (build.status !== "building") throw new Error("只有 building 状态的 index build 可以写入");
+    const insertContext = this.sql.prepare(`
+      INSERT INTO context_units
+        (id, stable_key, build_id, version_id, source_node_ids_json, primary_source_node_id, source_range_json,
+          heading_path_json, display_heading_path_json, ordinal, ordinal_in_primary_source, text, blocks_json,
+          retrieval_unit_ids_json, estimated_tokens, boundary_reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertRetrieval = this.sql.prepare(`
+      INSERT INTO retrieval_units
+        (id, stable_key, build_id, version_id, context_unit_id, text, heading_path_json, ordinal,
+          start_char, end_char, start_line, end_line, page_number, estimated_tokens)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.sql.exec("BEGIN");
+    try {
+      this.sql.prepare("DELETE FROM retrieval_units WHERE build_id = ?").run(buildId);
+      this.sql.prepare("DELETE FROM context_units WHERE build_id = ?").run(buildId);
+      for (const unit of contextUnits) {
+        insertContext.run(
+          unit.id,
+          unit.stableKey,
+          unit.buildId,
+          unit.versionId,
+          JSON.stringify(unit.sourceNodeIds),
+          unit.primarySourceNodeId ?? null,
+          JSON.stringify(unit.sourceRange),
+          JSON.stringify(unit.headingPath),
+          JSON.stringify(unit.displayHeadingPath),
+          unit.ordinal,
+          unit.ordinalInPrimarySource ?? null,
+          unit.text,
+          JSON.stringify(unit.blocks),
+          JSON.stringify(unit.retrievalUnitIds),
+          unit.estimatedTokens ?? null,
+          unit.boundaryReason,
+        );
+      }
+      for (const unit of retrievalUnits) {
+        insertRetrieval.run(
+          unit.id,
+          unit.stableKey,
+          unit.buildId,
+          unit.versionId,
+          unit.contextUnitId,
+          unit.text,
+          JSON.stringify(unit.headingPath),
+          unit.ordinal,
+          unit.startChar ?? null,
+          unit.endChar ?? null,
+          unit.startLine ?? null,
+          unit.endLine ?? null,
+          unit.pageNumber ?? null,
+          unit.estimatedTokens ?? null,
+        );
+      }
+      this.sql.prepare(`
+        UPDATE index_builds
+        SET context_unit_count = ?, retrieval_unit_count = ?, quality_report_json = ?, performance_report_json = ?
+        WHERE build_id = ?
+      `).run(contextUnits.length, retrievalUnits.length, JSON.stringify(qualityReport), JSON.stringify(performanceReport), buildId);
+      this.sql.exec("COMMIT");
+    } catch (error) {
+      this.sql.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  markIndexBuildReady(buildId: string, counts: { vectorCount?: number; summaryVectorCount?: number } = {}): IndexBuildRecord {
+    const build = this.getIndexBuild(buildId);
+    if (!build) throw new Error("index build 不存在");
+    const timestamp = now();
+    this.sql.exec("BEGIN");
+    try {
+      this.sql.prepare(`
+        UPDATE index_builds
+        SET status = 'ready', finished_at = ?, vector_count = COALESCE(?, vector_count), summary_vector_count = COALESCE(?, summary_vector_count)
+        WHERE build_id = ?
+      `).run(timestamp, counts.vectorCount ?? null, counts.summaryVectorCount ?? null, buildId);
+      if (build.profile === "v1") {
+        this.sql.prepare(`
+          UPDATE document_versions
+          SET latest_ready_v1_build_id = ?, active_index_profile = CASE WHEN active_index_profile = 'v2' THEN active_index_profile ELSE 'v1' END
+          WHERE id = ?
+        `).run(buildId, build.versionId);
+      } else {
+        this.sql.prepare(`
+          UPDATE document_versions
+          SET latest_ready_v2_build_id = ?, index_schema_version = 2, active_index_profile = 'v2'
+          WHERE id = ?
+        `).run(buildId, build.versionId);
+      }
+      this.sql.exec("COMMIT");
+      return this.getIndexBuild(buildId) as IndexBuildRecord;
+    } catch (error) {
+      this.sql.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  markIndexBuildFailed(buildId: string, error: unknown, status: "failed" | "partial" | "abandoned" = "failed"): IndexBuildRecord | undefined {
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack : undefined;
+    const build = this.getIndexBuild(buildId);
+    this.sql.prepare(`
+      UPDATE index_builds
+      SET status = ?, finished_at = ?, error_message = ?, error_stack = ?
+      WHERE build_id = ?
+    `).run(status, now(), message, stack ?? null, buildId);
+    if (build) {
+      const version = this.getVersion(build.versionId);
+      const warnings = [...new Set([...(version?.indexWarnings ?? []), `${build.profile} index build ${status}: ${message}`])];
+      this.sql.prepare("UPDATE document_versions SET index_warnings_json = ? WHERE id = ?")
+        .run(JSON.stringify(warnings), build.versionId);
+    }
+    return this.getIndexBuild(buildId);
+  }
+
+  getReadyContextUnits(versionId: string): ContextUnit[] {
+    const buildId = this.getVersion(versionId)?.latestReadyV2BuildId;
+    if (!buildId) return [];
+    const build = this.getIndexBuild(buildId);
+    if (build?.status !== "ready") return [];
+    return rows(
+      this.sql.prepare("SELECT * FROM context_units WHERE build_id = ? ORDER BY ordinal"),
+      buildId,
+    ).map(contextUnitFrom);
+  }
+
+  getReadyRetrievalUnits(versionId: string): RetrievalUnit[] {
+    const buildId = this.getVersion(versionId)?.latestReadyV2BuildId;
+    if (!buildId) return [];
+    const build = this.getIndexBuild(buildId);
+    if (build?.status !== "ready") return [];
+    return rows(
+      this.sql.prepare("SELECT * FROM retrieval_units WHERE build_id = ? ORDER BY ordinal"),
+      buildId,
+    ).map(retrievalUnitFrom);
+  }
+
+  getContextUnitsByIds(ids: string[]): ContextUnit[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    return rows(
+      this.sql.prepare(`SELECT * FROM context_units WHERE id IN (${placeholders}) ORDER BY ordinal`),
+      ...ids,
+    ).map(contextUnitFrom);
+  }
+
+  getRetrievalUnitsByIds(ids: string[]): RetrievalUnit[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    return rows(
+      this.sql.prepare(`SELECT * FROM retrieval_units WHERE id IN (${placeholders}) ORDER BY ordinal`),
+      ...ids,
+    ).map(retrievalUnitFrom);
+  }
+
+  getReadyContextUnitsForLibrary(libraryId: string): ContextUnit[] {
+    return rows(
+      this.sql.prepare(`
+        SELECT cu.* FROM context_units cu
+        JOIN document_versions v ON v.id = cu.version_id AND v.latest_ready_v2_build_id = cu.build_id
+        JOIN index_builds b ON b.build_id = cu.build_id AND b.status = 'ready'
+        JOIN documents d ON d.id = v.document_id
+        WHERE d.library_id = ?
+        ORDER BY v.created_at, cu.ordinal
+      `),
+      libraryId,
+    ).map(contextUnitFrom);
+  }
+
+  getReadyRetrievalUnitsForLibrary(libraryId: string): RetrievalUnit[] {
+    return rows(
+      this.sql.prepare(`
+        SELECT ru.* FROM retrieval_units ru
+        JOIN document_versions v ON v.id = ru.version_id AND v.latest_ready_v2_build_id = ru.build_id
+        JOIN index_builds b ON b.build_id = ru.build_id AND b.status = 'ready'
+        JOIN documents d ON d.id = v.document_id
+        WHERE d.library_id = ?
+        ORDER BY v.created_at, ru.ordinal
+      `),
+      libraryId,
+    ).map(retrievalUnitFrom);
+  }
+
+  searchRetrievalUnitsText(libraryId: string, query: string, limit = 12): Array<{ unit: RetrievalUnit; score: number }> {
+    const normalizedQuery = normalizeSearchText(query);
+    if (!normalizedQuery) return [];
+    const tokens = searchTokens(query);
+    const candidates = this.getReadyRetrievalUnitsForLibrary(libraryId);
+    return candidates
+      .map((unit) => {
+        const text = normalizeSearchText(unit.text);
+        const heading = normalizeSearchText(unit.headingPath.join(" / "));
+        let score = text.includes(normalizedQuery) ? 0.55 : 0;
+        if (heading.includes(normalizedQuery)) score += 0.35;
+        if (tokens.length > 0) {
+          const hits = tokens.filter((token) => text.includes(token) || heading.includes(token)).length;
+          score += (hits / tokens.length) * 0.45;
+        }
+        return { unit, score: Math.min(1, score) };
+      })
+      .filter((result) => result.score > 0)
+      .sort((left, right) => right.score - left.score || left.unit.ordinal - right.unit.ordinal)
+      .slice(0, limit);
+  }
+
+  getContextUnitsBySourceNodeId(sourceNodeId: string): ContextUnit[] {
+    return rows(
+      this.sql.prepare(`
+        SELECT cu.* FROM context_units cu
+        JOIN index_builds b ON b.build_id = cu.build_id
+        JOIN document_versions v ON v.latest_ready_v2_build_id = cu.build_id
+        WHERE b.status = 'ready' AND (cu.primary_source_node_id = ? OR cu.source_node_ids_json LIKE ?)
+        ORDER BY cu.ordinal
+      `),
+      sourceNodeId,
+      `%"${sourceNodeId}"%`,
+    ).map(contextUnitFrom);
+  }
+
+  getSourceNodesForContextUnit(contextUnitId: string): DocumentTreeNode[] {
+    const unit = row(this.sql.prepare("SELECT source_node_ids_json FROM context_units WHERE id = ?"), contextUnitId);
+    return this.getDocumentTreeNodesByIds(parseTextList(unit?.source_node_ids_json));
+  }
+
+  getIndexProfileStatus(versionId: string): IndexProfileStatus {
+    const version = this.getVersion(versionId);
+    const builds = this.listIndexBuilds(versionId);
+    const latestV1 = version?.latestReadyV1BuildId ? this.getIndexBuild(version.latestReadyV1BuildId) : undefined;
+    const latestV2 = version?.latestReadyV2BuildId ? this.getIndexBuild(version.latestReadyV2BuildId) : undefined;
+    const latestStatus = (profile: "v1" | "v2", ready: IndexBuildRecord | undefined): IndexProfileStatus["v1"] => {
+      if (ready?.status === "ready") return "ready";
+      return builds.find((build) => build.profile === profile)?.status ?? "not_started";
+    };
+    const lastV2Error = builds.find((build) => build.profile === "v2" && build.errorMessage)?.errorMessage;
+    return {
+      v1: latestStatus("v1", latestV1),
+      v2: latestStatus("v2", latestV2),
+      activeProfile: version?.activeIndexProfile ?? "v1",
+      latestReadyV1BuildId: version?.latestReadyV1BuildId ?? null,
+      latestReadyV2BuildId: version?.latestReadyV2BuildId ?? null,
+      warnings: version?.indexWarnings ?? [],
+      lastV1BuildAt: builds.find((build) => build.profile === "v1")?.startedAt,
+      lastV2BuildAt: builds.find((build) => build.profile === "v2")?.startedAt,
+      ...(lastV2Error ? { lastV2Error } : {}),
+    };
+  }
+
+  getV2IndexHealth(versionId: string): {
+    status: IndexProfileStatus;
+    buildId?: string | undefined;
+    retrievalUnitCount: number;
+    contextUnitCount: number;
+    vectorCount: number;
+    summaryVectorCount: number;
+    qualityReport?: ContextUnitQualityReport | undefined;
+    performanceReport?: IndexingPerformanceReport | undefined;
+    buildHistory: Array<{ buildId: string; status: string; startedAt: string; finishedAt?: string | undefined; errorMessage?: string | undefined }>;
+    warnings: string[];
+  } {
+    const status = this.getIndexProfileStatus(versionId);
+    const build = status.latestReadyV2BuildId ? this.getIndexBuild(status.latestReadyV2BuildId) : undefined;
+    return {
+      status,
+      ...(build ? { buildId: build.buildId } : {}),
+      retrievalUnitCount: build?.retrievalUnitCount ?? 0,
+      contextUnitCount: build?.contextUnitCount ?? 0,
+      vectorCount: build?.vectorCount ?? 0,
+      summaryVectorCount: build?.summaryVectorCount ?? 0,
+      ...(build?.qualityReportJson ? { qualityReport: JSON.parse(build.qualityReportJson) as ContextUnitQualityReport } : {}),
+      ...(build?.performanceReportJson ? { performanceReport: JSON.parse(build.performanceReportJson) as IndexingPerformanceReport } : {}),
+      buildHistory: this.listIndexBuilds(versionId).map((entry) => ({
+        buildId: entry.buildId,
+        status: entry.status,
+        startedAt: entry.startedAt,
+        ...(entry.finishedAt ? { finishedAt: entry.finishedAt } : {}),
+        ...(entry.errorMessage ? { errorMessage: entry.errorMessage } : {}),
+      })),
+      warnings: status.warnings,
+    };
+  }
+
+  getIndexStatusReport(versionId: string): {
+    versionId: string;
+    activeIndexProfile: "v1" | "v2";
+    latestReadyV1BuildId: string | null;
+    latestReadyV2BuildId: string | null;
+    chunkCount: number;
+    contextUnitCount: number;
+    retrievalUnitCount: number;
+    chunkVectorCount: number;
+    retrievalUnitVectorCount: number;
+    summaryVectorCount: number;
+    qualityReport?: ContextUnitQualityReport | undefined;
+    warnings: string[];
+  } {
+    const version = this.getVersion(versionId);
+    if (!version) throw new Error("导入版本不存在");
+    const v2Health = this.getV2IndexHealth(versionId);
+    const chunkCount = Number(row(this.sql.prepare("SELECT COUNT(*) AS count FROM chunks WHERE version_id = ?"), versionId)?.count ?? 0);
+    const chunkVectorCount = Number(row(this.sql.prepare(`
+      SELECT COUNT(*) AS count FROM chunk_embeddings e JOIN chunks c ON c.id = e.chunk_id WHERE c.version_id = ?
+    `), versionId)?.count ?? 0);
+    return {
+      versionId,
+      activeIndexProfile: version.activeIndexProfile ?? "v1",
+      latestReadyV1BuildId: version.latestReadyV1BuildId ?? null,
+      latestReadyV2BuildId: version.latestReadyV2BuildId ?? null,
+      chunkCount,
+      contextUnitCount: v2Health.contextUnitCount,
+      retrievalUnitCount: v2Health.retrievalUnitCount,
+      chunkVectorCount,
+      retrievalUnitVectorCount: version.latestReadyV2BuildId ? this.countVectorRecords(version.latestReadyV2BuildId, "retrieval_unit") : 0,
+      summaryVectorCount: version.latestReadyV2BuildId ? this.countVectorRecords(version.latestReadyV2BuildId, "summary_node") : 0,
+      ...(v2Health.qualityReport ? { qualityReport: v2Health.qualityReport } : {}),
+      warnings: v2Health.warnings,
+    };
+  }
+
+  getDocumentTreeForVersion(versionId: string): DocumentTreeNode[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM document_tree_nodes WHERE version_id = ? ORDER BY ordinal"),
+      versionId,
+    ).map(documentTreeNodeFrom);
+  }
+
+  getDocumentTreeForLibrary(libraryId: string): DocumentTreeNode[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM document_tree_nodes WHERE library_id = ? ORDER BY version_id, ordinal"),
+      libraryId,
+    ).map(documentTreeNodeFrom);
+  }
+
+  getDocumentTreeNodesByIds(ids: string[]): DocumentTreeNode[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const order = new Map(ids.map((id, index) => [id, index]));
+    return rows(this.sql.prepare(`SELECT * FROM document_tree_nodes WHERE id IN (${placeholders})`), ...ids)
+      .map(documentTreeNodeFrom)
+      .sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
+  }
+
+  searchDocumentTreeNodes(libraryId: string, query: string, limit = 20): DocumentTreeNode[] {
+    const normalized = normalizeSearchText(query);
+    if (!normalized) return [];
+    const tokens = searchTokens(query).slice(0, 6);
+    const likeTerms = [normalized, ...tokens];
+    const filters = likeTerms.flatMap(() => ["text LIKE ?", "summary LIKE ?"]);
+    const params = likeTerms.flatMap((term) => [`%${term}%`, `%${term}%`]);
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM document_tree_nodes
+        WHERE library_id = ? AND (${filters.join(" OR ")})
+        ORDER BY level, ordinal LIMIT ?
+      `),
+      libraryId,
+      ...params,
+      Math.max(1, Math.min(limit, 100)),
+    ).map(documentTreeNodeFrom);
+  }
+
+  getSectionSubtree(sectionId: string): DocumentTreeNode[] {
+    const root = row(this.sql.prepare("SELECT * FROM document_tree_nodes WHERE id = ?"), sectionId);
+    if (!root) return [];
+    const versionId = String(root.version_id);
+    const all = this.getDocumentTreeForVersion(versionId);
+    const byParent = new Map<string | null, DocumentTreeNode[]>();
+    for (const node of all) {
+      const group = byParent.get(node.parentId) ?? [];
+      group.push(node);
+      byParent.set(node.parentId, group);
+    }
+    const result: DocumentTreeNode[] = [];
+    const visit = (node: DocumentTreeNode) => {
+      result.push(node);
+      for (const child of byParent.get(node.id) ?? []) visit(child);
+    };
+    visit(documentTreeNodeFrom(root));
+    return result;
+  }
+
+  getSiblingTreeNodes(nodeId: string, window = 3): DocumentTreeNode[] {
+    const node = row(this.sql.prepare("SELECT * FROM document_tree_nodes WHERE id = ?"), nodeId);
+    if (!node) return [];
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM document_tree_nodes
+        WHERE version_id = ? AND parent_id IS ? AND ordinal BETWEEN ? AND ?
+        ORDER BY ordinal
+      `),
+      String(node.version_id),
+      node.parent_id,
+      Number(node.ordinal) - Math.max(1, window),
+      Number(node.ordinal) + Math.max(1, window),
+    ).map(documentTreeNodeFrom);
+  }
+
+  getRemainingTreeNodesAfter(nodeId: string, limit = 24): DocumentTreeNode[] {
+    const node = row(this.sql.prepare("SELECT * FROM document_tree_nodes WHERE id = ?"), nodeId);
+    if (!node) return [];
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM document_tree_nodes
+        WHERE version_id = ? AND ordinal > ?
+        ORDER BY ordinal LIMIT ?
+      `),
+      String(node.version_id),
+      Number(node.ordinal),
+      Math.max(1, Math.min(limit, 100)),
+    ).map(documentTreeNodeFrom);
+  }
+
+  getParentChildChunks(childChunkIds: string[]): ParentChildChunk[] {
+    if (childChunkIds.length === 0) return [];
+    const placeholders = childChunkIds.map(() => "?").join(",");
+    return rows(
+      this.sql.prepare(`SELECT * FROM parent_child_chunks WHERE child_chunk_id IN (${placeholders})`),
+      ...childChunkIds,
+    ).map((entry) => ({
+      childChunkId: String(entry.child_chunk_id),
+      parentChunkId: String(entry.parent_chunk_id),
+      documentTreeNodeId: String(entry.document_tree_node_id),
+      childText: String(entry.child_text),
+      parentText: String(entry.parent_text),
+      childOrdinal: Number(entry.child_ordinal),
+      parentOrdinal: Number(entry.parent_ordinal),
+    }));
+  }
+
   private clearGeneratedForVersion(versionId: string): void {
+    this.sql.prepare("DELETE FROM summary_embeddings WHERE summary_id IN (SELECT id FROM summary_tree_nodes WHERE version_id = ?)").run(versionId);
+    this.sql.prepare("DELETE FROM summary_tree_nodes WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM parent_child_chunks WHERE child_chunk_id IN (SELECT id FROM chunks WHERE version_id = ?)").run(versionId);
+    this.sql.prepare("DELETE FROM document_tree_nodes WHERE version_id = ?").run(versionId);
     const contributionNodes = rows(
       this.sql.prepare("SELECT node_id FROM abstract_node_aspect_contributions WHERE analyzed_version_id = ?"),
       versionId,
@@ -1302,8 +2146,127 @@ export class AgentDatabase {
   getChunksByIds(ids: string[]): Chunk[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
+    const order = new Map(ids.map((id, index) => [id, index]));
     return rows(this.sql.prepare(`SELECT * FROM chunks WHERE id IN (${placeholders})`), ...ids)
-      .map(chunkFrom);
+      .map(chunkFrom)
+      .sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
+  }
+
+  getNeighborChunks(chunkIds: string[], window: number): Chunk[] {
+    if (chunkIds.length === 0) return [];
+    const seeds = this.getChunksByIds(chunkIds);
+    const seen = new Set<string>();
+    const result: Chunk[] = [];
+    const boundedWindow = Math.min(Math.max(Math.trunc(window), 0), 8);
+    for (const seed of seeds) {
+      for (const chunk of rows(
+        this.sql.prepare(`
+          SELECT * FROM chunks
+          WHERE library_id = ? AND version_id = ? AND ordinal BETWEEN ? AND ?
+          ORDER BY ordinal
+        `),
+        seed.libraryId,
+        seed.versionId,
+        Math.max(0, seed.ordinal - boundedWindow),
+        seed.ordinal + boundedWindow,
+      ).map(chunkFrom)) {
+        if (seen.has(chunk.id)) continue;
+        seen.add(chunk.id);
+        result.push(chunk);
+      }
+    }
+    return result;
+  }
+
+  getSameSectionChunks(chunkIds: string[], limit = 30): Chunk[] {
+    if (chunkIds.length === 0) return [];
+    const seeds = this.getChunksByIds(chunkIds);
+    const seen = new Set<string>();
+    const result: Chunk[] = [];
+    for (const seed of seeds) {
+      const sectionLimit = Math.max(1, Math.min(limit, 80));
+      const sectionRows = seed.headingPath
+        ? rows(
+          this.sql.prepare(`
+            SELECT * FROM chunks
+            WHERE library_id = ? AND version_id = ? AND heading_path = ?
+            ORDER BY ordinal LIMIT ?
+          `),
+          seed.libraryId,
+          seed.versionId,
+          seed.headingPath,
+          sectionLimit,
+        )
+        : rows(
+          this.sql.prepare(`
+            SELECT * FROM chunks
+            WHERE library_id = ? AND version_id = ?
+            ORDER BY ordinal LIMIT ?
+          `),
+          seed.libraryId,
+          seed.versionId,
+          sectionLimit,
+        );
+      for (const chunk of sectionRows.map(chunkFrom)) {
+        if (seen.has(chunk.id)) continue;
+        seen.add(chunk.id);
+        result.push(chunk);
+      }
+    }
+    return result.slice(0, Math.max(1, Math.min(limit, 80)));
+  }
+
+  getRemainingChunksAfter(versionId: string, chunkId: string, limit = 12): Chunk[] {
+    const seed = this.getChunk(chunkId);
+    if (!seed || seed.versionId !== versionId) return [];
+    return rows(
+      this.sql.prepare(`
+        SELECT * FROM chunks
+        WHERE library_id = ? AND version_id = ? AND ordinal > ?
+        ORDER BY ordinal LIMIT ?
+      `),
+      seed.libraryId,
+      versionId,
+      seed.ordinal,
+      Math.max(1, Math.min(Math.trunc(limit), 80)),
+    ).map(chunkFrom);
+  }
+
+  getDocumentOutlineForLibrary(libraryId: string, versionId?: string): Array<{
+    versionId: string;
+    documentName: string;
+    headingPath: string | null;
+    chunkCount: number;
+    firstOrdinal: number;
+    lastOrdinal: number;
+  }> {
+    const filters = ["c.library_id = ?"];
+    const params: Array<string | number> = [libraryId];
+    if (versionId) {
+      filters.push("c.version_id = ?");
+      params.push(versionId);
+    }
+    return rows(
+      this.sql.prepare(`
+        SELECT c.version_id, d.name AS document_name, c.heading_path,
+          COUNT(*) AS chunk_count, MIN(c.ordinal) AS first_ordinal, MAX(c.ordinal) AS last_ordinal
+        FROM chunks c
+        JOIN document_versions v ON v.id = c.version_id
+        JOIN documents d ON d.id = v.document_id
+        WHERE ${filters.join(" AND ")}
+        GROUP BY c.version_id, d.name, c.heading_path
+        ORDER BY d.name, first_ordinal
+        LIMIT 200
+      `),
+      ...params,
+    ).map((entry) => ({
+      versionId: String(entry.version_id),
+      documentName: String(entry.document_name),
+      headingPath: entry.heading_path === null ? null : String(entry.heading_path),
+      chunkCount: Number(entry.chunk_count),
+      firstOrdinal: Number(entry.first_ordinal),
+      lastOrdinal: Number(entry.last_ordinal),
+    }));
   }
 
   searchText(libraryId: string, query: string, limit: number): SearchResult[] {
@@ -1314,6 +2277,7 @@ export class AgentDatabase {
         SELECT c.*, bm25(chunks_fts) AS rank
         FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.chunk_id
         WHERE chunks_fts MATCH ? AND c.library_id = ?
+          AND (c.node_type IS NULL OR c.node_type IN ('paragraph','sentence','unknown'))
         ORDER BY rank LIMIT ?
       `),
       match,
@@ -1333,6 +2297,7 @@ export class AgentDatabase {
       this.sql.prepare(`
         SELECT * FROM chunks
         WHERE library_id = ? AND (${filters.join(" OR ")})
+          AND (node_type IS NULL OR node_type IN ('paragraph','sentence','unknown'))
         ORDER BY ordinal LIMIT ?
       `),
       libraryId,
@@ -1495,6 +2460,81 @@ export class AgentDatabase {
       INSERT INTO chunk_embeddings (chunk_id, dimensions, embedding) VALUES (?, ?, ?)
       ON CONFLICT(chunk_id) DO UPDATE SET dimensions = excluded.dimensions, embedding = excluded.embedding
     `).run(chunkId, dimensions, embedding);
+    const chunk = this.getChunk(chunkId);
+    if (chunk) {
+      const buildId = this.getVersion(chunk.versionId)?.latestReadyV1BuildId ?? `legacy-v1:${chunk.versionId}`;
+      this.saveVectorRecord(chunk.libraryId, chunk.versionId, buildId, 1, "legacy_chunk", chunk.id, dimensions, embedding);
+    }
+  }
+
+  saveSummaryEmbedding(libraryId: string, summaryId: string, dimensions: number, embedding: Uint8Array): void {
+    this.sql.prepare(`
+      INSERT INTO summary_embeddings (summary_id, library_id, dimensions, embedding) VALUES (?, ?, ?, ?)
+      ON CONFLICT(summary_id) DO UPDATE SET dimensions = excluded.dimensions, embedding = excluded.embedding
+    `).run(summaryId, libraryId, dimensions, embedding);
+    this.sql.prepare("UPDATE summary_tree_nodes SET embedding_id = ? WHERE id = ?").run(summaryId, summaryId);
+  }
+
+  saveVectorRecord(
+    libraryId: string,
+    versionId: string,
+    buildId: string,
+    indexSchemaVersion: 1 | 2,
+    targetType: "legacy_chunk" | "retrieval_unit" | "summary_node" | "context_unit_optional",
+    targetId: string,
+    dimensions: number,
+    embedding: Uint8Array,
+  ): void {
+    this.sql.prepare(`
+      INSERT INTO vector_records
+        (id, library_id, version_id, build_id, index_schema_version, target_type, target_id, dimensions, embedding)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(build_id, target_type, target_id) DO UPDATE SET
+        dimensions = excluded.dimensions,
+        embedding = excluded.embedding
+    `).run(
+      `${buildId}:${targetType}:${targetId}`,
+      libraryId,
+      versionId,
+      buildId,
+      indexSchemaVersion,
+      targetType,
+      targetId,
+      dimensions,
+      embedding,
+    );
+  }
+
+  listVectorRecords(
+    libraryId: string,
+    buildId: string,
+    targetType: "legacy_chunk" | "retrieval_unit" | "summary_node" | "context_unit_optional",
+    dimensions: number,
+  ): Array<{ targetId: string; embedding: Uint8Array }> {
+    return rows(
+      this.sql.prepare(`
+        SELECT target_id, embedding FROM vector_records
+        WHERE library_id = ? AND build_id = ? AND target_type = ? AND dimensions = ?
+      `),
+      libraryId,
+      buildId,
+      targetType,
+      dimensions,
+    ).map((result) => ({
+      targetId: String(result.target_id),
+      embedding: result.embedding as Uint8Array,
+    }));
+  }
+
+  countVectorRecords(buildId: string, targetType?: "legacy_chunk" | "retrieval_unit" | "summary_node" | "context_unit_optional"): number {
+    if (targetType) {
+      return Number(row(
+        this.sql.prepare("SELECT COUNT(*) AS count FROM vector_records WHERE build_id = ? AND target_type = ?"),
+        buildId,
+        targetType,
+      )?.count ?? 0);
+    }
+    return Number(row(this.sql.prepare("SELECT COUNT(*) AS count FROM vector_records WHERE build_id = ?"), buildId)?.count ?? 0);
   }
 
   private citationsForChunkIds(ids: string[]): Citation[] {
@@ -1530,7 +2570,20 @@ export class AgentDatabase {
       this.sql.prepare("SELECT chunk_id FROM abstract_node_evidence WHERE node_id = ?"),
       node.id,
     ).map((item) => String(item.chunk_id));
-    return { ...node, citations: this.citationsForChunkIds(evidenceIds) };
+    return {
+      ...node,
+      citations: this.citationsForChunkIds(evidenceIds),
+      evidenceNodeIds: this.treeNodeIdsForChunks(evidenceIds),
+    };
+  }
+
+  private treeNodeIdsForChunks(chunkIds: string[]): string[] {
+    if (chunkIds.length === 0) return [];
+    const placeholders = chunkIds.map(() => "?").join(",");
+    return [...new Set(rows(
+      this.sql.prepare(`SELECT document_tree_node_id FROM chunks WHERE id IN (${placeholders}) AND document_tree_node_id IS NOT NULL`),
+      ...chunkIds,
+    ).map((entry) => String(entry.document_tree_node_id)))];
   }
 
   listEmbeddings(libraryId: string, dimensions: number): Array<{ chunk: Chunk; embedding: Uint8Array }> {
@@ -1539,6 +2592,7 @@ export class AgentDatabase {
         SELECT c.*, e.embedding FROM chunk_embeddings e
         JOIN chunks c ON c.id = e.chunk_id
         WHERE c.library_id = ? AND e.dimensions = ?
+          AND (c.node_type IS NULL OR c.node_type IN ('paragraph','sentence','unknown'))
       `),
       libraryId,
       dimensions,
@@ -1546,6 +2600,63 @@ export class AgentDatabase {
       chunk: chunkFrom(result),
       embedding: result.embedding as Uint8Array,
     }));
+  }
+
+  listSummaryEmbeddings(libraryId: string, dimensions: number): Array<{ summary: SummaryTreeNode; embedding: Uint8Array }> {
+    return rows(
+      this.sql.prepare(`
+        SELECT s.*, e.embedding FROM summary_embeddings e
+        JOIN summary_tree_nodes s ON s.id = e.summary_id
+        WHERE e.library_id = ? AND e.dimensions = ?
+      `),
+      libraryId,
+      dimensions,
+    ).map((result) => ({
+      summary: summaryTreeNodeFrom(result),
+      embedding: result.embedding as Uint8Array,
+    }));
+  }
+
+  getSummaryTreeForVersion(versionId: string): SummaryTreeNode[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM summary_tree_nodes WHERE version_id = ? ORDER BY CASE level WHEN 'document' THEN 0 WHEN 'section' THEN 1 WHEN 'paragraph' THEN 2 ELSE 3 END, rowid"),
+      versionId,
+    ).map(summaryTreeNodeFrom);
+  }
+
+  getSummaryTreeForLibrary(libraryId: string): SummaryTreeNode[] {
+    return rows(
+      this.sql.prepare(`
+        SELECT s.* FROM summary_tree_nodes s
+        JOIN document_versions v ON v.id = s.version_id
+        JOIN documents d ON d.id = v.document_id
+        WHERE d.library_id = ?
+        ORDER BY s.version_id, CASE s.level WHEN 'document' THEN 0 WHEN 'section' THEN 1 WHEN 'paragraph' THEN 2 ELSE 3 END, s.rowid
+      `),
+      libraryId,
+    ).map(summaryTreeNodeFrom);
+  }
+
+  searchSummaryTree(libraryId: string, query: string, limit = 12): SummaryTreeNode[] {
+    const normalized = normalizeSearchText(query);
+    if (!normalized) return [];
+    const tokens = searchTokens(query).slice(0, 6);
+    const likeTerms = [normalized, ...tokens];
+    const filters = likeTerms.map(() => "s.summary LIKE ?");
+    const params = likeTerms.map((term) => `%${term}%`);
+    return rows(
+      this.sql.prepare(`
+        SELECT s.* FROM summary_tree_nodes s
+        JOIN document_versions v ON v.id = s.version_id
+        JOIN documents d ON d.id = v.document_id
+        WHERE d.library_id = ? AND (${filters.join(" OR ")})
+        ORDER BY CASE s.level WHEN 'document' THEN 0 WHEN 'section' THEN 1 WHEN 'paragraph' THEN 2 ELSE 3 END
+        LIMIT ?
+      `),
+      libraryId,
+      ...params,
+      Math.max(1, Math.min(limit, 50)),
+    ).map(summaryTreeNodeFrom);
   }
 
   saveExtraction(
@@ -1836,6 +2947,7 @@ export class AgentDatabase {
       confidence: result.confidence === null ? null : Number(result.confidence),
       createdBy: String(result.created_by) as "ai" | "user",
       evidenceChunkIds: evidence,
+      evidenceNodeIds: this.treeNodeIdsForChunks(evidence),
       citations: this.citationsForChunkIds(evidence),
       createdAt: String(result.created_at),
       updatedAt: String(result.updated_at),
@@ -1849,15 +2961,16 @@ export class AgentDatabase {
     summary: string,
     inputMode: PulseInputMode,
     hits: PendingPulseHit[],
+    evidencePack?: EvidencePack,
   ): Pulse {
     const id = randomUUID();
     const timestamp = now();
     this.sql.exec("BEGIN");
     try {
       this.sql.prepare(`
-        INSERT INTO pulses (id, library_id, question, answer, summary, input_mode, status, reviewed_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
-      `).run(id, libraryId, question, answer, summary, inputMode, timestamp);
+        INSERT INTO pulses (id, library_id, question, answer, summary, evidence_pack_json, input_mode, status, reviewed_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
+      `).run(id, libraryId, question, answer, summary, evidencePack ? JSON.stringify(evidencePack) : null, inputMode, timestamp);
       const insertHit = this.sql.prepare(`
         INSERT INTO pulse_hits
           (id, pulse_id, library_id, target_type, target_id, score, reason, path_role, step_index, observation, rationale, label, excerpt)
@@ -1915,6 +3028,16 @@ export class AgentDatabase {
     ).map(pulseHitFrom);
   }
 
+  getPulseEvidencePack(pulseId: string): EvidencePack | undefined {
+    const result = row(this.sql.prepare("SELECT evidence_pack_json FROM pulses WHERE id = ?"), pulseId);
+    if (typeof result?.evidence_pack_json !== "string" || !result.evidence_pack_json.trim()) return undefined;
+    try {
+      return JSON.parse(result.evidence_pack_json) as EvidencePack;
+    } catch {
+      return undefined;
+    }
+  }
+
   getPulseResponse(libraryId: string, pulseId: string): PulseResponse | undefined {
     const pulse = this.getPulse(pulseId);
     if (!pulse || pulse.libraryId !== libraryId) return undefined;
@@ -1922,6 +3045,7 @@ export class AgentDatabase {
       pulse,
       hits: this.getPulseHits(pulseId),
       graph: this.getGraph(libraryId, { pulseId, pulseStats: true }),
+      ...(this.getPulseEvidencePack(pulseId) ? { evidencePack: this.getPulseEvidencePack(pulseId) } : {}),
     };
   }
 

@@ -4,7 +4,10 @@ import type {
   AnalysisDraft,
   AnalysisStatement,
   AuthSession,
+  ContextUnit,
   Document,
+  DocumentTreeNode,
+  EvidencePack,
   GraphResponse,
   GraphView,
   IngestJob,
@@ -23,7 +26,10 @@ import type {
   PulseResponse,
   PulseStreamEvent,
   PublishedAnalysis,
+  RetrievalUnit,
   SourceStructure,
+  SummaryTreeNode,
+  V2IndexHealth,
 } from "@agent-thinking/contracts";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -117,7 +123,16 @@ export const api = {
     if (!response.ok) throw new Error("读取原文件失败");
     return response.text();
   },
+  v2IndexHealth: (versionId: string) => request<V2IndexHealth>(`/debug/versions/${versionId}/v2-index-health`),
+  debugContextUnits: (versionId: string, includeFullText = false) =>
+    request<ContextUnit[]>(`/debug/versions/${versionId}/context-units${includeFullText ? "?includeFullText=true" : ""}`),
+  debugRetrievalUnits: (versionId: string, includeFullText = false) =>
+    request<RetrievalUnit[]>(`/debug/versions/${versionId}/retrieval-units${includeFullText ? "?includeFullText=true" : ""}`),
   structure: (versionId: string) => request<SourceStructure>(`/versions/${versionId}/structure`),
+  documentTree: (libraryId: string) => request<DocumentTreeNode[]>(`/libraries/${libraryId}/document-tree`),
+  versionDocumentTree: (versionId: string) => request<DocumentTreeNode[]>(`/versions/${versionId}/document-tree`),
+  sectionSubtree: (nodeId: string) => request<DocumentTreeNode[]>(`/document-tree/${nodeId}/subtree`),
+  summaryTree: (libraryId: string) => request<SummaryTreeNode[]>(`/libraries/${libraryId}/summary-tree`),
   reanalyze: (versionId: string) => request<IngestJob>(`/versions/${versionId}/reanalyze`, { method: "POST" }),
   runMappingAudit: (versionId: string) =>
     request<MappingAudit>(`/versions/${versionId}/mapping-audit`, { method: "POST" }),
@@ -172,6 +187,11 @@ export const api = {
     }),
   pulses: (libraryId: string) => request<Pulse[]>(`/libraries/${libraryId}/pulses`),
   pulse: (libraryId: string, pulseId: string) => request<PulseResponse>(`/libraries/${libraryId}/pulses/${pulseId}`),
+  pulseEvidencePack: (libraryId: string, pulseId: string) =>
+    request<EvidencePack>(`/libraries/${libraryId}/pulses/${pulseId}/evidence-pack`),
+  pulseRetrievalTrace: (libraryId: string, pulseId: string) =>
+    request<EvidencePack["retrievalTrace"]>(`/libraries/${libraryId}/pulses/${pulseId}/retrieval-trace`),
+  indexStatus: (versionId: string) => request<unknown>(`/versions/${versionId}/index-status`),
   clearPulses: (libraryId: string) =>
     request<{ deleted: number }>(`/libraries/${libraryId}/pulses`, { method: "DELETE" }),
   createPulse: (libraryId: string, question: string, mode: PulseInputMode = "full") =>
@@ -223,6 +243,13 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ title, summary }),
     }),
+  nodeEvidenceDetail: (nodeId: string) =>
+    request<{
+      node: AbstractNode;
+      relations: Relation[];
+      treeNodes: DocumentTreeNode[];
+      parentChunks: EvidencePack["parentChunks"];
+    }>(`/nodes/${nodeId}/evidence-detail`),
   updateNodeFields: (nodeId: string, values: { title?: string; summary?: string }) =>
     request<AbstractNode>(`/nodes/${nodeId}`, {
       method: "PATCH",

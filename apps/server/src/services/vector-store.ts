@@ -1,4 +1,4 @@
-import type { Chunk, SearchResult } from "@agent-thinking/contracts";
+import type { Chunk, RetrievalUnit, SearchResult, SummaryTreeNode } from "@agent-thinking/contracts";
 import * as sqliteVec from "sqlite-vec";
 import { AgentDatabase } from "../db.js";
 
@@ -46,6 +46,14 @@ export class VectorStore {
     this.db.saveEmbedding(chunk.id, embedding.length, toBlob(embedding));
   }
 
+  saveSummary(libraryId: string, summary: SummaryTreeNode, embedding: number[]): void {
+    this.db.saveSummaryEmbedding(libraryId, summary.id, embedding.length, toBlob(embedding));
+  }
+
+  saveRetrievalUnit(libraryId: string, unit: RetrievalUnit, embedding: number[]): void {
+    this.db.saveVectorRecord(libraryId, unit.versionId, unit.buildId, 2, "retrieval_unit", unit.id, embedding.length, toBlob(embedding));
+  }
+
   search(
     libraryId: string,
     queryEmbedding: number[],
@@ -76,5 +84,47 @@ export class VectorStore {
       .sort((left, right) => right.score - left.score)
       .slice(0, limit);
   }
-}
 
+  searchSummaries(
+    libraryId: string,
+    queryEmbedding: number[],
+    limit: number,
+  ): Array<{ summary: SummaryTreeNode; score: number }> {
+    if (this.extensionLoaded) {
+      const candidates = this.db.sql.prepare(`
+        SELECT e.summary_id, vec_distance_cosine(e.embedding, ?) AS distance
+        FROM summary_embeddings e
+        WHERE e.library_id = ? AND e.dimensions = ?
+        ORDER BY distance ASC LIMIT ?
+      `).all(toBlob(queryEmbedding), libraryId, queryEmbedding.length, limit) as unknown as Array<{
+        summary_id: string;
+        distance: number;
+      }>;
+      const summaries = new Map(this.db.getSummaryTreeForLibrary(libraryId).map((summary) => [summary.id, summary]));
+      return candidates.flatMap((candidate) => {
+        const summary = summaries.get(candidate.summary_id);
+        return summary ? [{ summary, score: 1 - Number(candidate.distance) }] : [];
+      });
+    }
+    return this.db.listSummaryEmbeddings(libraryId, queryEmbedding.length)
+      .map(({ summary, embedding }) => ({ summary, score: cosine(queryEmbedding, fromBlob(embedding)) }))
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit);
+  }
+
+  searchRetrievalUnits(
+    libraryId: string,
+    buildId: string,
+    queryEmbedding: number[],
+    units: Map<string, RetrievalUnit>,
+    limit: number,
+  ): Array<{ unit: RetrievalUnit; score: number }> {
+    return this.db.listVectorRecords(libraryId, buildId, "retrieval_unit", queryEmbedding.length)
+      .flatMap(({ targetId, embedding }) => {
+        const unit = units.get(targetId);
+        return unit ? [{ unit, score: cosine(queryEmbedding, fromBlob(embedding)) }] : [];
+      })
+      .sort((left, right) => right.score - left.score)
+      .slice(0, limit);
+  }
+}

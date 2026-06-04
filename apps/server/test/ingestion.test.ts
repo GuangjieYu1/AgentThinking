@@ -6,6 +6,7 @@ import type { Chunk } from "@agent-thinking/contracts";
 import { getConfig } from "../src/config.js";
 import { AgentDatabase } from "../src/db.js";
 import { IngestionQueue } from "../src/services/ingestion.js";
+import { LibraryEventBus } from "../src/services/library-events.js";
 import { FakeModelProvider } from "../src/services/models.js";
 import { VectorStore } from "../src/services/vector-store.js";
 
@@ -28,7 +29,12 @@ describe("ingestion pipeline", () => {
     const job = db.createJob(library.id, version.id);
     const vectors = new VectorStore(db);
     expect(vectors.usesSqliteVec).toBe(true);
-    const queue = new IngestionQueue(db, vectors, new FakeModelProvider(), config);
+    const events = new LibraryEventBus();
+    const governanceEvents: string[] = [];
+    events.subscribe((event) => {
+      if (event.type === "graph_rule_trace" || event.type === "graph_rule_summary") governanceEvents.push(event.type);
+    });
+    const queue = new IngestionQueue(db, vectors, new FakeModelProvider(), config, events);
     const completed = new Promise<void>((resolve, reject) => {
       queue.on("job", (update: { stage: string; error?: string }) => {
         if (update.stage === "completed") resolve();
@@ -43,6 +49,8 @@ describe("ingestion pipeline", () => {
     const [queryEmbedding] = await new FakeModelProvider().embed(["结论"]);
     expect(vectors.search(library.id, queryEmbedding!, 3).length).toBeGreaterThan(0);
     expect(db.listJobs(library.id)[0]?.stage).toBe("completed");
+    expect(governanceEvents).toContain("graph_rule_trace");
+    expect(governanceEvents).toContain("graph_rule_summary");
     db.close();
   });
 
@@ -66,21 +74,106 @@ describe("ingestion pipeline", () => {
     await enqueueAndComplete(queue, db.createJob(library.id, second.id).id);
 
     expect(model.calls.some((call) =>
-      call.primaryVersionIds.includes(first.id) && call.candidateVersionIds.includes(second.id),
+      call.aoriStage === "relation_extraction" &&
+      call.primaryVersionIds.includes(first.id) &&
+      call.primaryVersionIds.includes(second.id),
     )).toBe(true);
+    db.close();
+  });
+
+  it("uses full-document AORI context for documents inside the model budget", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-aori-full-"));
+    temporaryDirectories.push(dir);
+    const config = getConfig({ dataDir: dir, filesDir: join(dir, "files"), ocrCacheDir: join(dir, "ocr"), provider: "fake" });
+    const db = new AgentDatabase(dir);
+    const library = db.createLibrary("AORI Full");
+    await mkdir(join(dir, "files"), { recursive: true });
+    const tailMarker = "全文阅读尾部标记";
+    const filePath = join(dir, "files", "long.md");
+    await writeFile(filePath, `# Long\n开头\n${"完整上下文".repeat(900)}\n${tailMarker}`, "utf8");
+    const version = db.createDocumentVersion(library.id, "long.md", "text/markdown", "long", filePath).version;
+    const model = new RecordingModelProvider();
+    const queue = new IngestionQueue(db, new VectorStore(db), model, config);
+
+    await enqueueAndComplete(queue, db.createJob(library.id, version.id).id);
+
+    const globalRead = model.calls.find((call) => call.aoriStage === "global_reading");
+    expect(globalRead?.chunkTexts.join("\n")).toContain(tailMarker);
+    expect(globalRead?.maxChunkTextLength).toBeGreaterThan(2400);
+    expect(globalRead?.truncated).toBe(false);
+    db.close();
+  });
+
+  it("uses large AORI context groups and records truncation rationale for over-budget documents", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-aori-truncated-"));
+    temporaryDirectories.push(dir);
+    const config = getConfig({
+      dataDir: dir,
+      filesDir: join(dir, "files"),
+      ocrCacheDir: join(dir, "ocr"),
+      provider: "fake",
+      aoriModelContextTokens: 12000,
+      aoriGlobalReadMaxInputTokens: 12000,
+      aoriMinTruncatedContextTokens: 10000,
+      recordIndexingRationale: true,
+    });
+    const db = new AgentDatabase(dir);
+    const library = db.createLibrary("AORI Truncated");
+    await mkdir(join(dir, "files"), { recursive: true });
+    const filePath = join(dir, "files", "oversize.md");
+    await writeFile(filePath, `# First\n${"甲".repeat(44000)}\n\n# Second\n${"乙".repeat(44000)}`, "utf8");
+    const version = db.createDocumentVersion(library.id, "oversize.md", "text/markdown", "oversize", filePath).version;
+    const model = new RecordingModelProvider();
+    const queue = new IngestionQueue(db, new VectorStore(db), model, config);
+
+    await enqueueAndComplete(queue, db.createJob(library.id, version.id).id);
+
+    const globalReads = model.calls.filter((call) => call.aoriStage === "global_reading");
+    expect(globalReads.length).toBeGreaterThan(1);
+    expect(globalReads.every((call) => (call.usedTokenEstimate ?? 0) >= 10000)).toBe(true);
+    expect(globalReads.every((call) => call.minTruncatedContextTokens === 10000)).toBe(true);
+    const v2Build = db.listIndexBuilds(version.id).find((build) => build.profile === "v2");
+    const qualityReport = JSON.parse(v2Build?.qualityReportJson ?? "{}") as {
+      aoriRationaleTrace?: Array<{ decisionType: string; usedTokenEstimate: number }>;
+      reflectiveIndexReport?: { completenessRisk: string; truncationCount: number };
+    };
+    expect(qualityReport.aoriRationaleTrace?.length).toBe(globalReads.length);
+    expect(qualityReport.aoriRationaleTrace?.every((entry) =>
+      entry.decisionType === "context_truncation" && entry.usedTokenEstimate >= 10000,
+    )).toBe(true);
+    expect(qualityReport.reflectiveIndexReport?.completenessRisk).not.toBe("none");
+    expect(qualityReport.reflectiveIndexReport?.truncationCount).toBe(globalReads.length);
     db.close();
   });
 });
 
 class RecordingModelProvider extends FakeModelProvider {
-  calls: Array<{ primaryVersionIds: string[]; candidateVersionIds: string[] }> = [];
+  calls: Array<{
+    primaryVersionIds: string[];
+    candidateVersionIds: string[];
+    aoriStage?: string | undefined;
+    usedTokenEstimate?: number | undefined;
+    minTruncatedContextTokens?: number | undefined;
+    truncated?: boolean | undefined;
+    maxChunkTextLength: number;
+    chunkTexts: string[];
+  }> = [];
 
-  override async extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]> = new Map()) {
+  override async extract(...args: Parameters<FakeModelProvider["extract"]>) {
+    const chunks = args[0];
+    const relatedChunks = args[1] ?? new Map<string, Chunk[]>();
+    const options = args[2];
     this.calls.push({
       primaryVersionIds: chunks.map((chunk) => chunk.versionId),
       candidateVersionIds: [...relatedChunks.values()].flat().map((chunk) => chunk.versionId),
+      aoriStage: options?.aoriContext?.stage,
+      usedTokenEstimate: options?.aoriContext?.usedTokenEstimate,
+      minTruncatedContextTokens: options?.aoriContext?.minTruncatedContextTokens,
+      truncated: options?.aoriContext?.truncated,
+      maxChunkTextLength: Math.max(0, ...chunks.map((chunk) => chunk.text.length)),
+      chunkTexts: chunks.map((chunk) => chunk.text),
     });
-    return { nodes: [], relations: [] };
+    return { nodes: [], relations: [], themes: [] };
   }
 }
 

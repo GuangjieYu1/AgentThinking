@@ -1,15 +1,24 @@
 import type {
   AbstractNodeKind,
+  AoriIndexingStage,
+  AoriRiskLevel,
   AspectKind,
   Chunk,
   Citation,
   ExtractionOutput,
+  GraphRuleStage,
   MappingAudit,
   MappingAuditResult,
   MappingAuditStatus,
   ModelTestResult,
   PulseAnswerContext,
   PulseAnswerOutput,
+  PulseEvidenceMemory,
+  PulseEvidencePlan,
+  PulseEvidenceRow,
+  PulseEvidenceStatus,
+  PulseEvidenceStep,
+  PulseQuestionPlan,
   PulseNavigationCandidate,
   PulseNavigationDecision,
   RelationType,
@@ -24,12 +33,17 @@ import {
   mappingAuditSeverities,
   mappingAuditStatuses,
   pulseAnswerSchema,
+  pulseEvidencePlanSchema,
+  pulseEvidenceRowSchema,
+  pulseEvidenceStatusSchema,
   pulseNavigationDecisionSchema,
+  pulseQuestionPlanSchema,
   relationTypes,
   statementPrecheckSchema,
 } from "@agent-thinking/contracts";
 import { ZodError } from "zod";
 import type { AppConfig } from "../config.js";
+import { applyGraphRulesToExtraction, type GraphRulesResult } from "./graphRules.js";
 
 export interface MappingAuditNodeContext {
   id: string;
@@ -59,6 +73,39 @@ export interface MappingAuditContext {
   nodes: MappingAuditNodeContext[];
   relations: MappingAuditRelationContext[];
   note?: string;
+}
+
+export interface AoriExtractionContext {
+  stage: AoriIndexingStage;
+  groupId: string;
+  documentName: string;
+  documentTokenEstimate: number;
+  inputTokenEstimate: number;
+  usedTokenEstimate: number;
+  preservedRanges: string[];
+  omittedRanges: string[];
+  truncated: boolean;
+  risk: AoriRiskLevel;
+  minTruncatedContextTokens: number;
+  evidenceBindingMinContextTokens: number;
+  allowSmallContextOnlyForQuoteLookup: boolean;
+}
+
+interface ExtractionRuleOptions {
+  stage?: GraphRuleStage;
+  onGraphRules?: (result: GraphRulesResult) => void;
+  aoriContext?: AoriExtractionContext | undefined;
+}
+
+interface FinalizedExtraction {
+  output: ExtractionOutput;
+  graphRules: GraphRulesResult;
+}
+
+interface ExtractionOutputLimits {
+  maxNodes: number;
+  maxRelations: number;
+  maxThemes: number;
 }
 
 type MappingAuditReview = Pick<MappingAuditResult, "status" | "summary" | "findings">;
@@ -171,6 +218,57 @@ function parseMappingAuditReview(raw: string): MappingAuditReview {
   return mappingAuditReviewSchema.parse(sanitizeMappingAuditReview(parseJsonModelObject(raw)));
 }
 
+function fallbackPulseQuestionPlan(): PulseQuestionPlan {
+  return {
+    questionType: "normal",
+    requiresExhaustiveEvidence: false,
+    requiresStructuredEvidence: true,
+    requiresNumericalReconciliation: false,
+    requiresSourceQuotes: true,
+    requiresTimelineCompleteness: false,
+    requiresEntityCoverage: false,
+    allowedPartialAnswer: true,
+    answerMustExposeGaps: true,
+    evidenceTargets: ["answerable source evidence", "source quotes", "remaining gaps"],
+    keyEntities: [],
+    expectedEvidenceTypes: ["quote", "claim", "fact"],
+    riskLevel: "medium",
+    reasoning: "Planner fallback: use conservative evidence requirements and expose gaps when context is incomplete.",
+  };
+}
+
+function fallbackPulseEvidencePlan(question: string, mode: PulseAnswerContext["mode"], tools: string[]): PulseEvidencePlan {
+  const available = new Set(tools);
+  const preferred = [
+    { tool: "semanticSearchChildChunks", query: question, purpose: "Find semantically related child chunks.", expectedResult: "Relevant source child chunks." },
+    { tool: "fullTextSearchChildChunks", query: question, purpose: "Find literal source matches in child chunks.", expectedResult: "Chunks with explicit wording from the question." },
+    { tool: "retrieveSummaryTree", query: question, purpose: "Find section or document summaries for broader context.", expectedResult: "Relevant summary tree nodes." },
+    { tool: "graphSearch", query: question, purpose: "Find graph context that may point to source evidence.", expectedResult: "Relevant nodes and relations." },
+  ].filter((step) => available.has(step.tool));
+  return {
+    objective: "Build a question-focused evidence pack from generic retrieval tools.",
+    steps: preferred as PulseEvidenceStep[],
+    stopCondition: "Stop when source-backed evidence can answer the question or remaining gaps are explicit.",
+    expectedEvidenceShape: "Source chunks, quotes, and structured evidence rows with chunk citations.",
+    maxIterations: mode === "progressive" ? 4 : 2,
+  };
+}
+
+function cleanPulseEvidenceRows(rowsValue: unknown, allowedChunkIds: Set<string>): PulseEvidenceRow[] {
+  const rows = Array.isArray(rowsValue) ? rowsValue : (rowsValue && typeof rowsValue === "object" && Array.isArray((rowsValue as { rows?: unknown }).rows) ? (rowsValue as { rows: unknown[] }).rows : []);
+  return rows.flatMap((entry, index): PulseEvidenceRow[] => {
+    const parsed = pulseEvidenceRowSchema.safeParse({
+      ...(entry && typeof entry === "object" ? entry as Record<string, unknown> : {}),
+      rowId: entry && typeof entry === "object" && typeof (entry as { rowId?: unknown }).rowId === "string"
+        ? (entry as { rowId: string }).rowId
+        : `row-${index + 1}`,
+    });
+    if (!parsed.success) return [];
+    if (!allowedChunkIds.has(parsed.data.evidenceChunkId)) return [];
+    return [parsed.data];
+  });
+}
+
 function firstSentence(text: string, fallback: string): string {
   return text.split(/[。\n.!?]/, 1)[0]?.trim() || fallback;
 }
@@ -211,13 +309,24 @@ function fallbackExtractionFromChunks(chunks: Chunk[], note = "模型结构化�
   return { nodes, relations: [], themes: [] };
 }
 
-function sanitizeExtractionOutput(value: unknown, allowedChunks: Chunk[], fallbackNote?: string): ExtractionOutput {
+function extractionOutputLimits(options: ExtractionRuleOptions): ExtractionOutputLimits {
+  return options.aoriContext
+    ? { maxNodes: 96, maxRelations: 192, maxThemes: 32 }
+    : { maxNodes: 32, maxRelations: 64, maxThemes: 12 };
+}
+
+function sanitizeExtractionOutput(
+  value: unknown,
+  allowedChunks: Chunk[],
+  fallbackNote?: string,
+  limits: ExtractionOutputLimits = { maxNodes: 32, maxRelations: 64, maxThemes: 12 },
+): ExtractionOutput {
   const allowedChunkIds = new Set(allowedChunks.map((chunk) => chunk.id));
   const source = value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
   const rawNodes = Array.isArray(source.nodes) ? source.nodes : [];
-  const nodes = rawNodes.slice(0, 32).map((entry, index) => {
+  const nodes = rawNodes.slice(0, limits.maxNodes).map((entry, index) => {
     const node = entry && typeof entry === "object" && !Array.isArray(entry)
       ? entry as Record<string, unknown>
       : {};
@@ -237,24 +346,33 @@ function sanitizeExtractionOutput(value: unknown, allowedChunks: Chunk[], fallba
   if (nodes.length === 0 && allowedChunks.length > 0) return fallbackExtractionFromChunks(allowedChunks, fallbackNote);
   const nodeKeys = new Set(nodes.map((node) => node.key));
   const rawRelations = Array.isArray(source.relations) ? source.relations : [];
-  const relations = rawRelations.slice(0, 64).flatMap((entry) => {
+  const relations = rawRelations.slice(0, limits.maxRelations).flatMap((entry) => {
     const relation = entry && typeof entry === "object" && !Array.isArray(entry)
       ? entry as Record<string, unknown>
       : {};
     const sourceKey = typeof relation.sourceKey === "string" ? relation.sourceKey.trim() : "";
     const targetKey = typeof relation.targetKey === "string" ? relation.targetKey.trim() : "";
-    if (!nodeKeys.has(sourceKey) || !nodeKeys.has(targetKey) || sourceKey === targetKey) return [];
+    if (!sourceKey || !targetKey) return [];
+    const rawType = typeof relation.type === "string" ? relation.type.trim() : "";
+    const rawConfidence = typeof relation.confidence === "number" ? relation.confidence : Number(relation.confidence);
+    const confidence = safeConfidence(relation.confidence);
+    const originalType = rawType && !relationTypes.includes(rawType as RelationType) ? rawType : undefined;
+    const originalConfidence = Number.isFinite(rawConfidence) && rawConfidence >= 0 && rawConfidence <= 1 ? undefined : rawConfidence;
     return [{
       sourceKey,
       targetKey,
-      type: relationTypes.includes(relation.type as RelationType) ? relation.type as RelationType : "related_to",
+      type: relationTypes.includes(rawType as RelationType) ? rawType as RelationType : "related_to",
       reason: normalizedText(relation.reason, "模型未提供关系说明。", 1000),
-      confidence: safeConfidence(relation.confidence),
+      confidence,
       evidenceChunkIds: safeEvidenceIds(relation.evidenceChunkIds, allowedChunkIds),
+      ...(originalType ? { originalType } : {}),
+      ...(originalConfidence !== undefined ? { originalConfidence } : {}),
+      ruleWarnings: [],
+      ruleDecision: "kept" as const,
     }];
   });
   const rawThemes = Array.isArray(source.themes) ? source.themes : [];
-  const themes = rawThemes.slice(0, 12).flatMap((entry, index) => {
+  const themes = rawThemes.slice(0, limits.maxThemes).flatMap((entry, index) => {
     const theme = entry && typeof entry === "object" && !Array.isArray(entry)
       ? entry as Record<string, unknown>
       : {};
@@ -273,8 +391,30 @@ function sanitizeExtractionOutput(value: unknown, allowedChunks: Chunk[], fallba
   return extractionSchema.parse({ nodes, relations, themes });
 }
 
-function parseExtractionOutput(raw: string, allowedChunks: Chunk[], fallbackNote?: string): ExtractionOutput {
-  return sanitizeExtractionOutput(parseJsonModelObject(raw), allowedChunks, fallbackNote);
+function finalizeExtractionOutput(
+  value: unknown,
+  allowedChunks: Chunk[],
+  fallbackNote?: string,
+  options: ExtractionRuleOptions = {},
+): FinalizedExtraction {
+  const sanitized = sanitizeExtractionOutput(value, allowedChunks, fallbackNote, extractionOutputLimits(options));
+  const graphRules = applyGraphRulesToExtraction(sanitized, {
+    allowedChunks,
+    ...(options.stage ? { mode: options.stage } : {}),
+  });
+  const output = extractionSchema.parse(graphRules.output);
+  const finalized = { output, graphRules: { ...graphRules, output } };
+  options.onGraphRules?.(finalized.graphRules);
+  return finalized;
+}
+
+function parseExtractionOutput(
+  raw: string,
+  allowedChunks: Chunk[],
+  fallbackNote?: string,
+  options: ExtractionRuleOptions = {},
+): FinalizedExtraction {
+  return finalizeExtractionOutput(parseJsonModelObject(raw), allowedChunks, fallbackNote, options);
 }
 
 function isMappingAuditEnumValidationError(cause: unknown): boolean {
@@ -285,11 +425,50 @@ export interface ModelProvider {
   readonly name: string;
   readonly configured: boolean;
   embed(texts: string[]): Promise<number[][]>;
-  extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>): Promise<ExtractionOutput>;
+  extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>, options?: ExtractionRuleOptions): Promise<ExtractionOutput>;
   precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput>;
   reconstructMapping(context: MappingAuditContext): Promise<string>;
   auditMapping(reconstruction: string, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<MappingAuditReview>;
-  rebuildGraphFromMappingAudit(audit: MappingAudit, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<ExtractionOutput>;
+  rebuildGraphFromMappingAudit(
+    audit: MappingAudit,
+    originalChunks: Chunk[],
+    graphContext: MappingAuditContext,
+    options?: ExtractionRuleOptions,
+  ): Promise<ExtractionOutput>;
+  analyzePulseQuestion(question: string, mode: PulseAnswerContext["mode"]): Promise<PulseQuestionPlan>;
+  planPulseEvidence(input: {
+    question: string;
+    mode: PulseAnswerContext["mode"];
+    questionPlan: PulseQuestionPlan;
+    memorySummary: unknown;
+    tools: string[];
+  }): Promise<PulseEvidencePlan>;
+  extractPulseEvidenceRows(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    purpose: string;
+    chunks: Array<{ id: string; text: string; headingPath: string | null; pageNumber: number | null }>;
+    existingRows: PulseEvidenceRow[];
+  }): Promise<PulseEvidenceRow[]>;
+  judgePulseEvidenceSufficiency(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    memory: unknown;
+    computedReconciliation?: unknown;
+  }): Promise<PulseEvidenceStatus>;
+  synthesizePulseAnswer(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    memory: unknown;
+    evidenceStatus: PulseEvidenceStatus;
+  }): Promise<PulseAnswerOutput>;
+  rewritePulseAnswer(input: {
+    question: string;
+    draft: PulseAnswerOutput;
+    rewriteInstructions: string;
+    memory: unknown;
+    evidenceStatus: PulseEvidenceStatus;
+  }): Promise<PulseAnswerOutput>;
   answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput>;
   selectPulseNavigation(question: string, step: string, candidates: PulseNavigationCandidate[]): Promise<PulseNavigationDecision>;
   stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }>;
@@ -341,8 +520,8 @@ export class FakeModelProvider implements ModelProvider {
     return texts.map((text) => hashedEmbedding(text));
   }
 
-  async extract(chunks: Chunk[]): Promise<ExtractionOutput> {
-    const selected = chunks.slice(0, 10);
+  async extract(chunks: Chunk[], _relatedChunks: Map<string, Chunk[]> = new Map(), options: ExtractionRuleOptions = {}): Promise<ExtractionOutput> {
+    const selected = chunks.slice(0, options.aoriContext ? 32 : 10);
     const nodes = selected.map((chunk, index) => {
       const opening = chunk.text.split(/[。\n.!?]/, 1)[0]?.trim() || `片段 ${index + 1}`;
       const kind = /因此|所以|therefore|conclusion|should|必须/i.test(chunk.text) ? "claim" as const : "concept" as const;
@@ -373,7 +552,7 @@ export class FakeModelProvider implements ModelProvider {
       evidenceChunkIds: nodes.flatMap((node) => node.evidenceChunkIds),
       aspects: [...new Set(nodes.flatMap((node) => node.aspects))],
     }] : [];
-    return { nodes, relations, themes };
+    return finalizeExtractionOutput({ nodes, relations, themes }, chunks, undefined, { ...options, stage: "extraction" }).output;
   }
 
   async precheckStatement(_text: string, citations: Citation[]): Promise<StatementPrecheckOutput> {
@@ -464,7 +643,12 @@ export class FakeModelProvider implements ModelProvider {
     };
   }
 
-  async rebuildGraphFromMappingAudit(audit: MappingAudit, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<ExtractionOutput> {
+  async rebuildGraphFromMappingAudit(
+    audit: MappingAudit,
+    originalChunks: Chunk[],
+    graphContext: MappingAuditContext,
+    options: ExtractionRuleOptions = {},
+  ): Promise<ExtractionOutput> {
     const chunks = originalChunks.length > 0 ? originalChunks : graphContext.chunks.slice(0, 8);
     const nodes = chunks.map((chunk, index) => {
       const finding = audit.findings[index % Math.max(1, audit.findings.length)];
@@ -497,7 +681,7 @@ export class FakeModelProvider implements ModelProvider {
       evidenceChunkIds: nodes.flatMap((node) => node.evidenceChunkIds),
       aspects: [...new Set(nodes.flatMap((node) => node.aspects))],
     }] : [];
-    return { nodes, relations, themes };
+    return finalizeExtractionOutput({ nodes, relations, themes }, originalChunks, undefined, { ...options, stage: "rebuild" }).output;
   }
 
   async answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput> {
@@ -506,6 +690,88 @@ export class FakeModelProvider implements ModelProvider {
     return {
       answer: `演示脉冲回答：问题“${question}”主要激活了 ${topNodes}。相关证据包括：${topChunks}`,
       summary: `激活 ${context.nodes.length} 个节点、${context.relations.length} 条关系、${context.chunks.length} 个证据片段。`,
+    };
+  }
+
+  async analyzePulseQuestion(_question: string, _mode: PulseAnswerContext["mode"]): Promise<PulseQuestionPlan> {
+    return fallbackPulseQuestionPlan();
+  }
+
+  async planPulseEvidence(input: {
+    question: string;
+    mode: PulseAnswerContext["mode"];
+    questionPlan: PulseQuestionPlan;
+    memorySummary: unknown;
+    tools: string[];
+  }): Promise<PulseEvidencePlan> {
+    return fallbackPulseEvidencePlan(input.question, input.mode, input.tools);
+  }
+
+  async extractPulseEvidenceRows(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    purpose: string;
+    chunks: Array<{ id: string; text: string; headingPath: string | null; pageNumber: number | null }>;
+    existingRows: PulseEvidenceRow[];
+  }): Promise<PulseEvidenceRow[]> {
+    return input.chunks.slice(0, 12).map((chunk, index) => ({
+      rowId: `fake-row-${chunk.id}-${index}`,
+      evidenceType: "quote",
+      claimText: chunk.text.slice(0, 180) || "证据片段",
+      evidenceChunkId: chunk.id,
+      evidenceQuote: chunk.text.slice(0, 220) || "证据片段",
+      confidence: 0.55,
+    }));
+  }
+
+  async judgePulseEvidenceSufficiency(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    memory: unknown;
+    computedReconciliation?: unknown;
+  }): Promise<PulseEvidenceStatus> {
+    const reconciliation = input.computedReconciliation as PulseEvidenceStatus["reconciliation"] | undefined;
+    return {
+      sufficient: Boolean(reconciliation?.closed),
+      status: reconciliation && !reconciliation.closed ? "failed_reconciliation" : "partial_answer_only",
+      gaps: reconciliation && !reconciliation.closed ? [{
+        type: "sum_mismatch",
+        description: "演示模型发现结构化证据尚未闭合。",
+        suggestedQueries: [input.question],
+        severity: "high",
+      }] : [],
+      reasoning: "演示模型使用保守充分性判断。",
+      ...(reconciliation ? { reconciliation } : {}),
+    };
+  }
+
+  async synthesizePulseAnswer(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    memory: unknown;
+    evidenceStatus: PulseEvidenceStatus;
+  }): Promise<PulseAnswerOutput> {
+    const memory = input.memory as Partial<PulseEvidenceMemory>;
+    const quote = memory.evidenceRows?.find((row) => row.evidenceQuote.trim())?.evidenceQuote.trim();
+    const gapNote = input.evidenceStatus.gaps.length > 0
+      ? ` 当前证据缺口：${input.evidenceStatus.gaps.map((gap) => gap.description).join("；")}`
+      : input.evidenceStatus.sufficient ? "" : " 当前证据不足，只能作为部分回答。";
+    return {
+      answer: `演示脉冲回答：问题“${input.question}”已基于动态证据控制器生成。${quote ? `来源：“${quote}”。` : ""}${gapNote}`,
+      summary: `证据控制器状态：${input.evidenceStatus.status}`,
+    };
+  }
+
+  async rewritePulseAnswer(input: {
+    question: string;
+    draft: PulseAnswerOutput;
+    rewriteInstructions: string;
+    memory: unknown;
+    evidenceStatus: PulseEvidenceStatus;
+  }): Promise<PulseAnswerOutput> {
+    return {
+      answer: `${input.draft.answer}\n\n校验补充：${input.rewriteInstructions}`,
+      summary: input.draft.summary,
     };
   }
 
@@ -595,7 +861,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         },
         { role: "user", content: JSON.stringify({ parseError: errorMessage, malformedJson: raw.slice(0, 12000) }) },
       ],
-      max_tokens: 1400,
+      max_tokens: 1_000_000,
     };
     if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
     const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
@@ -608,7 +874,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
     return parseMappingAuditReview(repaired);
   }
 
-  private async repairExtractionJson(raw: string, parseError: unknown, allowedChunks: Chunk[]): Promise<ExtractionOutput> {
+  private async repairExtractionJson(
+    raw: string,
+    parseError: unknown,
+    allowedChunks: Chunk[],
+    options: ExtractionRuleOptions = {},
+  ): Promise<ExtractionOutput> {
     const errorMessage = parseError instanceof Error ? parseError.message : "JSON parse failed";
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
@@ -634,7 +905,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
       "/chat/completions",
       body,
     );
-    return parseExtractionOutput(response.choices[0]?.message.content ?? "{}", allowedChunks, "模型修复后仍缺少结构化字段。");
+    return parseExtractionOutput(
+      response.choices[0]?.message.content ?? "{}",
+      allowedChunks,
+      "模型修复后仍缺少结构化字段。",
+      options,
+    ).output;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
@@ -649,18 +925,61 @@ export class OpenAICompatibleProvider implements ModelProvider {
     return result.data.sort((left, right) => left.index - right.index).map((item) => item.embedding);
   }
 
-  async extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>): Promise<ExtractionOutput> {
+  async extract(
+    chunks: Chunk[],
+    relatedChunks: Map<string, Chunk[]>,
+    options: ExtractionRuleOptions = {},
+  ): Promise<ExtractionOutput> {
     if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const aori = options.aoriContext;
     const evidence = chunks.map((chunk) => ({
       id: chunk.id,
       source: chunk.headingPath ?? (chunk.pageNumber ? `PDF page ${chunk.pageNumber}` : ""),
-      text: chunk.text.slice(0, 2400),
+      ordinal: chunk.ordinal,
+      estimatedTokens: Math.max(1, Math.ceil(chunk.text.length / 4)),
+      text: aori ? chunk.text : chunk.text.slice(0, 2400),
       candidates: (relatedChunks.get(chunk.id) ?? []).map((candidate) => ({
         id: candidate.id,
         source: candidate.headingPath ?? (candidate.pageNumber ? `PDF page ${candidate.pageNumber}` : ""),
-        text: candidate.text.slice(0, 1200),
+        ordinal: candidate.ordinal,
+        estimatedTokens: Math.max(1, Math.ceil(candidate.text.length / 4)),
+        text: aori ? candidate.text : candidate.text.slice(0, 1200),
       })),
     }));
+    const compactExtractionPrompt =
+      "You extract a compact knowledge graph from evidence chunks. Return JSON with this shape: " +
+      '{"nodes":[{"key":"n1","kind":"concept","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["system"]}],' +
+      '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
+      '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
+      "Node kind is concept or claim. Relation type must be supports, contradicts, explains, depends_on, example_of, or related_to. " +
+      "Every node and theme must include an aspects array (it may be empty) chosen from person, operation, system, story, claim, conflict, time, other. " +
+      "Create a small number of themes only when multiple nodes share a defensible higher-level subject; themes organize navigation and must cite evidence. " +
+      "Candidate evidence may come from other documents and should be used to identify contradictions. " +
+      "Every node and relation must cite evidenceChunkIds from supplied evidence or candidate ids; only create defensible relationships. " +
+      "Use Simplified Chinese for every title, summary, and reason. Keep nodes atomic and source-faithful: preserve uncertainty, hearsay, temporal order, and who claims what. " +
+      "Do not turn enemy/opposition, sequence, or narrative tension into contradicts unless the source states a logical contradiction. " +
+      "Prefer 1-4 high-value relations for each central chunk when the source or candidate chunks explicitly support them; avoid isolated nodes when a clear relation exists. " +
+      "Relation Governance Rules: " +
+      "1. Only use allowed relation types. " +
+      "2. Co-occurrence is not a strong relation. " +
+      "3. Strong relations require direct evidence. " +
+      "4. related_to is the weakest fallback relation. " +
+      "5. Direction matters. " +
+      "6. Contradiction requires same scope. " +
+      "7. If unsure, omit the relation or use related_to with low confidence.";
+    const aoriExtractionPrompt =
+      "AORI indexing mode. First read the supplied full document or large context group globally, then generate aspects, aspect items, self-check questions, relation vocabulary, candidate nodes, themes, and relations. " +
+      "Do not treat the supplied chunks as independent small retrieval windows. They are source-locator and evidence-binding units only. " +
+      "If the context is truncated, reason from the preserved ranges and expose uncertainty in summaries or relation reasons where coverage may be incomplete. " +
+      "Never infer from omitted ranges. Do not use paragraph-sized or sentence-sized fragments as the main understanding unit; small chunks are only for quote lookup and evidence backtracking. " +
+      `When this group is truncated, its usedTokenEstimate must be at least ${aori?.minTruncatedContextTokens ?? 10_000} unless the remaining original text is smaller. ` +
+      "Return JSON with exactly this shape: " +
+      '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["person|operation|system|story|claim|conflict|time|other"]}],' +
+      '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
+      '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
+      "Every node, relation, and theme must cite evidenceChunkIds from supplied evidence ids. Use Simplified Chinese for every title, summary, and reason. " +
+      "Relation Governance Rules: only use allowed relation types; co-occurrence is not a strong relation; strong relations require direct evidence; direction matters; contradiction requires same scope; if unsure, omit the relation or use related_to with low confidence. " +
+      "Closure Check: before returning, check whether important sections in the supplied large context group are missing from nodes/themes, and prefer adding a source-faithful node over over-compressing unrelated meanings.";
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.1,
@@ -668,20 +987,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
       messages: [
         {
           role: "system",
-          content:
-            "You extract a compact knowledge graph from evidence chunks. Return JSON with this shape: " +
-            '{"nodes":[{"key":"n1","kind":"concept","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["system"]}],' +
-            '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
-            '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
-            "Node kind is concept or claim. Relation type must be supports, contradicts, explains, depends_on, example_of, or related_to. " +
-            "Every node and theme must include an aspects array (it may be empty) chosen from person, operation, system, story, claim, conflict, time, other. " +
-            "Create a small number of themes only when multiple nodes share a defensible higher-level subject; themes organize navigation and must cite evidence. " +
-            "Candidate evidence may come from other documents and should be used to identify contradictions. " +
-            "Every node and relation must cite evidenceChunkIds from supplied evidence or candidate ids; only create defensible relationships.",
+          content: aori ? aoriExtractionPrompt : compactExtractionPrompt,
         },
-        { role: "user", content: JSON.stringify({ evidence }) },
+        { role: "user", content: JSON.stringify(aori ? { aoriContext: aori, evidence } : { evidence }) },
       ],
-      max_tokens: 4096,
+      max_tokens: aori ? 12000 : 4096,
     };
     if (this.config.provider === "deepseek") {
       body.thinking = { type: this.config.thinkingMode };
@@ -695,12 +1005,22 @@ export class OpenAICompatibleProvider implements ModelProvider {
       ...chunks.flatMap((chunk) => relatedChunks.get(chunk.id) ?? []),
     ];
     try {
-      return parseExtractionOutput(raw, allowedChunks, "模型抽取结构化输出不可用，系统生成保守导入候选。");
+      return parseExtractionOutput(
+        raw,
+        allowedChunks,
+        "模型抽取结构化输出不可用，系统生成保守导入候选。",
+        { ...options, stage: "extraction" },
+      ).output;
     } catch (cause) {
       try {
-        return await this.repairExtractionJson(raw, cause, allowedChunks);
+        return await this.repairExtractionJson(raw, cause, allowedChunks, { ...options, stage: "extraction" });
       } catch {
-        return fallbackExtractionFromChunks(chunks, "模型结构化输出修复失败，系统生成保守导入候选。");
+        return finalizeExtractionOutput(
+          fallbackExtractionFromChunks(chunks, "模型结构化输出修复失败，系统生成保守导入候选。"),
+          allowedChunks,
+          undefined,
+          { ...options, stage: "extraction" },
+        ).output;
       }
     }
   }
@@ -845,7 +1165,14 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "Do not penalize harmless wording changes. Prefer actionable findings with exact chunk, node, and relation ids when relevant. " +
             "Keep summary under 1000 characters. Return at most 5 findings. For each finding keep title under 80 characters, description under 800 characters, and suggestion under 400 characters; put long explanations into concise issue plus action. " +
             "All human-readable strings in summary, title, description, and suggestion must be Simplified Chinese. " +
-            'Return JSON only: {"status":"clean|minor_issues|major_issues|failed","summary":"...","findings":[{"kind":"missing_source_meaning|unsupported_graph_claim|wrong_relation|chunk_boundary_loss|overgeneralization|other","severity":"low|medium|high","title":"...","description":"...","suggestion":"...","evidenceChunkIds":["..."],"nodeIds":["..."],"relationIds":["..."]}]}.',
+            'Return JSON only: {"status":"clean|minor_issues|major_issues|failed","summary":"...","findings":[{"kind":"missing_source_meaning|unsupported_graph_claim|wrong_relation|chunk_boundary_loss|overgeneralization|other","severity":"low|medium|high","title":"...","description":"...","suggestion":"...","evidenceChunkIds":["..."],"nodeIds":["..."],"relationIds":["..."]}]}. ' +
+            "Semantic Coverage Rules: " +
+            "1. Judge whether the graph preserves important source meaning. " +
+            "2. Report missing_source_meaning when important source content is absent from the graph. " +
+            "3. Report unsupported_graph_claim when a graph node or relation is not grounded in source chunks. " +
+            "4. Report chunk_boundary_loss when meaning spanning adjacent chunks is lost. " +
+            "5. Report overgeneralization when distinct source meanings are merged into a broad unsupported claim. " +
+            "6. Treat reconstruction as a diagnostic aid, not as evidence.",
         },
         { role: "user", content: JSON.stringify({ original, reconstruction, graph, note: graphContext.note ?? "" }) },
       ],
@@ -886,7 +1213,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
     }
   }
 
-  async rebuildGraphFromMappingAudit(audit: MappingAudit, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<ExtractionOutput> {
+  async rebuildGraphFromMappingAudit(
+    audit: MappingAudit,
+    originalChunks: Chunk[],
+    graphContext: MappingAuditContext,
+    options: ExtractionRuleOptions = {},
+  ): Promise<ExtractionOutput> {
     if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
     const original = originalChunks.map((chunk) => ({
       id: chunk.id,
@@ -907,6 +1239,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
       relations: graphContext.relations.map((relation) => ({
         id: relation.id,
         type: relation.type,
+        status: "current",
         sourceTitle: relation.sourceTitle,
         targetTitle: relation.targetTitle,
         reason: relation.reason,
@@ -924,6 +1257,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
       relationIds: finding.relationIds,
       userComment: finding.userComment,
     }));
+    const previousGraphRebuild = audit.graphRebuildReport
+      ? audit.graphRebuildReport.slice(0, 6000)
+      : "";
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.1,
@@ -936,11 +1272,20 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "必须使用简体中文。审计发现只是线索，不是事实；所有节点、主题和关系都必须由原文 chunk 支撑。 " +
             "若审计发现包含 userComment，它代表用户对该问题的修正意图，应作为重构时的重要参考，但仍必须受原文证据约束。 " +
             "优先修复审计报告指出的缺失含义、无证据图谱声明、错误关系方向/类型、过度概括和 chunk 边界造成的语义损失。 " +
+            "若输入包含 previousGraphRebuild，它是上一轮“审计驱动图谱重构”的处理记录；请避免重复上一轮无效修复，并优先补足仍未解决的问题。 " +
+            "不要简单复述旧图谱。对无证据、过度绝对、方向错误或类型错误的旧关系，应生成更保守、更有证据的新候选来替代；缺失的原文含义应补成新的候选节点或关系。 " +
+            "Graph Evolution Rules: " +
+            "1. Rebuild only the local subgraph affected by audit findings. " +
+            "2. Prefer minimal corrections over rewriting the whole graph. " +
+            "3. Audit findings are hints, not facts. " +
+            "4. All rebuilt nodes and relations must be grounded in source chunks. " +
+            "5. Rebuild output is candidate graph only. " +
+            "6. It will be checked by graphRules and quick rule audit. " +
             "不要输出解释文本，只返回 JSON，形状必须是：" +
             '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["claim"]}],"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],"themes":[{"title":"...","summary":"...","memberKeys":["n1"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
             "aspects 只能从 person, operation, system, story, claim, conflict, time, other 中选择。所有 evidenceChunkIds 必须来自提供的 original chunk id。节点数量保持紧凑，关系只生成可由原文支撑的候选。",
         },
-        { role: "user", content: JSON.stringify({ document: graphContext.documentName, auditSummary: audit.summary, findings, original, graph, reconstruction: audit.reconstruction }) },
+        { role: "user", content: JSON.stringify({ document: graphContext.documentName, auditSummary: audit.summary, findings, original, graph, reconstruction: audit.reconstruction, previousGraphRebuild }) },
       ],
       max_tokens: 4096,
     };
@@ -953,14 +1298,236 @@ export class OpenAICompatibleProvider implements ModelProvider {
     );
     const raw = response.choices[0]?.message.content ?? "{}";
     try {
-      return parseExtractionOutput(raw, originalChunks, "模型重构结构化输出不可用，系统生成保守候选。");
+      return parseExtractionOutput(
+        raw,
+        originalChunks,
+        "模型重构结构化输出不可用，系统生成保守候选。",
+        { ...options, stage: "rebuild" },
+      ).output;
     } catch (cause) {
       try {
-        return await this.repairExtractionJson(raw, cause, originalChunks);
+        return await this.repairExtractionJson(raw, cause, originalChunks, { ...options, stage: "rebuild" });
       } catch {
-        return fallbackExtractionFromChunks(originalChunks, "模型重构结构化输出修复失败，系统生成保守候选。");
+        return finalizeExtractionOutput(
+          fallbackExtractionFromChunks(originalChunks, "模型重构结构化输出修复失败，系统生成保守候选。"),
+          originalChunks,
+          undefined,
+          { ...options, stage: "rebuild" },
+        ).output;
       }
     }
+  }
+
+  async analyzePulseQuestion(question: string, mode: PulseAnswerContext["mode"]): Promise<PulseQuestionPlan> {
+    if (!this.config.chatModel) return fallbackPulseQuestionPlan();
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Pulse Question Planner. Analyze the user question semantically. Do not answer it. " +
+            "Decide what evidence is required: exhaustive evidence, structured evidence, numerical reconciliation, source quotes, timeline completeness, or entity coverage. " +
+            "Do not use or request question-specific regex rules. Return JSON only with exactly these fields: " +
+            '{"questionType":"normal|exhaustive_list|numerical_aggregation|timeline|entity_relation|causal_explanation|claim_support|summary|critique|comparison|mixed","requiresExhaustiveEvidence":true,"requiresStructuredEvidence":true,"requiresNumericalReconciliation":false,"requiresSourceQuotes":true,"requiresTimelineCompleteness":false,"requiresEntityCoverage":false,"allowedPartialAnswer":true,"answerMustExposeGaps":true,"evidenceTargets":["..."],"keyEntities":["..."],"expectedEvidenceTypes":["..."],"riskLevel":"low|medium|high","reasoning":"..."}.',
+        },
+        { role: "user", content: JSON.stringify({ question, mode }) },
+      ],
+      max_tokens: 900,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    try {
+      const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
+      return pulseQuestionPlanSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+    } catch {
+      return fallbackPulseQuestionPlan();
+    }
+  }
+
+  async planPulseEvidence(input: {
+    question: string;
+    mode: PulseAnswerContext["mode"];
+    questionPlan: PulseQuestionPlan;
+    memorySummary: unknown;
+    tools: string[];
+  }): Promise<PulseEvidencePlan> {
+    if (!this.config.chatModel) return fallbackPulseEvidencePlan(input.question, input.mode, input.tools);
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Pulse Evidence Planner. Plan retrieval using only the supplied generic tools. " +
+            "Do not request amountRegexScan, timelineRegexScan, legalMode, or any question-specific scanner. Prefer raw chunks when exact evidence is needed. " +
+            "If EvidenceMemory contains a declared total but itemized rows do not reconcile, or existing rows look like part of the same source list/section, generate continuation actions: readRemainingChunksAfter the last covered chunk, readSameSectionChunks, and readNeighborChunks before broad semantic search. " +
+            "For exhaustive questions, plan to extract remaining itemized rows from continued raw chunks instead of stopping at a partial answer. " +
+            'Return JSON only: {"objective":"...","steps":[{"tool":"semanticSearch|fullTextSearch|graphExpand|readChunks|readNeighborChunks|readSameSectionChunks|readRemainingChunksAfter|getDocumentOutline|getChunkEvidenceAround|getGraphContext","query":"...","basedOnChunkIds":["..."],"basedOnNodeIds":["..."],"purpose":"...","expectedResult":"..."}],"stopCondition":"...","expectedEvidenceShape":"...","maxIterations":4}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1200,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    try {
+      const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
+      const parsed = pulseEvidencePlanSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+      const allowed = new Set(input.tools);
+      const progressiveCap = input.questionPlan.riskLevel === "high" && input.questionPlan.requiresExhaustiveEvidence ? 6 : 5;
+      return {
+        ...parsed,
+        steps: parsed.steps.filter((step) => allowed.has(step.tool)),
+        maxIterations: input.mode === "progressive" ? Math.min(progressiveCap, Math.max(parsed.maxIterations, 1)) : Math.min(2, Math.max(parsed.maxIterations, 1)),
+      };
+    } catch {
+      return fallbackPulseEvidencePlan(input.question, input.mode, input.tools);
+    }
+  }
+
+  async extractPulseEvidenceRows(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    purpose: string;
+    chunks: Array<{ id: string; text: string; headingPath: string | null; pageNumber: number | null }>;
+    existingRows: PulseEvidenceRow[];
+  }): Promise<PulseEvidenceRow[]> {
+    if (!this.config.chatModel || input.chunks.length === 0) return [];
+    const allowedChunkIds = new Set(input.chunks.map((chunk) => chunk.id));
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Pulse Evidence Extractor. Extract structured EvidenceRows only from supplied chunks. " +
+            "Every row must cite evidenceChunkId and evidenceQuote. Do not infer facts not present. If uncertain, lower confidence or omit the row. " +
+            "For exhaustive/list questions, distinguish declared totals from itemized rows. Do not mix declared totals with itemized amounts. " +
+            'Return JSON only: {"rows":[{"rowId":"...","evidenceType":"fact|amount|date|entity_relation|claim|quote|other","claimText":"...","structuredValue":{},"sourceEntity":"...","targetEntity":"...","relationType":"...","evidenceChunkId":"...","evidenceQuote":"...","confidence":0.8,"countedInAnswer":true,"dedupeKey":"...","warnings":["..."]}]}',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1600,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    try {
+      const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
+      return cleanPulseEvidenceRows(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), allowedChunkIds);
+    } catch {
+      return [];
+    }
+  }
+
+  async judgePulseEvidenceSufficiency(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    memory: unknown;
+    computedReconciliation?: unknown;
+  }): Promise<PulseEvidenceStatus> {
+    if (!this.config.chatModel) {
+      return {
+        sufficient: false,
+        status: "partial_answer_only",
+        gaps: [],
+        reasoning: "Planner unavailable; answer must stay guarded.",
+        ...(input.computedReconciliation ? { reconciliation: input.computedReconciliation as PulseEvidenceStatus["reconciliation"] } : {}),
+      };
+    }
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Pulse Sufficiency Judge. Judge whether evidence is sufficient for the question plan. Use EvidenceMemory and computed reconciliation. " +
+            "If insufficient, return concrete gaps and suggested generic search queries. Do not hide reconciliation failure. " +
+            "For exhaustive questions, if you see a partial list, numbered/list structure, or sections that appear to continue after the current chunks, return needs_gap_retrieval and recommend continuing the same section or subsequent chunks; do not return partial_answer_only unless the document has truly been covered or the details are absent from the document. " +
+            'Return JSON only: {"sufficient":false,"status":"sufficient|insufficient_context|needs_gap_retrieval|failed_reconciliation|partial_answer_only","gaps":[{"type":"missing_itemized_evidence|declared_total_without_breakdown|sum_mismatch|missing_source_quote|missing_entity_coverage|timeline_gap|unsupported_claim|other","description":"...","suggestedQueries":["..."],"severity":"low|medium|high"}],"reasoning":"...","reconciliation":{"declaredTotal":0,"itemizedSum":0,"difference":0,"unit":"万","closed":false,"explanation":"..."}}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1200,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    try {
+      const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
+      const parsed = pulseEvidenceStatusSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+      if (input.computedReconciliation && typeof input.computedReconciliation === "object") {
+        return { ...parsed, reconciliation: parsed.reconciliation ?? input.computedReconciliation as PulseEvidenceStatus["reconciliation"] };
+      }
+      return parsed;
+    } catch {
+      return {
+        sufficient: false,
+        status: "partial_answer_only",
+        gaps: [],
+        reasoning: "Sufficiency judge failed; answer must expose uncertainty.",
+        ...(input.computedReconciliation ? { reconciliation: input.computedReconciliation as PulseEvidenceStatus["reconciliation"] } : {}),
+      };
+    }
+  }
+
+  async synthesizePulseAnswer(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+    memory: unknown;
+    evidenceStatus: PulseEvidenceStatus;
+  }): Promise<PulseAnswerOutput> {
+    if (!this.config.chatModel) return this.answerPulse(input.question, { chunks: [], nodes: [], relations: [] });
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Pulse Answer Synthesizer. Use only supplied EvidenceMemory. Do not imply exhaustive coverage unless evidenceStatus.sufficient is true. " +
+            "If evidence is insufficient, explicitly state gaps. If numerical reconciliation failed, state declared total, itemized sum, and difference. " +
+            "If source quotes are required, include quote-level evidence or state missing quote. Return JSON only: {\"answer\":\"...\",\"summary\":\"...\"}.",
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1600,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
+    return pulseAnswerSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+  }
+
+  async rewritePulseAnswer(input: {
+    question: string;
+    draft: PulseAnswerOutput;
+    rewriteInstructions: string;
+    memory: unknown;
+    evidenceStatus: PulseEvidenceStatus;
+  }): Promise<PulseAnswerOutput> {
+    if (!this.config.chatModel) return input.draft;
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Pulse Answer Rewrite Gate. Rewrite the draft to satisfy verification instructions. Keep only supported claims and expose gaps. " +
+            "Do not add facts that are not in EvidenceMemory. Return JSON only: {\"answer\":\"...\",\"summary\":\"...\"}.",
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1400,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
+    return pulseAnswerSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
   }
 
   async answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput> {

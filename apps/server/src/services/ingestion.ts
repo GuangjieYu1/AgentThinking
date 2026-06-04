@@ -16,6 +16,7 @@ import { buildDocumentIndex } from "../domain/document-tree.js";
 import { isWordMediaType } from "../domain/files.js";
 import { parseMarkdownStructure } from "../domain/source-structure.js";
 import type { GraphRulesResult } from "./graphRules.js";
+import { aoriIndexToExtraction, buildAoriDocumentIndex, type AoriDraftGroup } from "./aori.js";
 import { LibraryEventBus } from "./library-events.js";
 import type { ModelProvider } from "./models.js";
 import { parseDocument } from "./parser.js";
@@ -138,7 +139,7 @@ function uniqueChunksById(chunks: Chunk[]): Chunk[] {
     .sort((left, right) => left.ordinal - right.ordinal);
 }
 
-function buildAoriContextPlan(chunks: Chunk[], config: AppConfig): AoriContextPlan {
+function buildAoriContextPlan(chunks: Chunk[], config: AppConfig, recordIndexingRationale: boolean): AoriContextPlan {
   const policy: AoriContextPolicy = {
     modelContextTokens: config.aoriModelContextTokens,
     globalReadMaxInputTokens: config.aoriGlobalReadMaxInputTokens,
@@ -198,7 +199,7 @@ function buildAoriContextPlan(chunks: Chunk[], config: AppConfig): AoriContextPl
   }
 
   const truncationGroups = groups.filter((group) => group.truncated);
-  const rationaleTrace: AoriIndexingRationale[] = config.recordIndexingRationale
+  const rationaleTrace: AoriIndexingRationale[] = recordIndexingRationale
     ? truncationGroups.map((group) => ({
       stage: "global_reading",
       decisionType: "context_truncation",
@@ -399,7 +400,10 @@ export class IngestionQueue extends EventEmitter {
       const chunks = this.db.replaceChunks(source.libraryId, source.version.id, documentIndex.chunks);
       this.db.saveDocumentIndex(documentIndex, chunks);
       if (chunks.length === 0) throw new Error("文档中没有可处理的文本内容");
-      const aoriContextPlan = buildAoriContextPlan(chunks, this.config);
+      const shouldRunAori = job.indexStrategy === "aspect_oriented_reflective";
+      const aoriContextPlan = shouldRunAori
+        ? buildAoriContextPlan(chunks, this.config, job.recordIndexingRationale)
+        : undefined;
       {
         const build = this.db.createIndexBuild(source.version.id, "v2");
         try {
@@ -416,9 +420,11 @@ export class IngestionQueue extends EventEmitter {
             contextIndex.retrievalUnits,
             {
               ...contextIndex.qualityReport,
-              aoriContextPolicy: aoriContextPlan.policy,
-              ...(aoriContextPlan.rationaleTrace.length > 0 ? { aoriRationaleTrace: aoriContextPlan.rationaleTrace } : {}),
-              reflectiveIndexReport: aoriContextPlan.reflectiveReport,
+              ...(aoriContextPlan ? {
+                aoriContextPolicy: aoriContextPlan.policy,
+                ...(aoriContextPlan.rationaleTrace.length > 0 ? { aoriRationaleTrace: aoriContextPlan.rationaleTrace } : {}),
+                reflectiveIndexReport: aoriContextPlan.reflectiveReport,
+              } : {}),
             },
             contextIndex.performanceReport,
           );
@@ -457,95 +463,74 @@ export class IngestionQueue extends EventEmitter {
 
       this.setStage(jobId, "extracting", 0.7);
       const currentVersionChunkIds = new Set(childChunks.map((chunk) => chunk.id));
-      const affectedExistingChunks = new Map<string, { chunk: Chunk; newContext: Map<string, Chunk> }>();
-      for (const chunk of childChunks) {
-        const embedding = await this.model.embed([chunk.text]);
-        const crossDocumentCandidates = this.vectors.search(
-          source.libraryId,
-          embedding[0] ?? [],
-          6,
-          currentVersionChunkIds,
-        ).map((result) => result.chunk)
-          .filter((candidate) => candidate.versionId !== source.version.id);
-        for (const candidate of crossDocumentCandidates) {
-          const affected = affectedExistingChunks.get(candidate.id) ?? {
-            chunk: candidate,
-            newContext: new Map<string, Chunk>(),
-          };
-          for (const contextChunk of aoriContextPlan.contextChunks) affected.newContext.set(contextChunk.id, contextChunk);
-          affectedExistingChunks.set(candidate.id, affected);
-        }
-      }
-
-      const primaryBatchCount = Math.max(1, aoriContextPlan.groups.length);
-      for (const [index, group] of aoriContextPlan.groups.entries()) {
-        let graphRules: GraphRulesResult | undefined;
-        const extraction = await this.model.extract(group.chunks, new Map(), {
-          stage: "extraction",
-          aoriContext: {
-            stage: "global_reading",
-            groupId: group.groupId,
-            documentName: source.documentName,
-            documentTokenEstimate: group.documentTokenEstimate,
-            inputTokenEstimate: group.inputTokenEstimate,
-            usedTokenEstimate: group.usedTokenEstimate,
-            preservedRanges: group.preservedRanges,
-            omittedRanges: group.omittedRanges,
-            truncated: group.truncated,
-            risk: group.risk,
-            minTruncatedContextTokens: this.config.aoriMinTruncatedContextTokens,
-            evidenceBindingMinContextTokens: this.config.aoriEvidenceBindingMinContextTokens,
-            allowSmallContextOnlyForQuoteLookup: this.config.aoriAllowSmallContextOnlyForQuoteLookup,
-          },
-          onGraphRules: (result) => {
-            graphRules = result;
-            this.emitGraphRuleEvents(source, jobId, "graph_rule_trace", result);
-          },
-        });
-        this.db.saveExtraction(source.libraryId, extraction, source.version.id);
-        if (graphRules) {
-          this.emitCandidateReady(source, jobId, index + 1, primaryBatchCount, graphRules.summary, {
-            nodes: extraction.nodes.length,
-            relations: extraction.relations.length,
-            themes: extraction.themes?.length ?? 0,
-          });
-        }
-      }
-
-      // Existing chunks need a reciprocal look at new material so import order does not
-      // determine whether a cross-document relationship can be proposed.
-      const affected = [...affectedExistingChunks.values()];
-      const reciprocalBatchBase = primaryBatchCount;
-      const reciprocalAnchorBatchSize = 20;
-      const reciprocalAnchorBatchCount = Math.ceil(affected.length / reciprocalAnchorBatchSize);
-      const reciprocalBatchCount = reciprocalAnchorBatchCount * Math.max(1, aoriContextPlan.groups.length);
-      let reciprocalBatchOffset = 0;
-      for (let start = 0; start < affected.length; start += reciprocalAnchorBatchSize) {
-        const batch = affected.slice(start, start + reciprocalAnchorBatchSize);
-        const anchors = batch.map((entry) => entry.chunk);
-        const newContext = uniqueChunksById(batch.flatMap((entry) => [...entry.newContext.values()]));
+      if (shouldRunAori && aoriContextPlan) {
+        const draftGroups: AoriDraftGroup[] = [];
         for (const group of aoriContextPlan.groups) {
-          reciprocalBatchOffset += 1;
-          const reciprocalChunks = uniqueChunksById([...anchors, ...group.chunks, ...newContext]);
-          const usedTokenEstimate = estimateAoriChunkTokens(reciprocalChunks);
-          let graphRules: GraphRulesResult | undefined;
-          const extraction = await this.model.extract(reciprocalChunks, new Map(), {
-            stage: "extraction",
-            aoriContext: {
-              stage: "relation_extraction",
-              groupId: `${group.groupId}-reciprocal-${reciprocalBatchOffset}`,
+          const draft = await this.model.extractAoriDocument({
+            documentName: source.documentName,
+            chunks: group.chunks,
+            context: {
+              stage: "global_reading",
+              groupId: group.groupId,
               documentName: source.documentName,
-              documentTokenEstimate: usedTokenEstimate,
-              inputTokenEstimate: usedTokenEstimate,
-              usedTokenEstimate,
-              preservedRanges: [describeAoriRange(reciprocalChunks)].filter(Boolean),
-              omittedRanges: [],
-              truncated: false,
-              risk: "low",
+              documentTokenEstimate: group.documentTokenEstimate,
+              inputTokenEstimate: group.inputTokenEstimate,
+              usedTokenEstimate: group.usedTokenEstimate,
+              preservedRanges: group.preservedRanges,
+              omittedRanges: group.omittedRanges,
+              truncated: group.truncated,
+              risk: group.risk,
               minTruncatedContextTokens: this.config.aoriMinTruncatedContextTokens,
               evidenceBindingMinContextTokens: this.config.aoriEvidenceBindingMinContextTokens,
               allowSmallContextOnlyForQuoteLookup: this.config.aoriAllowSmallContextOnlyForQuoteLookup,
             },
+          });
+          draftGroups.push({ groupId: group.groupId, draft });
+        }
+        const aoriIndex = buildAoriDocumentIndex({
+          libraryId: source.libraryId,
+          documentId: source.documentId,
+          documentName: source.documentName,
+          versionId: source.version.id,
+          chunks,
+          drafts: draftGroups,
+          rationaleTrace: job.recordIndexingRationale ? aoriContextPlan.rationaleTrace : [],
+          reflectiveReport: aoriContextPlan.reflectiveReport,
+        });
+        this.db.saveAoriDocumentIndex(aoriIndex);
+        const compatibleExtraction = aoriIndexToExtraction(aoriIndex);
+        if (compatibleExtraction.nodes.length > 0) this.db.saveExtraction(source.libraryId, compatibleExtraction, source.version.id);
+      } else {
+        const relatedByChunk = new Map<string, Chunk[]>();
+        const affectedExistingChunks = new Map<string, { chunk: Chunk; newContext: Map<string, Chunk> }>();
+        for (const chunk of childChunks) {
+          const embedding = await this.model.embed([chunk.text]);
+          const crossDocumentCandidates = this.vectors.search(
+            source.libraryId,
+            embedding[0] ?? [],
+            6,
+            currentVersionChunkIds,
+          ).map((result) => result.chunk)
+            .filter((candidate) => candidate.versionId !== source.version.id);
+          relatedByChunk.set(chunk.id, crossDocumentCandidates);
+          for (const candidate of crossDocumentCandidates) {
+            const affected = affectedExistingChunks.get(candidate.id) ?? {
+              chunk: candidate,
+              newContext: new Map<string, Chunk>(),
+            };
+            affected.newContext.set(chunk.id, chunk);
+            affectedExistingChunks.set(candidate.id, affected);
+          }
+        }
+
+        const batchSize = 8;
+        const primaryBatchCount = Math.ceil(childChunks.length / batchSize);
+        for (let start = 0; start < childChunks.length; start += batchSize) {
+          const batch = childChunks.slice(start, start + batchSize);
+          const relatedBatch = new Map(batch.map((chunk) => [chunk.id, relatedByChunk.get(chunk.id) ?? []]));
+          let graphRules: GraphRulesResult | undefined;
+          const extraction = await this.model.extract(batch, relatedBatch, {
+            stage: "extraction",
             onGraphRules: (result) => {
               graphRules = result;
               this.emitGraphRuleEvents(source, jobId, "graph_rule_trace", result);
@@ -553,7 +538,34 @@ export class IngestionQueue extends EventEmitter {
           });
           this.db.saveExtraction(source.libraryId, extraction, source.version.id);
           if (graphRules) {
-            this.emitCandidateReady(source, jobId, reciprocalBatchBase + reciprocalBatchOffset, reciprocalBatchBase + reciprocalBatchCount, graphRules.summary, {
+            this.emitCandidateReady(source, jobId, Math.floor(start / batchSize) + 1, Math.max(1, primaryBatchCount), graphRules.summary, {
+              nodes: extraction.nodes.length,
+              relations: extraction.relations.length,
+              themes: extraction.themes?.length ?? 0,
+            });
+          }
+        }
+
+        // Existing chunks need a reciprocal look at new material so import order does not
+        // determine whether a cross-document relationship can be proposed.
+        const affected = [...affectedExistingChunks.values()];
+        const reciprocalAnchorBatchSize = 20;
+        const reciprocalBatchCount = Math.ceil(affected.length / reciprocalAnchorBatchSize);
+        for (let start = 0; start < affected.length; start += reciprocalAnchorBatchSize) {
+          const batch = affected.slice(start, start + reciprocalAnchorBatchSize);
+          const anchors = batch.map((entry) => entry.chunk);
+          const reciprocalRelated = new Map(batch.map((entry) => [entry.chunk.id, uniqueChunksById([...entry.newContext.values()])]));
+          let graphRules: GraphRulesResult | undefined;
+          const extraction = await this.model.extract(anchors, reciprocalRelated, {
+            stage: "extraction",
+            onGraphRules: (result) => {
+              graphRules = result;
+              this.emitGraphRuleEvents(source, jobId, "graph_rule_trace", result);
+            },
+          });
+          this.db.saveExtraction(source.libraryId, extraction, source.version.id);
+          if (graphRules) {
+            this.emitCandidateReady(source, jobId, primaryBatchCount + Math.floor(start / reciprocalAnchorBatchSize) + 1, primaryBatchCount + Math.max(0, reciprocalBatchCount), graphRules.summary, {
               nodes: extraction.nodes.length,
               relations: extraction.relations.length,
               themes: extraction.themes?.length ?? 0,

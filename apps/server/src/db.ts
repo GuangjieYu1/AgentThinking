@@ -6,7 +6,12 @@ import { aspectKinds } from "@agent-thinking/contracts";
 import type {
   AbstractNode,
   AbstractNodeKind,
+  AoriDocumentIndex,
+  AoriDocumentResponse,
+  Aspect,
   AspectKind,
+  AspectItem,
+  AspectRelation,
   AuthUser,
   AnalysisDraft,
   AnalysisStatement,
@@ -14,10 +19,13 @@ import type {
   Chunk,
   ContextUnit,
   ContextUnitQualityReport,
+  ClosureReport,
   Document,
+  DocumentRelationLexicon,
   DocumentTreeNode,
   DocumentTreeNodeType,
   DocumentVersion,
+  DocumentUnderstanding,
   EvidencePack,
   ExtractionOutput,
   GraphEdge,
@@ -28,6 +36,8 @@ import type {
   IndexBuildStatus,
   IndexingPerformanceReport,
   IndexProfileStatus,
+  IndexStrategy,
+  IndexingRationaleTrace,
   IngestJob,
   JobStage,
   Library,
@@ -49,6 +59,7 @@ import type {
   Relation,
   RelationStatus,
   RelationType,
+  ReflectiveIndexReport,
   SearchResult,
   SummaryTreeLevel,
   SummaryTreeNode,
@@ -59,6 +70,7 @@ import type {
   SourceStructure,
   PublishedAnalysis,
   RetrievalUnit,
+  SelfQuestion,
 } from "@agent-thinking/contracts";
 import type { PendingChunk } from "./domain/chunker.js";
 import type { PendingDocumentIndex } from "./domain/document-tree.js";
@@ -318,6 +330,23 @@ function parseTextList(value: Row[string] | undefined): string[] {
   } catch {
     return [];
   }
+}
+
+function parseJsonValue<T>(value: Row[string] | undefined, fallback: T): T {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeIndexStrategy(value: unknown): IndexStrategy {
+  return value === "aspect_oriented_reflective" ? "aspect_oriented_reflective" : "bottom_up_evidence";
+}
+
+function sqliteBoolean(value: unknown): boolean {
+  return value === true || value === 1 || value === "1" || value === "true";
 }
 
 function parseMappingAuditFindings(value: Row[string] | undefined): MappingAuditFinding[] {
@@ -663,6 +692,86 @@ export class AgentDatabase {
         chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
         PRIMARY KEY(relation_id, chunk_id)
       );
+      CREATE TABLE IF NOT EXISTS aori_documents (
+        version_id TEXT PRIMARY KEY REFERENCES document_versions(id) ON DELETE CASCADE,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        document_name TEXT NOT NULL,
+        understanding_json TEXT NOT NULL,
+        reflective_report_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS aori_aspects (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        central_question TEXT NOT NULL,
+        item_ids_json TEXT NOT NULL DEFAULT '[]',
+        relation_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS aori_aspect_items (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        aspect_id TEXT NOT NULL REFERENCES aori_aspects(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        source_node_ids_json TEXT NOT NULL DEFAULT '[]',
+        evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS aori_aspect_relations (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        aspect_id TEXT NOT NULL REFERENCES aori_aspects(id) ON DELETE CASCADE,
+        source_item_id TEXT NOT NULL REFERENCES aori_aspect_items(id) ON DELETE CASCADE,
+        target_item_id TEXT NOT NULL REFERENCES aori_aspect_items(id) ON DELETE CASCADE,
+        relation_name TEXT NOT NULL,
+        base_relation TEXT NOT NULL CHECK (base_relation IN ('supports','contradicts','explains','depends_on','example_of','related_to')),
+        relation_text_in_source TEXT,
+        normalized_relation TEXT,
+        reason TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE TABLE IF NOT EXISTS aori_relation_lexicon (
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        relation_name TEXT NOT NULL,
+        base_relation TEXT NOT NULL CHECK (base_relation IN ('supports','contradicts','explains','depends_on','example_of','related_to')),
+        source_examples_json TEXT NOT NULL DEFAULT '[]',
+        PRIMARY KEY(version_id, relation_name)
+      );
+      CREATE TABLE IF NOT EXISTS aori_closure_reports (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        aspect_id TEXT REFERENCES aori_aspects(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('closed','open','partial')),
+        item_count INTEGER NOT NULL,
+        relation_count INTEGER NOT NULL,
+        gaps_json TEXT NOT NULL DEFAULT '[]',
+        warnings_json TEXT NOT NULL DEFAULT '[]',
+        checked_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS aori_self_questions (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        question TEXT NOT NULL,
+        answer TEXT,
+        evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL CHECK (status IN ('answered','gap','unchecked'))
+      );
+      CREATE TABLE IF NOT EXISTS aori_indexing_rationale (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL,
+        decision_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        input_token_estimate INTEGER NOT NULL,
+        used_token_estimate INTEGER NOT NULL,
+        omitted_ranges_json TEXT NOT NULL DEFAULT '[]',
+        preserved_ranges_json TEXT NOT NULL DEFAULT '[]',
+        risk TEXT NOT NULL CHECK (risk IN ('low','medium','high')),
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS ingest_jobs (
         id TEXT PRIMARY KEY,
         library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
@@ -679,6 +788,10 @@ export class AgentDatabase {
       CREATE INDEX IF NOT EXISTS idx_nodes_library ON abstract_nodes(library_id);
       CREATE INDEX IF NOT EXISTS idx_relations_library_status ON relations(library_id, status);
       CREATE INDEX IF NOT EXISTS idx_jobs_library ON ingest_jobs(library_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_aori_documents_library ON aori_documents(library_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_aori_aspects_version ON aori_aspects(version_id);
+      CREATE INDEX IF NOT EXISTS idx_aori_items_version ON aori_aspect_items(version_id);
+      CREATE INDEX IF NOT EXISTS idx_aori_relations_version ON aori_aspect_relations(version_id);
       CREATE TABLE IF NOT EXISTS source_metadata (
         version_id TEXT PRIMARY KEY REFERENCES document_versions(id) ON DELETE CASCADE,
         title TEXT,
@@ -838,6 +951,10 @@ export class AgentDatabase {
     this.addColumn("document_versions", "latest_ready_v2_build_id", "TEXT");
     this.addColumn("document_versions", "active_index_profile", "TEXT NOT NULL DEFAULT 'v1'");
     this.addColumn("document_versions", "index_warnings_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumn("document_versions", "index_strategy", "TEXT NOT NULL DEFAULT 'bottom_up_evidence'");
+    this.addColumn("document_versions", "record_indexing_rationale", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("ingest_jobs", "index_strategy", "TEXT NOT NULL DEFAULT 'bottom_up_evidence'");
+    this.addColumn("ingest_jobs", "record_indexing_rationale", "INTEGER NOT NULL DEFAULT 0");
     this.addColumn("pulse_hits", "step_index", "INTEGER");
     this.addColumn("pulse_hits", "observation", "TEXT");
     this.addColumn("pulse_hits", "rationale", "TEXT");
@@ -1000,6 +1117,7 @@ export class AgentDatabase {
     mediaType: string,
     hash: string,
     storagePath: string,
+    options: { indexStrategy?: IndexStrategy; recordIndexingRationale?: boolean } = {},
   ): { version: DocumentVersion; duplicate: boolean } {
     let documentRow = row(
       this.sql.prepare("SELECT * FROM documents WHERE library_id = ? AND name = ?"),
@@ -1026,9 +1144,13 @@ export class AgentDatabase {
 
     const id = randomUUID();
     const timestamp = now();
+    const indexStrategy = normalizeIndexStrategy(options.indexStrategy);
+    const recordIndexingRationale = Boolean(options.recordIndexingRationale);
     this.sql.prepare(
-      "INSERT INTO document_versions (id, document_id, content_hash, storage_path, status, created_at) VALUES (?, ?, ?, ?, 'queued', ?)",
-    ).run(id, documentId, hash, storagePath, timestamp);
+      `INSERT INTO document_versions
+        (id, document_id, content_hash, storage_path, status, index_strategy, record_indexing_rationale, created_at)
+       VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
+    ).run(id, documentId, hash, storagePath, indexStrategy, recordIndexingRationale ? 1 : 0, timestamp);
     return {
       version: {
         id,
@@ -1036,6 +1158,8 @@ export class AgentDatabase {
         contentHash: hash,
         storagePath,
         status: "queued",
+        indexStrategy,
+        recordIndexingRationale,
         createdAt: timestamp,
       },
       duplicate: false,
@@ -1049,6 +1173,8 @@ export class AgentDatabase {
       contentHash: String(r.content_hash),
       storagePath: String(r.storage_path),
       status: String(r.status) as DocumentVersion["status"],
+      indexStrategy: normalizeIndexStrategy(r.index_strategy),
+      recordIndexingRationale: sqliteBoolean(r.record_indexing_rationale),
       indexSchemaVersion: Number(r.index_schema_version ?? 1) === 2 ? 2 : 1,
       latestReadyV1BuildId: r.latest_ready_v1_build_id === null || r.latest_ready_v1_build_id === undefined ? null : String(r.latest_ready_v1_build_id),
       latestReadyV2BuildId: r.latest_ready_v2_build_id === null || r.latest_ready_v2_build_id === undefined ? null : String(r.latest_ready_v2_build_id),
@@ -1091,7 +1217,14 @@ export class AgentDatabase {
     return rows(
       this.sql.prepare(`
         SELECT d.*, v.id AS v_id, v.document_id AS v_document_id, v.content_hash AS v_hash,
-          v.storage_path AS v_path, v.status AS v_status, v.created_at AS v_created
+          v.storage_path AS v_path, v.status AS v_status, v.index_strategy AS v_index_strategy,
+          v.record_indexing_rationale AS v_record_indexing_rationale,
+          v.index_schema_version AS v_index_schema_version,
+          v.latest_ready_v1_build_id AS v_latest_ready_v1_build_id,
+          v.latest_ready_v2_build_id AS v_latest_ready_v2_build_id,
+          v.active_index_profile AS v_active_index_profile,
+          v.index_warnings_json AS v_index_warnings_json,
+          v.created_at AS v_created
         FROM documents d
         LEFT JOIN document_versions v ON v.id = (
           SELECT id FROM document_versions WHERE document_id = d.id ORDER BY created_at DESC LIMIT 1
@@ -1115,6 +1248,13 @@ export class AgentDatabase {
           contentHash: String(result.v_hash),
           storagePath: String(result.v_path),
           status: String(result.v_status) as DocumentVersion["status"],
+          indexStrategy: normalizeIndexStrategy(result.v_index_strategy),
+          recordIndexingRationale: sqliteBoolean(result.v_record_indexing_rationale),
+          indexSchemaVersion: Number(result.v_index_schema_version ?? 1) === 2 ? 2 : 1,
+          latestReadyV1BuildId: result.v_latest_ready_v1_build_id === null || result.v_latest_ready_v1_build_id === undefined ? null : String(result.v_latest_ready_v1_build_id),
+          latestReadyV2BuildId: result.v_latest_ready_v2_build_id === null || result.v_latest_ready_v2_build_id === undefined ? null : String(result.v_latest_ready_v2_build_id),
+          activeIndexProfile: String(result.v_active_index_profile ?? "v1") === "v2" ? "v2" : "v1",
+          indexWarnings: parseTextList(result.v_index_warnings_json),
           createdAt: String(result.v_created),
         };
       }
@@ -1359,11 +1499,20 @@ export class AgentDatabase {
     return result ? mappingAuditFrom(result) : undefined;
   }
 
-  createJob(libraryId: string, versionId: string): IngestJob {
+  createJob(
+    libraryId: string,
+    versionId: string,
+    options: { indexStrategy?: IndexStrategy; recordIndexingRationale?: boolean } = {},
+  ): IngestJob {
+    const version = this.getVersion(versionId);
+    const indexStrategy = normalizeIndexStrategy(options.indexStrategy ?? version?.indexStrategy);
+    const recordIndexingRationale = options.recordIndexingRationale ?? version?.recordIndexingRationale ?? false;
     const job: IngestJob = {
       id: randomUUID(),
       libraryId,
       versionId,
+      indexStrategy,
+      recordIndexingRationale,
       stage: "queued",
       progress: 0,
       error: null,
@@ -1373,10 +1522,10 @@ export class AgentDatabase {
     };
     this.sql.prepare(`
       INSERT INTO ingest_jobs
-        (id, library_id, version_id, stage, progress, error, attempts, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, library_id, version_id, index_strategy, record_indexing_rationale, stage, progress, error, attempts, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      job.id, job.libraryId, job.versionId, job.stage, job.progress, job.error,
+      job.id, job.libraryId, job.versionId, job.indexStrategy, job.recordIndexingRationale ? 1 : 0, job.stage, job.progress, job.error,
       job.attempts, job.createdAt, job.updatedAt,
     );
     return job;
@@ -1447,6 +1596,8 @@ export class AgentDatabase {
       id: String(result.id),
       libraryId: String(result.library_id),
       versionId: String(result.version_id),
+      indexStrategy: normalizeIndexStrategy(result.index_strategy),
+      recordIndexingRationale: sqliteBoolean(result.record_indexing_rationale),
       stage: String(result.stage) as JobStage,
       progress: Number(result.progress),
       error: result.error === null ? null : String(result.error),
@@ -2064,7 +2215,331 @@ export class AgentDatabase {
     }));
   }
 
+  private clearAoriForVersion(versionId: string): void {
+    this.sql.prepare("DELETE FROM aori_indexing_rationale WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM aori_self_questions WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM aori_closure_reports WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM aori_relation_lexicon WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM aori_aspect_relations WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM aori_aspect_items WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM aori_aspects WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM aori_documents WHERE version_id = ?").run(versionId);
+  }
+
+  saveAoriDocumentIndex(index: AoriDocumentIndex): void {
+    const timestamp = index.createdAt || now();
+    this.sql.exec("BEGIN");
+    try {
+      this.clearAoriForVersion(index.versionId);
+      this.sql.prepare(`
+        INSERT INTO aori_documents
+          (version_id, library_id, document_id, document_name, understanding_json, reflective_report_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        index.versionId,
+        index.libraryId,
+        index.documentId,
+        index.documentName,
+        JSON.stringify(index.understanding),
+        JSON.stringify(index.reflectiveReport),
+        timestamp,
+      );
+      const insertAspect = this.sql.prepare(`
+        INSERT INTO aori_aspects
+          (id, version_id, title, summary, central_question, item_ids_json, relation_ids_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insertItem = this.sql.prepare(`
+        INSERT INTO aori_aspect_items
+          (id, version_id, aspect_id, title, summary, source_node_ids_json, evidence_chunk_ids_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insertRelation = this.sql.prepare(`
+        INSERT INTO aori_aspect_relations
+          (id, version_id, aspect_id, source_item_id, target_item_id, relation_name, base_relation,
+            relation_text_in_source, normalized_relation, reason, confidence, evidence_chunk_ids_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insertClosure = this.sql.prepare(`
+        INSERT INTO aori_closure_reports
+          (id, version_id, aspect_id, status, item_count, relation_count, gaps_json, warnings_json, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const aspect of index.aspects) {
+        insertAspect.run(
+          aspect.id,
+          index.versionId,
+          aspect.title,
+          aspect.summary,
+          aspect.centralQuestion,
+          JSON.stringify(aspect.itemIds),
+          JSON.stringify(aspect.relationIds),
+        );
+        for (const item of aspect.items) {
+          insertItem.run(
+            item.id,
+            index.versionId,
+            aspect.id,
+            item.title,
+            item.summary,
+            JSON.stringify(item.sourceNodeIds),
+            JSON.stringify(item.evidenceChunkIds),
+          );
+        }
+        for (const relation of aspect.relations) {
+          insertRelation.run(
+            relation.id,
+            index.versionId,
+            aspect.id,
+            relation.sourceItemId,
+            relation.targetItemId,
+            relation.relationName,
+            relation.baseRelation,
+            relation.relationTextInSource ?? null,
+            relation.normalizedRelation ?? null,
+            relation.reason,
+            relation.confidence,
+            JSON.stringify(relation.evidenceChunkIds),
+          );
+        }
+        const report = aspect.closureReport;
+        insertClosure.run(
+          report.id,
+          index.versionId,
+          report.aspectId ?? aspect.id,
+          report.status,
+          report.itemCount,
+          report.relationCount,
+          JSON.stringify(report.gaps),
+          JSON.stringify(report.warnings),
+          report.checkedAt,
+        );
+      }
+      const globalReports = index.closureReports.filter((report) => !report.aspectId);
+      for (const report of globalReports) {
+        insertClosure.run(
+          report.id,
+          index.versionId,
+          null,
+          report.status,
+          report.itemCount,
+          report.relationCount,
+          JSON.stringify(report.gaps),
+          JSON.stringify(report.warnings),
+          report.checkedAt,
+        );
+      }
+      const insertLexicon = this.sql.prepare(`
+        INSERT INTO aori_relation_lexicon
+          (version_id, relation_name, base_relation, source_examples_json)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const entry of index.relationLexicon.entries) {
+        insertLexicon.run(index.versionId, entry.relationName, entry.baseRelation, JSON.stringify(entry.sourceExamples));
+      }
+      const insertQuestion = this.sql.prepare(`
+        INSERT INTO aori_self_questions
+          (id, version_id, question, answer, evidence_chunk_ids_json, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const question of index.selfQuestions) {
+        insertQuestion.run(
+          question.id,
+          index.versionId,
+          question.question,
+          question.answer ?? null,
+          JSON.stringify(question.evidenceChunkIds),
+          question.status,
+        );
+      }
+      const insertRationale = this.sql.prepare(`
+        INSERT INTO aori_indexing_rationale
+          (id, version_id, stage, decision_type, summary, input_token_estimate, used_token_estimate,
+            omitted_ranges_json, preserved_ranges_json, risk, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const trace of index.rationaleTrace) {
+        insertRationale.run(
+          trace.id ?? randomUUID(),
+          index.versionId,
+          trace.stage,
+          trace.decisionType,
+          trace.summary,
+          trace.inputTokenEstimate,
+          trace.usedTokenEstimate,
+          JSON.stringify(trace.omittedRanges),
+          JSON.stringify(trace.preservedRanges),
+          trace.risk,
+          trace.createdAt ?? timestamp,
+        );
+      }
+      this.sql.exec("COMMIT");
+    } catch (error) {
+      this.sql.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getAoriDocumentIndex(versionId: string): AoriDocumentResponse {
+    const source = this.getVersionSource(versionId);
+    if (!source) return { available: false, message: "导入版本不存在" };
+    if (source.version.indexStrategy !== "aspect_oriented_reflective") {
+      return { available: false, message: "该文档未使用切面式反思索引", indexStrategy: source.version.indexStrategy };
+    }
+    const doc = row(this.sql.prepare("SELECT * FROM aori_documents WHERE version_id = ?"), versionId);
+    if (!doc) return { available: false, message: "AORI 产物尚未生成", indexStrategy: source.version.indexStrategy };
+
+    const items = rows(this.sql.prepare("SELECT * FROM aori_aspect_items WHERE version_id = ?"), versionId)
+      .map((entry): AspectItem => ({
+        id: String(entry.id),
+        versionId,
+        aspectId: String(entry.aspect_id),
+        title: String(entry.title),
+        summary: String(entry.summary),
+        sourceNodeIds: parseTextList(entry.source_node_ids_json),
+        evidenceChunkIds: parseTextList(entry.evidence_chunk_ids_json),
+      }));
+    const relations = rows(this.sql.prepare("SELECT * FROM aori_aspect_relations WHERE version_id = ?"), versionId)
+      .map((entry): AspectRelation => ({
+        id: String(entry.id),
+        versionId,
+        aspectId: String(entry.aspect_id),
+        sourceItemId: String(entry.source_item_id),
+        targetItemId: String(entry.target_item_id),
+        relationName: String(entry.relation_name),
+        baseRelation: String(entry.base_relation) as RelationType,
+        ...(entry.relation_text_in_source === null ? {} : { relationTextInSource: String(entry.relation_text_in_source) }),
+        ...(entry.normalized_relation === null ? {} : { normalizedRelation: String(entry.normalized_relation) }),
+        reason: String(entry.reason),
+        confidence: Number(entry.confidence),
+        evidenceChunkIds: parseTextList(entry.evidence_chunk_ids_json),
+      }));
+    const closureReports = rows(this.sql.prepare("SELECT * FROM aori_closure_reports WHERE version_id = ?"), versionId)
+      .map((entry): ClosureReport => ({
+        id: String(entry.id),
+        versionId,
+        aspectId: entry.aspect_id === null || entry.aspect_id === undefined ? null : String(entry.aspect_id),
+        status: String(entry.status) as ClosureReport["status"],
+        itemCount: Number(entry.item_count),
+        relationCount: Number(entry.relation_count),
+        gaps: parseJsonValue(entry.gaps_json, []),
+        warnings: parseTextList(entry.warnings_json),
+        checkedAt: String(entry.checked_at),
+      }));
+    const itemByAspect = new Map<string, AspectItem[]>();
+    for (const item of items) {
+      const group = itemByAspect.get(item.aspectId) ?? [];
+      group.push(item);
+      itemByAspect.set(item.aspectId, group);
+    }
+    const relationByAspect = new Map<string, AspectRelation[]>();
+    for (const relation of relations) {
+      const group = relationByAspect.get(relation.aspectId) ?? [];
+      group.push(relation);
+      relationByAspect.set(relation.aspectId, group);
+    }
+    const closureByAspect = new Map(closureReports.flatMap((report) => report.aspectId ? [[report.aspectId, report]] : []));
+    const aspects = rows(this.sql.prepare("SELECT * FROM aori_aspects WHERE version_id = ? ORDER BY rowid"), versionId)
+      .map((entry): Aspect => {
+        const aspectItems = itemByAspect.get(String(entry.id)) ?? [];
+        const aspectRelations = relationByAspect.get(String(entry.id)) ?? [];
+        const closureReport = closureByAspect.get(String(entry.id)) ?? {
+          id: `closure-missing-${String(entry.id)}`,
+          versionId,
+          aspectId: String(entry.id),
+          status: "open" as const,
+          itemCount: aspectItems.length,
+          relationCount: aspectRelations.length,
+          gaps: [],
+          warnings: ["closure report missing"],
+          checkedAt: String(doc.created_at),
+        };
+        return {
+          id: String(entry.id),
+          versionId,
+          title: String(entry.title),
+          summary: String(entry.summary),
+          centralQuestion: String(entry.central_question),
+          itemIds: parseTextList(entry.item_ids_json),
+          relationIds: parseTextList(entry.relation_ids_json),
+          items: aspectItems,
+          relations: aspectRelations,
+          closureReport,
+        };
+      });
+    const relationLexicon: DocumentRelationLexicon = {
+      versionId,
+      entries: rows(this.sql.prepare("SELECT * FROM aori_relation_lexicon WHERE version_id = ? ORDER BY relation_name"), versionId)
+        .map((entry) => ({
+          relationName: String(entry.relation_name),
+          baseRelation: String(entry.base_relation) as RelationType,
+          sourceExamples: parseJsonValue(entry.source_examples_json, []),
+        })),
+    };
+    const selfQuestions = rows(this.sql.prepare("SELECT * FROM aori_self_questions WHERE version_id = ? ORDER BY rowid"), versionId)
+      .map((entry): SelfQuestion => ({
+        id: String(entry.id),
+        versionId,
+        question: String(entry.question),
+        ...(entry.answer === null || entry.answer === undefined ? {} : { answer: String(entry.answer) }),
+        evidenceChunkIds: parseTextList(entry.evidence_chunk_ids_json),
+        status: String(entry.status) as SelfQuestion["status"],
+      }));
+    const rationaleTrace = rows(this.sql.prepare("SELECT * FROM aori_indexing_rationale WHERE version_id = ? ORDER BY rowid"), versionId)
+      .map((entry): IndexingRationaleTrace => ({
+        id: String(entry.id),
+        versionId,
+        stage: String(entry.stage) as IndexingRationaleTrace["stage"],
+        decisionType: String(entry.decision_type) as IndexingRationaleTrace["decisionType"],
+        summary: String(entry.summary),
+        inputTokenEstimate: Number(entry.input_token_estimate),
+        usedTokenEstimate: Number(entry.used_token_estimate),
+        omittedRanges: parseTextList(entry.omitted_ranges_json),
+        preservedRanges: parseTextList(entry.preserved_ranges_json),
+        risk: String(entry.risk) as IndexingRationaleTrace["risk"],
+        createdAt: String(entry.created_at),
+      }));
+
+    return {
+      available: true,
+      versionId,
+      libraryId: source.libraryId,
+      documentId: source.documentId,
+      documentName: source.documentName,
+      createdAt: String(doc.created_at),
+      understanding: parseJsonValue<DocumentUnderstanding>(doc.understanding_json, {
+        versionId,
+        summary: "",
+        centralQuestion: "",
+        evidenceChunkIds: [],
+      }),
+      aspects,
+      relationLexicon,
+      closureReports,
+      selfQuestions,
+      reflectiveReport: parseJsonValue<ReflectiveIndexReport>(doc.reflective_report_json, {
+        summary: "",
+        completenessRisk: "none",
+        warnings: [],
+        truncationCount: 0,
+      }),
+      rationaleTrace,
+    };
+  }
+
+  listAoriDocumentIndexes(libraryId: string): AoriDocumentIndex[] {
+    const versionIds = rows(
+      this.sql.prepare("SELECT version_id FROM aori_documents WHERE library_id = ? ORDER BY created_at DESC"),
+      libraryId,
+    ).map((entry) => String(entry.version_id));
+    return versionIds.flatMap((versionId) => {
+      const result = this.getAoriDocumentIndex(versionId);
+      return result.available ? [result] : [];
+    });
+  }
+
   private clearGeneratedForVersion(versionId: string): void {
+    this.clearAoriForVersion(versionId);
     this.sql.prepare("DELETE FROM summary_embeddings WHERE summary_id IN (SELECT id FROM summary_tree_nodes WHERE version_id = ?)").run(versionId);
     this.sql.prepare("DELETE FROM summary_tree_nodes WHERE version_id = ?").run(versionId);
     this.sql.prepare("DELETE FROM parent_child_chunks WHERE child_chunk_id IN (SELECT id FROM chunks WHERE version_id = ?)").run(versionId);

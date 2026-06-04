@@ -1,5 +1,6 @@
 import type {
   AbstractNode,
+  AoriDocumentResponse,
   AspectKind,
   AnalysisDraft,
   AnalysisStatement,
@@ -11,6 +12,7 @@ import type {
   GraphResponse,
   GraphView,
   IngestJob,
+  IndexStrategy,
   Library,
   LibrarySettings,
   MappingAudit,
@@ -129,6 +131,7 @@ export const api = {
   debugRetrievalUnits: (versionId: string, includeFullText = false) =>
     request<RetrievalUnit[]>(`/debug/versions/${versionId}/retrieval-units${includeFullText ? "?includeFullText=true" : ""}`),
   structure: (versionId: string) => request<SourceStructure>(`/versions/${versionId}/structure`),
+  aori: (versionId: string) => request<AoriDocumentResponse>(`/versions/${versionId}/aori`),
   documentTree: (libraryId: string) => request<DocumentTreeNode[]>(`/libraries/${libraryId}/document-tree`),
   versionDocumentTree: (versionId: string) => request<DocumentTreeNode[]>(`/versions/${versionId}/document-tree`),
   sectionSubtree: (nodeId: string) => request<DocumentTreeNode[]>(`/document-tree/${nodeId}/subtree`),
@@ -148,8 +151,14 @@ export const api = {
   jobs: (id: string) => request<IngestJob[]>(`/libraries/${id}/jobs`),
   retry: (id: string) => request<IngestJob>(`/jobs/${id}/retry`, { method: "POST" }),
   deleteJob: (id: string) => request<void>(`/jobs/${id}`, { method: "DELETE" }),
-  import: (id: string, files: FileList) => {
+  import: (
+    id: string,
+    files: FileList,
+    options: { indexStrategy: IndexStrategy; recordIndexingRationale: boolean },
+  ) => {
     const body = new FormData();
+    body.append("indexStrategy", options.indexStrategy);
+    body.append("recordIndexingRationale", String(options.recordIndexingRationale));
     Array.from(files).forEach((file) => body.append("file", file));
     return request<Array<{ fileName: string; duplicate: boolean }>>(`/libraries/${id}/import`, {
       method: "POST",

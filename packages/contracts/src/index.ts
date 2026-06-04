@@ -23,6 +23,7 @@ export const pulseStatuses = ["unreviewed", "correct", "wrong"] as const;
 export const pulseHitTargetTypes = ["node", "relation", "chunk"] as const;
 export const pulsePathRoles = ["direct", "expanded", "bridge"] as const;
 export const pulseInputModes = ["full", "progressive"] as const;
+export const indexStrategies = ["bottom_up_evidence", "aspect_oriented_reflective"] as const;
 export const indexProfiles = ["v1", "v2", "dual"] as const;
 export const activeIndexProfiles = ["v1", "v2"] as const;
 export const indexBuildStatuses = ["building", "ready", "failed", "partial", "abandoned"] as const;
@@ -123,6 +124,7 @@ export type PulseStatus = (typeof pulseStatuses)[number];
 export type PulseHitTargetType = (typeof pulseHitTargetTypes)[number];
 export type PulsePathRole = (typeof pulsePathRoles)[number];
 export type PulseInputMode = (typeof pulseInputModes)[number];
+export type IndexStrategy = (typeof indexStrategies)[number];
 export type IndexProfile = (typeof indexProfiles)[number];
 export type ActiveIndexProfile = (typeof activeIndexProfiles)[number];
 export type IndexBuildStatus = (typeof indexBuildStatuses)[number];
@@ -186,6 +188,8 @@ export interface DocumentVersion {
   contentHash: string;
   storagePath: string;
   status: "queued" | "processing" | "completed" | "failed";
+  indexStrategy: IndexStrategy;
+  recordIndexingRationale: boolean;
   indexSchemaVersion?: 1 | 2 | undefined;
   latestReadyV1BuildId?: string | null | undefined;
   latestReadyV2BuildId?: string | null | undefined;
@@ -376,6 +380,164 @@ export interface ReflectiveIndexReport {
   truncationCount: number;
 }
 
+export interface IndexingRationaleTrace extends AoriIndexingRationale {
+  id?: string | undefined;
+  versionId?: string | undefined;
+  createdAt?: string | undefined;
+}
+
+export interface DocumentUnderstanding {
+  versionId: string;
+  summary: string;
+  centralQuestion: string;
+  centralNodeTitle?: string | undefined;
+  evidenceChunkIds: string[];
+}
+
+export interface AoriGapItem {
+  id: string;
+  aspectId?: string | null | undefined;
+  description: string;
+  severity: "low" | "medium" | "high";
+  evidenceChunkIds: string[];
+}
+
+export interface ClosureReport {
+  id: string;
+  versionId: string;
+  aspectId?: string | null | undefined;
+  status: "closed" | "open" | "partial";
+  itemCount: number;
+  relationCount: number;
+  gaps: AoriGapItem[];
+  warnings: string[];
+  checkedAt: string;
+}
+
+export interface AspectItem {
+  id: string;
+  versionId: string;
+  aspectId: string;
+  title: string;
+  summary: string;
+  sourceNodeIds: string[];
+  evidenceChunkIds: string[];
+}
+
+export interface AspectRelation {
+  id: string;
+  versionId: string;
+  aspectId: string;
+  sourceItemId: string;
+  targetItemId: string;
+  relationName: string;
+  baseRelation: RelationType;
+  relationTextInSource?: string | undefined;
+  normalizedRelation?: string | undefined;
+  reason: string;
+  confidence: number;
+  evidenceChunkIds: string[];
+}
+
+export interface Aspect {
+  id: string;
+  versionId: string;
+  title: string;
+  summary: string;
+  centralQuestion: string;
+  itemIds: string[];
+  relationIds: string[];
+  items: AspectItem[];
+  relations: AspectRelation[];
+  closureReport: ClosureReport;
+}
+
+export interface DocumentRelationLexiconEntry {
+  relationName: string;
+  baseRelation: RelationType;
+  sourceExamples: Array<{
+    relationId: string;
+    evidenceChunkId: string;
+    quote: string;
+  }>;
+}
+
+export interface DocumentRelationLexicon {
+  versionId: string;
+  entries: DocumentRelationLexiconEntry[];
+}
+
+export interface SelfQuestion {
+  id: string;
+  versionId: string;
+  question: string;
+  answer?: string | undefined;
+  evidenceChunkIds: string[];
+  status: "answered" | "gap" | "unchecked";
+}
+
+export interface AoriDocumentIndex {
+  available: true;
+  versionId: string;
+  libraryId: string;
+  documentId: string;
+  documentName: string;
+  createdAt: string;
+  understanding: DocumentUnderstanding;
+  aspects: Aspect[];
+  relationLexicon: DocumentRelationLexicon;
+  closureReports: ClosureReport[];
+  selfQuestions: SelfQuestion[];
+  reflectiveReport: ReflectiveIndexReport;
+  rationaleTrace: IndexingRationaleTrace[];
+}
+
+export interface AoriUnavailable {
+  available: false;
+  message: string;
+  indexStrategy?: IndexStrategy | undefined;
+}
+
+export type AoriDocumentResponse = AoriDocumentIndex | AoriUnavailable;
+
+export interface AoriDocumentDraft {
+  understanding: Omit<DocumentUnderstanding, "versionId">;
+  aspects: Array<{
+    title: string;
+    summary: string;
+    centralQuestion: string;
+    items: Array<{
+      key: string;
+      title: string;
+      summary: string;
+      evidenceChunkIds: string[];
+      sourceNodeIds?: string[] | undefined;
+    }>;
+    relations: Array<{
+      sourceKey: string;
+      targetKey: string;
+      relationTextInSource?: string | undefined;
+      normalizedRelation?: string | undefined;
+      baseRelation: RelationType;
+      reason: string;
+      confidence: number;
+      evidenceChunkIds: string[];
+    }>;
+    gaps?: Array<{
+      description: string;
+      severity: "low" | "medium" | "high";
+      evidenceChunkIds?: string[] | undefined;
+    }> | undefined;
+  }>;
+  selfQuestions: Array<{
+    question: string;
+    answer?: string | undefined;
+    evidenceChunkIds: string[];
+    status: "answered" | "gap" | "unchecked";
+  }>;
+  reflectiveReport: ReflectiveIndexReport;
+}
+
 export interface IndexingPerformanceReport {
   parseTimeMs?: number | undefined;
   v1IndexTimeMs?: number | undefined;
@@ -532,6 +694,8 @@ export interface IngestJob {
   id: string;
   libraryId: string;
   versionId: string;
+  indexStrategy: IndexStrategy;
+  recordIndexingRationale: boolean;
   stage: JobStage;
   progress: number;
   error: string | null;
@@ -831,8 +995,36 @@ export interface PulseQuestionPlan {
   evidenceTargets: string[];
   keyEntities: string[];
   expectedEvidenceTypes: string[];
+  answerScope?: AnswerScope | undefined;
   riskLevel: "low" | "medium" | "high";
   reasoning: string;
+}
+
+export interface AnswerScope {
+  question: string;
+  answerShape: "summary" | "list" | "comparison" | "timeline" | "evidence" | "relation" | "numeric" | "mixed";
+  targetLabels: string[];
+  aspectIds: string[];
+  aspectItemIds: string[];
+  themeNodeIds: string[];
+  centerNodeIds: string[];
+  summaryNodeIds: string[];
+  versionIds: string[];
+  reasoning: string;
+}
+
+export interface ScopeClosureReport {
+  status: "closed" | "open" | "partial";
+  answerScope: AnswerScope;
+  nodeIds: string[];
+  relationIds: string[];
+  chunkIds: string[];
+  aspectIds: string[];
+  aspectItemIds: string[];
+  aspectRelationIds: string[];
+  gaps: PulseEvidenceGap[];
+  warnings: string[];
+  generatedAt: string;
 }
 
 export interface PulseEvidenceStep {
@@ -908,6 +1100,8 @@ export interface EvidencePack {
   answerModeReason?: string | undefined;
   answerModeOverridden?: boolean | undefined;
   questionPlan?: PulseQuestionPlan | undefined;
+  answerScope?: AnswerScope | undefined;
+  scopeClosureReport?: ScopeClosureReport | undefined;
   usedIndexProfile?: ActiveIndexProfile | undefined;
   sufficiencyHistory?: PulseEvidenceStatus[] | undefined;
   contextUnits?: ContextUnit[] | undefined;
@@ -963,6 +1157,8 @@ export interface PulseEvidenceStatus {
 export interface PulseEvidenceMemory {
   question: string;
   questionPlan: PulseQuestionPlan;
+  answerScope?: AnswerScope | undefined;
+  scopeClosureReport?: ScopeClosureReport | undefined;
   collectedChunks: Array<{ id: string; versionId: string; text: string; headingPath: string | null; pageNumber: number | null; ordinal: number; parentChunkId?: string | null; documentTreeNodeId?: string | null; nodeType?: DocumentTreeNodeType | null }>;
   legacyChunks?: Array<{ id: string; versionId: string; text: string; headingPath: string | null; pageNumber: number | null; ordinal: number; parentChunkId?: string | null; documentTreeNodeId?: string | null; nodeType?: DocumentTreeNodeType | null }> | undefined;
   contextUnits?: ContextUnit[] | undefined;
@@ -971,6 +1167,9 @@ export interface PulseEvidenceMemory {
   usedIndexProfile?: ActiveIndexProfile | undefined;
   graphNodes: Array<{ id: string; title: string; summary: string }>;
   graphRelations: Array<{ id: string; type: RelationType; sourceTitle: string; targetTitle: string; reason: string }>;
+  aoriAspects?: Aspect[] | undefined;
+  aoriAspectItems?: AspectItem[] | undefined;
+  aoriAspectRelations?: AspectRelation[] | undefined;
   treeNodes?: DocumentTreeNode[] | undefined;
   parentChunks?: ParentChildChunk[] | undefined;
   summaryNodes?: SummaryTreeNode[] | undefined;
@@ -996,6 +1195,8 @@ export interface PulseAnswerOutput {
   evidenceStatus?: PulseEvidenceStatus | undefined;
   diagnostics?: {
     questionPlan?: PulseQuestionPlan | undefined;
+    answerScope?: AnswerScope | undefined;
+    scopeClosureReport?: ScopeClosureReport | undefined;
     retrievalSteps?: PulseEvidenceStep[] | undefined;
     citedChunkIds?: string[] | undefined;
     warnings?: string[] | undefined;
@@ -1222,6 +1423,8 @@ export const updateLibrarySettingsSchema = z.object({
   ocrMode: z.enum(ocrModes),
 });
 
+export const indexStrategySchema = z.enum(indexStrategies);
+
 export const updateAbstractNodeSchema = z.object({
   title: z.string().trim().min(1).max(180).optional(),
   summary: z.string().trim().max(2000).optional(),
@@ -1357,6 +1560,19 @@ export const citationLocatorSchema = z.object({
   validationWarnings: z.array(z.string().trim().min(1).max(300)).optional(),
 });
 
+export const answerScopeSchema = z.object({
+  question: z.string().trim().min(1).max(1000),
+  answerShape: z.enum(["summary", "list", "comparison", "timeline", "evidence", "relation", "numeric", "mixed"]),
+  targetLabels: z.array(z.string().trim().min(1).max(200)).default([]),
+  aspectIds: z.array(z.string().trim().min(1)).default([]),
+  aspectItemIds: z.array(z.string().trim().min(1)).default([]),
+  themeNodeIds: z.array(z.string().trim().min(1)).default([]),
+  centerNodeIds: z.array(z.string().trim().min(1)).default([]),
+  summaryNodeIds: z.array(z.string().trim().min(1)).default([]),
+  versionIds: z.array(z.string().trim().min(1)).default([]),
+  reasoning: z.string().trim().min(1).max(2000),
+});
+
 export const pulseQuestionPlanSchema = z.object({
   questionType: z.enum(["normal", "exhaustive_list", "numerical_aggregation", "timeline", "entity_relation", "causal_explanation", "claim_support", "summary", "critique", "comparison", "mixed"]),
   requiresExhaustiveEvidence: z.boolean(),
@@ -1370,6 +1586,7 @@ export const pulseQuestionPlanSchema = z.object({
   evidenceTargets: z.array(z.string().trim().min(1)).default([]),
   keyEntities: z.array(z.string().trim().min(1)).default([]),
   expectedEvidenceTypes: z.array(z.string().trim().min(1)).default([]),
+  answerScope: answerScopeSchema.optional(),
   riskLevel: z.enum(["low", "medium", "high"]),
   reasoning: z.string().trim().min(1).max(2000),
 });
@@ -1447,6 +1664,20 @@ export const pulseEvidenceGapSchema = z.object({
   severity: z.enum(["low", "medium", "high"]),
 });
 
+export const scopeClosureReportSchema = z.object({
+  status: z.enum(["closed", "open", "partial"]),
+  answerScope: answerScopeSchema,
+  nodeIds: z.array(z.string().trim().min(1)).default([]),
+  relationIds: z.array(z.string().trim().min(1)).default([]),
+  chunkIds: z.array(z.string().trim().min(1)).default([]),
+  aspectIds: z.array(z.string().trim().min(1)).default([]),
+  aspectItemIds: z.array(z.string().trim().min(1)).default([]),
+  aspectRelationIds: z.array(z.string().trim().min(1)).default([]),
+  gaps: z.array(pulseEvidenceGapSchema).default([]),
+  warnings: z.array(z.string().trim().min(1).max(500)).default([]),
+  generatedAt: z.string().trim().min(1),
+});
+
 export const pulseEvidenceStatusSchema = z.object({
   sufficient: z.boolean(),
   status: z.enum(["sufficient", "insufficient_context", "needs_gap_retrieval", "failed_reconciliation", "partial_answer_only"]),
@@ -1472,6 +1703,8 @@ export const pulseAnswerSchema = z.object({
   evidenceStatus: pulseEvidenceStatusSchema.optional(),
   diagnostics: z.object({
     questionPlan: pulseQuestionPlanSchema.optional(),
+    answerScope: answerScopeSchema.optional(),
+    scopeClosureReport: scopeClosureReportSchema.optional(),
     retrievalSteps: z.array(pulseEvidenceStepSchema).optional(),
     citedChunkIds: z.array(z.string()).optional(),
     warnings: z.array(z.string()).optional(),
@@ -1498,6 +1731,56 @@ export const searchSchema = z.object({
 
 export const modelStreamSchema = z.object({
   prompt: z.string().trim().min(1).max(8000),
+});
+
+export const reflectiveIndexReportSchema = z.object({
+  summary: z.string().trim().min(1).max(2000),
+  completenessRisk: z.enum(["none", ...aoriRiskLevels]),
+  warnings: z.array(z.string().trim().min(1).max(500)).default([]),
+  truncationCount: z.coerce.number().int().min(0).default(0),
+});
+
+export const aoriDocumentDraftSchema = z.object({
+  understanding: z.object({
+    summary: z.string().trim().min(1).max(4000),
+    centralQuestion: z.string().trim().min(1).max(1000),
+    centralNodeTitle: z.string().trim().min(1).max(240).optional(),
+    evidenceChunkIds: z.array(z.string().trim().min(1)).default([]),
+  }),
+  aspects: z.array(z.object({
+    title: z.string().trim().min(1).max(240),
+    summary: z.string().trim().min(1).max(3000),
+    centralQuestion: z.string().trim().min(1).max(1000),
+    items: z.array(z.object({
+      key: z.string().trim().min(1).max(100),
+      title: z.string().trim().min(1).max(240),
+      summary: z.string().trim().min(1).max(2000),
+      evidenceChunkIds: z.array(z.string().trim().min(1)).default([]),
+      sourceNodeIds: z.array(z.string().trim().min(1)).optional(),
+    })).default([]),
+    relations: z.array(z.object({
+      sourceKey: z.string().trim().min(1).max(100),
+      targetKey: z.string().trim().min(1).max(100),
+      relationTextInSource: z.string().trim().min(1).max(240).optional(),
+      normalizedRelation: z.string().trim().min(1).max(240).optional(),
+      baseRelation: z.enum(relationTypes).default("related_to"),
+      reason: z.string().trim().min(1).max(1000),
+      confidence: z.coerce.number().min(0).max(1).default(0.6),
+      evidenceChunkIds: z.array(z.string().trim().min(1)).default([]),
+    })).default([]),
+    gaps: z.array(z.object({
+      description: z.string().trim().min(1).max(1000),
+      severity: z.enum(["low", "medium", "high"]).default("medium"),
+      evidenceChunkIds: z.array(z.string().trim().min(1)).optional(),
+    })).optional(),
+  })).default([]),
+  selfQuestions: z.array(z.object({
+    question: z.string().trim().min(1).max(1000),
+    answer: z.string().trim().min(1).max(2000).optional(),
+    evidenceChunkIds: z.array(z.string().trim().min(1)).default([]),
+    status: z.enum(["answered", "gap", "unchecked"]).default("unchecked"),
+  })).default([]),
+  reflectiveReport: reflectiveIndexReportSchema,
 });
 
 export const extractionSchema = z.object({

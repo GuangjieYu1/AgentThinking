@@ -29,6 +29,12 @@ function model(): ModelProvider {
     configured: true,
     embed: async () => [],
     extract: async () => ({ nodes: [], relations: [] }),
+    extractAoriDocument: async () => ({
+      understanding: { summary: "ok", centralQuestion: "ok", evidenceChunkIds: [] },
+      aspects: [],
+      selfQuestions: [],
+      reflectiveReport: { summary: "ok", completenessRisk: "none", warnings: [], truncationCount: 0 },
+    }),
     precheckStatement: async () => ({ status: "supported", reason: "ok", suggestions: [] }),
     reconstructMapping: async () => "ok",
     auditMapping: async () => ({ status: "clean", summary: "ok", findings: [] }),

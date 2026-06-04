@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type {
+  AoriDocumentResponse,
   AuthSession,
   Citation,
   Document,
@@ -7,6 +8,7 @@ import type {
   GraphRulesSummary,
   GraphRuleTrace,
   IngestJob,
+  IndexStrategy,
   Library,
   LibraryStreamEvent,
   LibrarySettings,
@@ -331,7 +333,9 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const [refreshGraph, setRefreshGraph] = useState(0);
   const [activeWorkspace, setActiveWorkspace] = useState<"graph" | "timeline" | "analysis">("graph");
   const [analysis, setAnalysis] = useState<PublishedAnalysis>();
-  const [sourceView, setSourceView] = useState<{ structure: SourceStructure; text?: string; focus?: Citation }>();
+  const [sourceView, setSourceView] = useState<{ structure: SourceStructure; text?: string; focus?: Citation; aori?: AoriDocumentResponse }>();
+  const [indexStrategy, setIndexStrategy] = useState<IndexStrategy>("bottom_up_evidence");
+  const [recordIndexingRationale, setRecordIndexingRationale] = useState(false);
   const [mappingAuditView, setMappingAuditView] = useState<{
     versionId: string;
     documentName: string;
@@ -394,7 +398,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const upload = async (files: FileList | null) => {
     if (!files?.length) return;
     try {
-      await api.import(library.id, files);
+      await api.import(library.id, files, { indexStrategy, recordIndexingRationale });
       await reload();
     } catch (cause) {
       onError((cause as Error).message);
@@ -426,6 +430,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
       const text = mediaType === "text/markdown" || mediaType === "text/plain"
         ? await api.sourceText(versionId)
         : undefined;
+      const aori = await api.aori(versionId).catch(() => undefined);
       let resolvedFocus = focus;
       if (focus?.chunkId && focus.startLine == null) {
         const chunk = structure.chunks.find((item) => item.id === focus.chunkId);
@@ -441,7 +446,12 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
           };
         }
       }
-      setSourceView({ structure, ...(text !== undefined ? { text } : {}), ...(resolvedFocus ? { focus: resolvedFocus } : {}) });
+      setSourceView({
+        structure,
+        ...(text !== undefined ? { text } : {}),
+        ...(resolvedFocus ? { focus: resolvedFocus } : {}),
+        ...(aori ? { aori } : {}),
+      });
     } catch (cause) {
       onError((cause as Error).message);
     }
@@ -587,6 +597,23 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
                   <input type="file" multiple accept=".md,.markdown,.txt,.pdf,.doc,.docx" onChange={(event) => void upload(event.target.files)} />
                 </label>
               </div>
+            </div>
+            <div className="index-strategy-controls">
+              <label>
+                索引方式
+                <select value={indexStrategy} onChange={(event) => setIndexStrategy(event.target.value as IndexStrategy)}>
+                  <option value="bottom_up_evidence">自底向上证据索引</option>
+                  <option value="aspect_oriented_reflective">切面式反思索引</option>
+                </select>
+              </label>
+              <label className="checkbox-setting">
+                <input
+                  type="checkbox"
+                  checked={recordIndexingRationale}
+                  onChange={(event) => setRecordIndexingRationale(event.target.checked)}
+                />
+                记录索引生成理由
+              </label>
             </div>
             <label className="setting">
               扫描 PDF OCR
@@ -916,20 +943,40 @@ function MappingFindingComment({
   );
 }
 
-function SourcePreview({ view, onClose }: { view: { structure: SourceStructure; text?: string; focus?: Citation }; onClose: () => void }) {
+function SourcePreview({ view, onClose }: { view: { structure: SourceStructure; text?: string; focus?: Citation; aori?: AoriDocumentResponse }; onClose: () => void }) {
+  const [activeTab, setActiveTab] = useState<"source" | "aori">("source");
   const { metadata, links, chunks } = view.structure;
   const lines = view.text?.replace(/\r\n?/g, "\n").split("\n") ?? [];
+  const sourceBody = view.text === undefined ? (
+    <div className="source-chunks">{chunks.map((chunk) => (
+      <p className={view.focus?.chunkId === chunk.id ? "focused" : ""} key={chunk.id}>
+        {chunk.pageNumber ? `Page ${chunk.pageNumber}` : `Chunk ${chunk.ordinal + 1}`}: {chunk.text}
+      </p>
+    ))}</div>
+  ) : (
+    <pre className="source-text">{lines.map((line, index) => {
+      const number = index + 1;
+      const focused = view.focus?.startLine != null && number >= view.focus.startLine && number <= (view.focus.endLine ?? view.focus.startLine);
+      return <span className={focused ? "focused" : ""} key={number}><b>{number}</b>{line}{"\n"}</span>;
+    })}</pre>
+  );
   return (
     <div className="source-overlay">
       <section className="source-preview card">
         <header><h2>{metadata?.documentName ?? "来源预览"}</h2><button onClick={onClose}>关闭</button></header>
         {metadata?.title && <p className="source-title">解析标题：{metadata.title}</p>}
+        <div className="source-tabs">
+          <button className={activeTab === "source" ? "selected" : ""} type="button" onClick={() => setActiveTab("source")}>原文</button>
+          <button className={activeTab === "aori" ? "selected" : ""} type="button" onClick={() => setActiveTab("aori")}>AORI</button>
+        </div>
+        {activeTab === "source" ? <>
         {metadata?.frontmatterRaw && <><h3>Frontmatter</h3><pre>{metadata.frontmatterRaw}</pre></>}
         {links.length > 0 && <><h3>链接与块引用</h3><ul>{links.map((link) => <li key={link.id}>L{link.line} / {link.type}: {link.raw}</li>)}</ul></>}
-        {view.text === undefined ? (
+        {sourceBody}
+        {false && (view.text === undefined ? (
           <div className="source-chunks">{chunks.map((chunk) => (
             <p className={view.focus?.chunkId === chunk.id ? "focused" : ""} key={chunk.id}>
-              {chunk.pageNumber ? `第 ${chunk.pageNumber} 页` : `片段 ${chunk.ordinal + 1}`}：{chunk.text}
+              {chunk.pageNumber ? `Page ${chunk.pageNumber}` : `Chunk ${chunk.ordinal + 1}`}: {chunk.text}
             </p>
           ))}</div>
         ) : (
@@ -938,7 +985,80 @@ function SourcePreview({ view, onClose }: { view: { structure: SourceStructure; 
             const focused = view.focus?.startLine != null && number >= view.focus.startLine && number <= (view.focus.endLine ?? view.focus.startLine);
             return <span className={focused ? "focused" : ""} key={number}><b>{number}</b>{line}{"\n"}</span>;
           })}</pre>
-        )}
+        ))}
+        </> : <AoriPreview aori={view.aori} />}
+      </section>
+    </div>
+  );
+}
+
+function AoriPreview({ aori }: { aori: AoriDocumentResponse | undefined }) {
+  if (!aori) return <p className="muted">AORI unavailable.</p>;
+  if (!aori.available) return <p className="muted">{aori.message || "This document was not imported with AORI."}</p>;
+  return (
+    <div className="aori-preview">
+      <section>
+        <h3>全局理解</h3>
+        <p>{aori.understanding.summary}</p>
+        <small>{aori.understanding.centralQuestion}</small>
+      </section>
+      <section>
+        <h3>切面列表</h3>
+        {aori.aspects.map((aspect) => (
+          <article className="aori-aspect" key={aspect.id}>
+            <div className="aori-aspect-heading">
+              <strong>{aspect.title}</strong>
+              <span>{aspect.closureReport.status}</span>
+            </div>
+            <p>{aspect.summary}</p>
+            <small>{aspect.centralQuestion}</small>
+            <div className="aori-ve-grid">
+              <div>
+                <h4>V_A</h4>
+                <ul>{aspect.items.map((item) => <li key={item.id}><b>{item.title}</b><span>{item.summary}</span></li>)}</ul>
+              </div>
+              <div>
+                <h4>E_A</h4>
+                <ul>{aspect.relations.map((relation) => (
+                  <li key={relation.id}><b>{relation.relationName}</b><span>{relation.reason}</span></li>
+                ))}</ul>
+              </div>
+            </div>
+            {(aspect.closureReport.gaps.length > 0 || aspect.closureReport.warnings.length > 0) && (
+              <div className="aori-closure">
+                {aspect.closureReport.warnings.map((warning) => <p key={warning}>{warning}</p>)}
+                {aspect.closureReport.gaps.map((gap) => <p key={gap.id}>{gap.description}</p>)}
+              </div>
+            )}
+          </article>
+        ))}
+      </section>
+      <section>
+        <h3>文档内关系词表</h3>
+        <ul>{aori.relationLexicon.entries.map((entry) => (
+          <li key={entry.relationName}><b>{entry.relationName}</b><span>{entry.sourceExamples[0]?.quote}</span></li>
+        ))}</ul>
+      </section>
+      <section>
+        <h3>闭合性检查</h3>
+        <ul>{aori.closureReports.map((report) => (
+          <li key={report.id}><b>{report.status}</b><span>{report.warnings.join(" | ") || `${report.itemCount} nodes / ${report.relationCount} edges`}</span></li>
+        ))}</ul>
+      </section>
+      <section>
+        <h3>自提问题</h3>
+        <ul>{aori.selfQuestions.map((question) => <li key={question.id}><b>{question.question}</b><span>{question.answer}</span></li>)}</ul>
+      </section>
+      <section>
+        <h3>反思报告</h3>
+        <p>{aori.reflectiveReport.summary}</p>
+        {aori.reflectiveReport.warnings.map((warning) => <small key={warning}>{warning}</small>)}
+      </section>
+      <section>
+        <h3>索引生成理由</h3>
+        {aori.rationaleTrace.length > 0
+          ? <ul>{aori.rationaleTrace.map((trace) => <li key={trace.id ?? trace.summary}><b>{trace.decisionType}</b><span>{trace.summary}</span></li>)}</ul>
+          : <p className="muted">本次导入未记录索引生成理由。</p>}
       </section>
     </div>
   );

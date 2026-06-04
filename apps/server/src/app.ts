@@ -13,6 +13,7 @@ import {
   addStatementEvidenceSchema,
   aspectKinds,
   evidenceQuerySchema,
+  indexStrategySchema,
   loginSchema,
   modelStreamSchema,
   relationStatuses,
@@ -30,6 +31,7 @@ import {
   type RelationStatus,
   type RelationType,
   type AspectKind,
+  type IndexStrategy,
   type PulseStreamEvent,
   type SearchResult,
 } from "@agent-thinking/contracts";
@@ -273,27 +275,44 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     const libraryId = request.params.libraryId;
     requireLibrary(db, libraryId, request.user);
     const imported: Array<{ fileName: string; duplicate: boolean; jobId?: string }> = [];
-    for await (const part of request.files()) {
-      validateFileName(part.filename);
-      const buffer = await part.toBuffer();
+    let indexStrategy: IndexStrategy = "bottom_up_evidence";
+    let recordIndexingRationale = false;
+    const files: Array<{ filename: string; buffer: Buffer }> = [];
+    for await (const part of request.parts()) {
+      if (part.type === "file") {
+        validateFileName(part.filename);
+        files.push({ filename: part.filename, buffer: await part.toBuffer() });
+        continue;
+      }
+      if (part.fieldname === "indexStrategy") {
+        const parsed = indexStrategySchema.safeParse(String(part.value ?? ""));
+        if (parsed.success) indexStrategy = parsed.data;
+      } else if (part.fieldname === "recordIndexingRationale") {
+        const value = String(part.value ?? "").toLowerCase();
+        recordIndexingRationale = value === "true" || value === "1" || value === "yes";
+      }
+    }
+    for (const file of files) {
+      const buffer = file.buffer;
       const hash = contentHash(buffer);
-      const storagePath = join(config.filesDir, libraryId, hash, safeFileName(part.filename));
+      const storagePath = join(config.filesDir, libraryId, hash, safeFileName(file.filename));
       const { version, duplicate } = db.createDocumentVersion(
         libraryId,
-        part.filename,
-        mediaTypeFor(part.filename),
+        file.filename,
+        mediaTypeFor(file.filename),
         hash,
         storagePath,
+        { indexStrategy, recordIndexingRationale },
       );
       if (duplicate) {
-        imported.push({ fileName: part.filename, duplicate: true });
+        imported.push({ fileName: file.filename, duplicate: true });
         continue;
       }
       await mkdir(dirname(storagePath), { recursive: true });
       await writeFile(storagePath, buffer);
-      const job = db.createJob(libraryId, version.id);
+      const job = db.createJob(libraryId, version.id, { indexStrategy, recordIndexingRationale });
       queue.enqueue(job.id);
-      imported.push({ fileName: part.filename, duplicate: false, jobId: job.id });
+      imported.push({ fileName: file.filename, duplicate: false, jobId: job.id });
     }
     if (imported.length === 0) throw new Error("请选择至少一个文件");
     return reply.status(202).send(imported);
@@ -321,6 +340,12 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
       documentTree: db.getDocumentTreeForVersion(request.params.versionId),
       summaryTree: db.getSummaryTreeForVersion(request.params.versionId),
     };
+  });
+  app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/aori", async (request, reply) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+    requireLibrary(db, source.libraryId, request.user);
+    return db.getAoriDocumentIndex(request.params.versionId);
   });
   app.get<{ Params: { versionId: string } }>("/api/debug/versions/:versionId/v2-index-health", async (request) => {
     requireDebugAccess(config, request);
@@ -443,7 +468,10 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     if (!source) return reply.status(404).send({ error: "导入版本不存在" });
     requireLibrary(db, source.libraryId, request.user);
     db.updateVersionStatus(source.version.id, "queued");
-    const job = db.createJob(source.libraryId, source.version.id);
+    const job = db.createJob(source.libraryId, source.version.id, {
+      indexStrategy: source.version.indexStrategy,
+      recordIndexingRationale: source.version.recordIndexingRationale,
+    });
     queue.enqueue(job.id);
     return reply.status(202).send(job);
   });

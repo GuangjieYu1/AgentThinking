@@ -1,5 +1,6 @@
 import type {
   AbstractNodeKind,
+  AoriDocumentDraft,
   AoriIndexingStage,
   AoriRiskLevel,
   AspectKind,
@@ -26,6 +27,7 @@ import type {
 } from "@agent-thinking/contracts";
 import {
   abstractNodeKinds,
+  aoriDocumentDraftSchema,
   aspectKinds,
   extractionSchema,
   mappingAuditFindingKinds,
@@ -269,6 +271,111 @@ function cleanPulseEvidenceRows(rowsValue: unknown, allowedChunkIds: Set<string>
   });
 }
 
+function cleanAoriDraft(value: unknown, chunks: Chunk[]): AoriDocumentDraft {
+  const allowedChunkIds = new Set(chunks.map((chunk) => chunk.id));
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const rawUnderstanding = source.understanding && typeof source.understanding === "object" && !Array.isArray(source.understanding)
+    ? source.understanding as Record<string, unknown>
+    : {};
+  const fallbackSummary = chunks.map((chunk) => chunk.text).join("\n\n").slice(0, 1200) || "AORI 没有可用原文。";
+  const aspects = (Array.isArray(source.aspects) ? source.aspects : []).slice(0, 24).map((entry, aspectIndex) => {
+    const aspect = entry && typeof entry === "object" && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+    const rawItems = Array.isArray(aspect.items) ? aspect.items : [];
+    const items = rawItems.slice(0, 80).map((itemEntry, itemIndex) => {
+      const item = itemEntry && typeof itemEntry === "object" && !Array.isArray(itemEntry) ? itemEntry as Record<string, unknown> : {};
+      const evidenceChunkIds = safeEvidenceIds(item.evidenceChunkIds, allowedChunkIds);
+      const fallbackChunk = chunks.find((chunk) => evidenceChunkIds.includes(chunk.id)) ?? chunks[itemIndex % Math.max(1, chunks.length)];
+      return {
+        key: normalizedText(item.key, `a${aspectIndex + 1}_i${itemIndex + 1}`, 100),
+        title: normalizedText(item.title, fallbackChunk ? firstSentence(fallbackChunk.text, `切面条目 ${itemIndex + 1}`) : `切面条目 ${itemIndex + 1}`, 240),
+        summary: normalizedText(item.summary, fallbackChunk?.text.slice(0, 500) ?? "模型未提供条目摘要。", 2000),
+        evidenceChunkIds: evidenceChunkIds.length > 0 ? evidenceChunkIds : (fallbackChunk ? [fallbackChunk.id] : []),
+        sourceNodeIds: normalizedStringArray(item.sourceNodeIds),
+      };
+    });
+    const itemKeys = new Set(items.map((item) => item.key));
+    const relations = (Array.isArray(aspect.relations) ? aspect.relations : []).slice(0, 160).flatMap((relationEntry) => {
+      const relation = relationEntry && typeof relationEntry === "object" && !Array.isArray(relationEntry) ? relationEntry as Record<string, unknown> : {};
+      const sourceKey = typeof relation.sourceKey === "string" ? relation.sourceKey.trim() : "";
+      const targetKey = typeof relation.targetKey === "string" ? relation.targetKey.trim() : "";
+      if (!itemKeys.has(sourceKey) || !itemKeys.has(targetKey)) return [];
+      return [{
+        sourceKey,
+        targetKey,
+        relationTextInSource: typeof relation.relationTextInSource === "string" ? truncateText(relation.relationTextInSource.trim(), 240) : undefined,
+        normalizedRelation: typeof relation.normalizedRelation === "string" ? truncateText(relation.normalizedRelation.trim(), 240) : undefined,
+        baseRelation: relationTypes.includes(relation.baseRelation as RelationType) ? relation.baseRelation as RelationType : "related_to",
+        reason: normalizedText(relation.reason, "模型未提供关系理由。", 1000),
+        confidence: safeConfidence(relation.confidence),
+        evidenceChunkIds: safeEvidenceIds(relation.evidenceChunkIds, allowedChunkIds),
+      }];
+    });
+    return {
+      title: normalizedText(aspect.title, `切面 ${aspectIndex + 1}`, 240),
+      summary: normalizedText(aspect.summary, "模型未提供切面摘要。", 3000),
+      centralQuestion: normalizedText(aspect.centralQuestion, "该切面的中心问题是什么？", 1000),
+      items,
+      relations,
+      gaps: Array.isArray(aspect.gaps) ? aspect.gaps.slice(0, 20).flatMap((gapEntry) => {
+        const gap = gapEntry && typeof gapEntry === "object" && !Array.isArray(gapEntry) ? gapEntry as Record<string, unknown> : {};
+        const description = typeof gap.description === "string" ? gap.description.trim() : "";
+        if (!description) return [];
+        return [{
+          description: truncateText(description, 1000),
+          severity: gap.severity === "low" || gap.severity === "high" ? gap.severity : "medium" as const,
+          evidenceChunkIds: safeEvidenceIds(gap.evidenceChunkIds, allowedChunkIds),
+        }];
+      }) : [],
+    };
+  });
+  const fallbackAspect = aspects.length > 0 ? aspects : [{
+    title: "全局切面",
+    summary: fallbackSummary.slice(0, 1000),
+    centralQuestion: "这份文档的核心内容是什么？",
+    items: chunks.slice(0, 12).map((chunk, index) => ({
+      key: `fallback_${index + 1}`,
+      title: chunk.headingPath || firstSentence(chunk.text, `条目 ${index + 1}`),
+      summary: chunk.text.slice(0, 500),
+      evidenceChunkIds: [chunk.id],
+      sourceNodeIds: chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : [],
+    })),
+    relations: [],
+    gaps: [],
+  }];
+  return aoriDocumentDraftSchema.parse({
+    understanding: {
+      summary: normalizedText(rawUnderstanding.summary, fallbackSummary, 4000),
+      centralQuestion: normalizedText(rawUnderstanding.centralQuestion, "这份文档的核心问题是什么？", 1000),
+      centralNodeTitle: typeof rawUnderstanding.centralNodeTitle === "string" ? truncateText(rawUnderstanding.centralNodeTitle.trim(), 240) : undefined,
+      evidenceChunkIds: safeEvidenceIds(rawUnderstanding.evidenceChunkIds, allowedChunkIds),
+    },
+    aspects: fallbackAspect,
+    selfQuestions: (Array.isArray(source.selfQuestions) ? source.selfQuestions : []).slice(0, 24).flatMap((entry) => {
+      const question = entry && typeof entry === "object" && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+      const text = typeof question.question === "string" ? question.question.trim() : "";
+      if (!text) return [];
+      return [{
+        question: truncateText(text, 1000),
+        answer: typeof question.answer === "string" && question.answer.trim() ? truncateText(question.answer.trim(), 2000) : undefined,
+        evidenceChunkIds: safeEvidenceIds(question.evidenceChunkIds, allowedChunkIds),
+        status: question.status === "answered" || question.status === "gap" ? question.status : "unchecked",
+      }];
+    }),
+    reflectiveReport: {
+      summary: typeof (source.reflectiveReport as { summary?: unknown } | undefined)?.summary === "string"
+        ? (source.reflectiveReport as { summary: string }).summary
+        : "AORI draft 已完成基础反思检查。",
+      completenessRisk: ["none", "low", "medium", "high"].includes(String((source.reflectiveReport as { completenessRisk?: unknown } | undefined)?.completenessRisk))
+        ? (source.reflectiveReport as { completenessRisk: "none" | AoriRiskLevel }).completenessRisk
+        : "none",
+      warnings: normalizedStringArray((source.reflectiveReport as { warnings?: unknown } | undefined)?.warnings),
+      truncationCount: Number((source.reflectiveReport as { truncationCount?: unknown } | undefined)?.truncationCount ?? 0),
+    },
+  });
+}
+
 function firstSentence(text: string, fallback: string): string {
   return text.split(/[。\n.!?]/, 1)[0]?.trim() || fallback;
 }
@@ -426,6 +533,11 @@ export interface ModelProvider {
   readonly configured: boolean;
   embed(texts: string[]): Promise<number[][]>;
   extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>, options?: ExtractionRuleOptions): Promise<ExtractionOutput>;
+  extractAoriDocument(input: {
+    documentName: string;
+    chunks: Chunk[];
+    context: AoriExtractionContext;
+  }): Promise<AoriDocumentDraft>;
   precheckStatement(text: string, citations: Citation[]): Promise<StatementPrecheckOutput>;
   reconstructMapping(context: MappingAuditContext): Promise<string>;
   auditMapping(reconstruction: string, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<MappingAuditReview>;
@@ -553,6 +665,62 @@ export class FakeModelProvider implements ModelProvider {
       aspects: [...new Set(nodes.flatMap((node) => node.aspects))],
     }] : [];
     return finalizeExtractionOutput({ nodes, relations, themes }, chunks, undefined, { ...options, stage: "extraction" }).output;
+  }
+
+  async extractAoriDocument(input: {
+    documentName: string;
+    chunks: Chunk[];
+    context: AoriExtractionContext;
+  }): Promise<AoriDocumentDraft> {
+    const selected = input.chunks.slice(0, 16);
+    const items = selected.map((chunk, index) => ({
+      key: `item_${index + 1}`,
+      title: chunk.headingPath || firstSentence(chunk.text, `条目 ${index + 1}`),
+      summary: chunk.text.slice(0, 300),
+      evidenceChunkIds: [chunk.id],
+      sourceNodeIds: chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : [],
+    }));
+    const relations = items.slice(1).map((item, index) => ({
+      sourceKey: items[index]?.key ?? item.key,
+      targetKey: item.key,
+      relationTextInSource: "相邻叙述",
+      normalizedRelation: "相邻叙述",
+      baseRelation: "related_to" as const,
+      reason: "演示模型根据相邻材料生成的 AORI 关系。",
+      confidence: 0.55,
+      evidenceChunkIds: [...(items[index]?.evidenceChunkIds ?? []), ...item.evidenceChunkIds],
+    }));
+    return cleanAoriDraft({
+      understanding: {
+        summary: `${input.documentName} 的 AORI 全局理解。`,
+        centralQuestion: "这份文档的核心内容是什么？",
+        evidenceChunkIds: selected.flatMap((chunk) => [chunk.id]),
+      },
+      aspects: [{
+        title: "全局理解",
+        summary: "演示模型生成的切面，用于验证 AORI 独立产物保存和展示。",
+        centralQuestion: "文档整体表达了什么？",
+        items,
+        relations,
+        gaps: input.context.truncated ? [{
+          description: "当前 AORI 输入发生截断，部分范围需要人工复核。",
+          severity: input.context.risk,
+          evidenceChunkIds: [],
+        }] : [],
+      }],
+      selfQuestions: [{
+        question: "当前切面是否覆盖了主要证据？",
+        answer: input.context.truncated ? "存在截断风险，需要复核。": "已覆盖当前输入范围。",
+        evidenceChunkIds: selected.slice(0, 3).map((chunk) => chunk.id),
+        status: input.context.truncated ? "gap" : "answered",
+      }],
+      reflectiveReport: {
+        summary: input.context.truncated ? "AORI 输入发生截断。" : "AORI 输入未截断。",
+        completenessRisk: input.context.truncated ? input.context.risk : "none",
+        warnings: input.context.truncated ? ["AORI global reading used a truncated context group."] : [],
+        truncationCount: input.context.truncated ? 1 : 0,
+      },
+    }, input.chunks);
   }
 
   async precheckStatement(_text: string, citations: Citation[]): Promise<StatementPrecheckOutput> {
@@ -1022,6 +1190,64 @@ export class OpenAICompatibleProvider implements ModelProvider {
           { ...options, stage: "extraction" },
         ).output;
       }
+    }
+  }
+
+  async extractAoriDocument(input: {
+    documentName: string;
+    chunks: Chunk[];
+    context: AoriExtractionContext;
+  }): Promise<AoriDocumentDraft> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const evidence = input.chunks.map((chunk) => ({
+      id: chunk.id,
+      source: chunk.headingPath ?? (chunk.pageNumber ? `PDF page ${chunk.pageNumber}` : `chunk ${chunk.ordinal + 1}`),
+      ordinal: chunk.ordinal,
+      estimatedTokens: Math.max(1, Math.ceil(chunk.text.length / 4)),
+      text: chunk.text,
+    }));
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.1,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are building an Aspect-Oriented Reflective Index (AORI), not the legacy enum graph. " +
+            "Read the supplied large document context as a whole, then return JSON only. " +
+            "Every item, relation, self-question answer, and global understanding must cite evidenceChunkIds from the supplied evidence ids. " +
+            "Aspect relations must use sourceKey/targetKey from the same aspect items. " +
+            "The formal document relation name must come from relationTextInSource or normalizedRelation; baseRelation is only a compatibility enum. " +
+            "Do not invent relation names without source evidence. If coverage is incomplete, add gaps. " +
+            "Use Simplified Chinese for human-readable text. Return exactly this shape: " +
+            '{"understanding":{"summary":"...","centralQuestion":"...","centralNodeTitle":"...","evidenceChunkIds":["chunk-id"]},' +
+            '"aspects":[{"title":"...","summary":"...","centralQuestion":"...","items":[{"key":"i1","title":"...","summary":"...","evidenceChunkIds":["chunk-id"],"sourceNodeIds":["optional-tree-node-id"]}],' +
+            '"relations":[{"sourceKey":"i1","targetKey":"i2","relationTextInSource":"source phrase","normalizedRelation":"document relation name","baseRelation":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["chunk-id"]}],' +
+            '"gaps":[{"description":"...","severity":"low|medium|high","evidenceChunkIds":["chunk-id"]}]}],' +
+            '"selfQuestions":[{"question":"...","answer":"...","evidenceChunkIds":["chunk-id"],"status":"answered|gap|unchecked"}],' +
+            '"reflectiveReport":{"summary":"...","completenessRisk":"none|low|medium|high","warnings":["..."],"truncationCount":0}}',
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            documentName: input.documentName,
+            aoriContext: input.context,
+            evidence,
+          }),
+        },
+      ],
+      max_tokens: 12000,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{
+      choices: Array<{ message: { content: string } }>;
+    }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
+    const raw = response.choices[0]?.message.content ?? "{}";
+    try {
+      return cleanAoriDraft(parseJsonModelObject(raw), input.chunks);
+    } catch {
+      return cleanAoriDraft({}, input.chunks);
     }
   }
 

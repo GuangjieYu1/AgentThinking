@@ -74,9 +74,8 @@ describe("ingestion pipeline", () => {
     await enqueueAndComplete(queue, db.createJob(library.id, second.id).id);
 
     expect(model.calls.some((call) =>
-      call.aoriStage === "relation_extraction" &&
       call.primaryVersionIds.includes(first.id) &&
-      call.primaryVersionIds.includes(second.id),
+      call.candidateVersionIds.includes(second.id),
     )).toBe(true);
     db.close();
   });
@@ -91,7 +90,9 @@ describe("ingestion pipeline", () => {
     const tailMarker = "全文阅读尾部标记";
     const filePath = join(dir, "files", "long.md");
     await writeFile(filePath, `# Long\n开头\n${"完整上下文".repeat(900)}\n${tailMarker}`, "utf8");
-    const version = db.createDocumentVersion(library.id, "long.md", "text/markdown", "long", filePath).version;
+    const version = db.createDocumentVersion(library.id, "long.md", "text/markdown", "long", filePath, {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
     const model = new RecordingModelProvider();
     const queue = new IngestionQueue(db, new VectorStore(db), model, config);
 
@@ -122,7 +123,10 @@ describe("ingestion pipeline", () => {
     await mkdir(join(dir, "files"), { recursive: true });
     const filePath = join(dir, "files", "oversize.md");
     await writeFile(filePath, `# First\n${"甲".repeat(44000)}\n\n# Second\n${"乙".repeat(44000)}`, "utf8");
-    const version = db.createDocumentVersion(library.id, "oversize.md", "text/markdown", "oversize", filePath).version;
+    const version = db.createDocumentVersion(library.id, "oversize.md", "text/markdown", "oversize", filePath, {
+      indexStrategy: "aspect_oriented_reflective",
+      recordIndexingRationale: true,
+    }).version;
     const model = new RecordingModelProvider();
     const queue = new IngestionQueue(db, new VectorStore(db), model, config);
 
@@ -174,6 +178,21 @@ class RecordingModelProvider extends FakeModelProvider {
       chunkTexts: chunks.map((chunk) => chunk.text),
     });
     return { nodes: [], relations: [], themes: [] };
+  }
+
+  override async extractAoriDocument(...args: Parameters<FakeModelProvider["extractAoriDocument"]>) {
+    const input = args[0];
+    this.calls.push({
+      primaryVersionIds: input.chunks.map((chunk) => chunk.versionId),
+      candidateVersionIds: [],
+      aoriStage: input.context.stage,
+      usedTokenEstimate: input.context.usedTokenEstimate,
+      minTruncatedContextTokens: input.context.minTruncatedContextTokens,
+      truncated: input.context.truncated,
+      maxChunkTextLength: Math.max(0, ...input.chunks.map((chunk) => chunk.text.length)),
+      chunkTexts: input.chunks.map((chunk) => chunk.text),
+    });
+    return super.extractAoriDocument(...args);
   }
 }
 

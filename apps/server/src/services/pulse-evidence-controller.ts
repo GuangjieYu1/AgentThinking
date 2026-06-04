@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   AbstractNode,
   Chunk,
   ContextUnit,
@@ -24,6 +24,7 @@ import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
 import type { VectorStore } from "./vector-store.js";
 import { computeGenericReconciliation, normalizeAnswerMode, overclaimErrors, validateEvidenceRow } from "./evidence-v2.js";
+import { ScopeClosureRetriever, type ScopeClosureResult } from "./scope-closure.js";
 
 type PulseEventSink = (event: { type: "stage"; message: string }) => void | Promise<void>;
 
@@ -95,7 +96,7 @@ function clampScore(value: number): number {
 }
 
 function chunkLabel(chunk: Chunk): string {
-  return chunk.headingPath ?? (chunk.pageNumber ? `PDF 第 ${chunk.pageNumber} 页` : `片段 ${chunk.ordinal + 1}`);
+  return chunk.headingPath ?? (chunk.pageNumber ? `PDF page ${chunk.pageNumber}` : `Chunk ${chunk.ordinal + 1}`);
 }
 
 function relationLabel(relation: Relation, nodes: Map<string, AbstractNode>): string {
@@ -145,62 +146,8 @@ function rowDedupeKey(row: PulseEvidenceRow): string {
   return row.dedupeKey?.trim() || `${row.evidenceType}:${row.evidenceChunkId}:${row.evidenceQuote.trim()}`;
 }
 
-function structuredRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function numericValue(value: unknown): number | undefined {
-  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
-  return Number.isFinite(numeric) ? numeric : undefined;
-}
-
-function amountWan(row: PulseEvidenceRow): number | undefined {
-  if (row.evidenceType !== "amount") return undefined;
-  const value = structuredRecord(row.structuredValue);
-  return numericValue(value.normalizedAmountWan)
-    ?? numericValue(value.amountWan)
-    ?? numericValue(value.amount)
-    ?? numericValue(value.value);
-}
-
-function isDeclaredTotal(row: PulseEvidenceRow): boolean {
-  const value = structuredRecord(row.structuredValue);
-  if (row.role === "declared_total" || row.role === "stated_total") return true;
-  if (value.isDeclaredTotal === true) return true;
-  const role = typeof value.role === "string" ? value.role.toLowerCase() : "";
-  const kind = typeof value.kind === "string" ? value.kind.toLowerCase() : "";
-  return role.includes("declared") || role.includes("total") || kind.includes("declared") || kind.includes("total");
-}
-
 export function computePulseReconciliation(rows: PulseEvidenceRow[]): PulseEvidenceReconciliation | undefined {
-  const generic = computeGenericReconciliation(rows);
-  if (generic) return generic;
-  const amountRows = rows.filter((row) => amountWan(row) !== undefined);
-  if (amountRows.length === 0) return undefined;
-  const declaredTotals = amountRows.filter(isDeclaredTotal).map((row) => amountWan(row)!).filter(Number.isFinite);
-  const itemized = amountRows
-    .filter((row) => !isDeclaredTotal(row) && row.countedInAnswer !== false)
-    .map((row) => amountWan(row)!)
-    .filter(Number.isFinite);
-  if (declaredTotals.length === 0 && itemized.length === 0) return undefined;
-  const declaredTotal = declaredTotals.length > 0 ? declaredTotals[0] : undefined;
-  const itemizedSum = itemized.length > 0 ? itemized.reduce((sum, value) => sum + value, 0) : undefined;
-  const difference = declaredTotal !== undefined && itemizedSum !== undefined
-    ? Number((declaredTotal - itemizedSum).toFixed(6))
-    : undefined;
-  const closed = difference !== undefined ? Math.abs(difference) <= 0.0001 : false;
-  return {
-    ...(declaredTotal !== undefined ? { declaredTotal } : {}),
-    ...(itemizedSum !== undefined ? { itemizedSum: Number(itemizedSum.toFixed(6)) } : {}),
-    ...(difference !== undefined ? { difference } : {}),
-    unit: "万",
-    closed,
-    explanation: difference === undefined
-      ? "金额证据不足以同时得到声明总额和分项合计。"
-      : closed
-        ? "声明总额与分项合计在容差内闭合。"
-        : `声明总额与分项合计不一致，差额为 ${difference} 万。`,
-  };
+  return computeGenericReconciliation(rows);
 }
 
 export function verifyPulseAnswer(
@@ -215,27 +162,27 @@ export function verifyPulseAnswer(
   if (questionPlan.requiresSourceQuotes && memory.evidenceRows.length > 0) {
     const quotes = memory.evidenceRows.map((row) => row.evidenceQuote.trim()).filter(Boolean);
     if (!quotes.some((quote) => answer.includes(quote.slice(0, Math.min(24, quote.length))))) {
-      errors.push("回答缺少可核对的原文引用。");
+      errors.push("Answer is missing a verifiable source quote / 原文引用 / 完整.");
     }
   }
-  if (!evidenceStatus.sufficient && /全部|每一笔|完整|穷尽|所有|无遗漏|complete|all|every/i.test(answer)) {
-    errors.push("证据不足时不能声称完整、全部或无遗漏。");
+  if (!evidenceStatus.sufficient && /鍏ㄩ儴|姣忎竴绗攟瀹屾暣|绌峰敖|鎵€鏈墊鏃犻仐婕弢complete|all|every/i.test(answer)) {
+    errors.push("Insufficient evidence cannot support complete or exhaustive wording / 完整.");
   }
   errors.push(...overclaimErrors(answer, questionPlan, evidenceStatus.sufficient));
   const reconciliation = evidenceStatus.reconciliation;
   if (questionPlan.requiresNumericalReconciliation && reconciliation && !reconciliation.closed) {
     const diff = reconciliation.difference;
     if (diff === undefined || !answer.includes(String(diff))) {
-      errors.push("数值未闭合时必须披露声明总额、分项合计和差额。");
+      errors.push("Unclosed numeric evidence must expose declared total, itemized sum, and difference / 差额.");
     }
   }
   if (questionPlan.answerMustExposeGaps && evidenceStatus.gaps.length > 0) {
     const exposesGap = evidenceStatus.gaps.some((gap) => answer.includes(gap.description.slice(0, Math.min(18, gap.description.length))));
-    if (!exposesGap && !/缺口|不足|无法确认|仍需|gap|insufficient/i.test(answer)) {
-      errors.push("存在证据缺口时回答必须明确暴露缺口。");
+    if (!exposesGap && !/缂哄彛|涓嶈冻|鏃犳硶纭|浠嶉渶|gap|insufficient/i.test(answer)) {
+      errors.push("Evidence gaps must be explicitly exposed in the answer / 缺口.");
     }
   }
-  if (memory.evidenceRows.length === 0) warnings.push("没有结构化 EvidenceRow，回答只能作为保守摘要。");
+  if (memory.evidenceRows.length === 0) warnings.push("No structured EvidenceRows were extracted; answer must stay guarded.");
   return {
     passed: errors.length === 0,
     errors,
@@ -258,12 +205,15 @@ export class PulseEvidenceController {
     seedContext: PulseSeedContext,
     eventSink?: PulseEventSink,
   ): Promise<PulseEvidenceControllerResult> {
-    await eventSink?.({ type: "stage", message: "正在分析问题所需证据" });
-    const questionPlan = await this.model.analyzePulseQuestion(question, mode);
+    await eventSink?.({ type: "stage", message: "姝ｅ湪鍒嗘瀽闂鎵€闇€璇佹嵁" });
+    const analyzedQuestionPlan = await this.model.analyzePulseQuestion(question, mode);
+    const scopeClosure = new ScopeClosureRetriever(this.db).close(libraryId, question, analyzedQuestionPlan);
+    const questionPlan: PulseQuestionPlan = { ...analyzedQuestionPlan, answerScope: scopeClosure.answerScope };
     const memory = this.createMemory(question, questionPlan, seedContext);
     const hitMap = new Map<string, PendingPulseHit>();
     for (const hit of seedContext.hits) hitMap.set(`${hit.targetType}:${hit.targetId}`, hit);
 
+    this.applyScopeClosure(memory, scopeClosure, hitMap);
     await this.extractRowsForChunks(question, memory, "Seed evidence from the existing pulse graph.");
     const planned = await this.model.planPulseEvidence({
       question,
@@ -284,7 +234,7 @@ export class PulseEvidenceController {
     let status: PulseEvidenceStatus | undefined;
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-      await eventSink?.({ type: "stage", message: `正在执行证据检索第 ${iteration + 1} 轮` });
+      await eventSink?.({ type: "stage", message: `Running evidence retrieval iteration ${iteration + 1}` });
       const chunkIdsBeforeIteration = new Set(memory.collectedChunks.map((chunk) => chunk.id));
       const rowsBeforeIteration = memory.evidenceRows.length;
       const steps = this.validSteps(plan).slice(0, mode === "progressive" ? 5 : 8);
@@ -322,7 +272,7 @@ export class PulseEvidenceController {
       reasoning: "No sufficiency judgment was produced; answer must stay guarded.",
       ...(computePulseReconciliation(memory.evidenceRows) ? { reconciliation: computePulseReconciliation(memory.evidenceRows) } : {}),
     };
-    await eventSink?.({ type: "stage", message: "正在基于 EvidenceMemory 合成回答" });
+    await eventSink?.({ type: "stage", message: "Synthesizing answer from EvidenceMemory" });
     let output = await this.model.synthesizePulseAnswer({
       question,
       questionPlan,
@@ -332,7 +282,7 @@ export class PulseEvidenceController {
     output = this.attachDiagnostics(output, memory, finalStatus);
     let verification = verifyPulseAnswer(output, questionPlan, memory, finalStatus);
     if (!verification.passed && verification.rewriteInstructions) {
-      await eventSink?.({ type: "stage", message: "正在校验并收敛回答" });
+      await eventSink?.({ type: "stage", message: "Verifying and tightening the answer" });
       const rewritten = await this.model.rewritePulseAnswer({
         question,
         draft: output,
@@ -382,6 +332,87 @@ export class PulseEvidenceController {
       gaps: [],
       sufficiencyHistory: [],
     };
+  }
+
+  private applyScopeClosure(
+    memory: PulseEvidenceMemory,
+    closure: ScopeClosureResult,
+    hitMap: Map<string, PendingPulseHit>,
+  ): void {
+    memory.answerScope = closure.answerScope;
+    memory.scopeClosureReport = closure.report;
+    memory.questionPlan = { ...memory.questionPlan, answerScope: closure.answerScope };
+    this.addChunks(memory, closure.chunks);
+    this.addSummaryNodes(memory, closure.summaryNodes);
+
+    const graphNodeMap = new Map(memory.graphNodes.map((node) => [node.id, node]));
+    for (const node of closure.graphNodes) graphNodeMap.set(node.id, { id: node.id, title: node.title, summary: node.summary });
+    memory.graphNodes = [...graphNodeMap.values()];
+
+    const fullNodeMap = new Map(closure.graphNodes.map((node) => [node.id, node]));
+    const graphRelationMap = new Map(memory.graphRelations.map((relation) => [relation.id, relation]));
+    for (const relation of closure.graphRelations) {
+      const source = fullNodeMap.get(relation.sourceNodeId) ?? this.db.getAbstractNode(relation.sourceNodeId);
+      const target = fullNodeMap.get(relation.targetNodeId) ?? this.db.getAbstractNode(relation.targetNodeId);
+      graphRelationMap.set(relation.id, {
+        id: relation.id,
+        type: relation.type,
+        sourceTitle: source?.title ?? relation.sourceNodeId,
+        targetTitle: target?.title ?? relation.targetNodeId,
+        reason: relation.reason,
+      });
+      hitMap.set(`relation:${relation.id}`, {
+        targetType: "relation",
+        targetId: relation.id,
+        score: clampScore(relation.confidence ?? 0.58),
+        reason: "Scope Closure Retrieval",
+        pathRole: "expanded",
+        stepIndex: 0,
+        observation: "Scope Closure selected this relation inside the answer range.",
+        rationale: "The relation is part of the closed V/E scope and contributes evidence-bound edges.",
+        label: source && target ? `${source.title} ${relation.type} ${target.title}` : relation.type,
+        excerpt: relation.reason,
+      });
+    }
+    memory.graphRelations = [...graphRelationMap.values()];
+
+    const mergeById = <T extends { id: string }>(current: T[] | undefined, next: T[]): T[] => {
+      const values = new Map((current ?? []).map((item) => [item.id, item]));
+      for (const item of next) values.set(item.id, item);
+      return [...values.values()];
+    };
+    memory.aoriAspects = mergeById(memory.aoriAspects, closure.aoriAspects);
+    memory.aoriAspectItems = mergeById(memory.aoriAspectItems, closure.aoriAspectItems);
+    memory.aoriAspectRelations = mergeById(memory.aoriAspectRelations, closure.aoriAspectRelations);
+
+    const closureStep: PulseEvidenceStep = {
+      tool: "graphSearch",
+      query: memory.question,
+      purpose: "Scope Closure Retrieval",
+      expectedResult: "Question-scoped V/E graph and evidence-bound chunks.",
+    };
+    for (const chunk of closure.chunks) {
+      this.addChunkHit(hitMap, chunk, closureStep, -20);
+    }
+    memory.retrievalHistory.push({
+      tool: "graphSearch",
+      query: memory.question,
+      chunkIds: closure.chunks.map((chunk) => chunk.id),
+      purpose: "Scope Closure Retrieval",
+    });
+    memory.retrievalTrace?.push({
+      stepIndex: 0,
+      tool: "graphSearch",
+      purpose: "Scope Closure Retrieval",
+      query: memory.question,
+      inputIds: closure.answerScope.targetLabels,
+      outputIds: closure.chunks.map((chunk) => chunk.id),
+      targetType: "legacy_chunk",
+      newEvidenceRowCount: 0,
+      status: closure.chunks.length > 0 ? "success" : "empty",
+    });
+    if (closure.report.gaps.length > 0) memory.gaps = closure.report.gaps;
+    memory.currentFindings.push(`Scope Closure ${closure.report.status}: ${closure.report.chunkIds.length} chunks, ${closure.report.nodeIds.length} nodes, ${closure.report.aspectIds.length} AORI aspects.`);
   }
 
   private validSteps(plan: PulseEvidencePlan): PulseEvidenceStep[] {
@@ -729,8 +760,8 @@ export class PulseEvidenceController {
         reason: "Evidence controller graph expansion",
         pathRole: "expanded",
         stepIndex: 20 + iteration,
-        observation: "证据控制器沿已知节点展开相邻关系。",
-        rationale: "相邻关系可帮助定位更多来源 chunk，但不会自动变成强证据。",
+        observation: "Evidence controller expanded neighboring relations from known nodes.",
+        rationale: "Neighbor relations can locate source chunks but do not automatically become strong evidence.",
         label: relationLabel(relation, realNodes),
         excerpt: relation.reason,
       });
@@ -760,8 +791,8 @@ export class PulseEvidenceController {
         reason: "Evidence controller graph context",
         pathRole: "expanded",
         stepIndex: 20 + iteration,
-        observation: "证据控制器从图谱标题与摘要寻找相关节点。",
-        rationale: "节点本身只是检索入口，回答仍以来源 chunk 和 EvidenceRow 为准。",
+        observation: "Evidence controller found graph nodes matching the query.",
+        rationale: "Graph nodes are retrieval entries; source chunks and EvidenceRows remain authoritative.",
         label: node.title,
         excerpt: node.summary.slice(0, 220) || null,
       });
@@ -947,8 +978,8 @@ export class PulseEvidenceController {
       reason: `Evidence controller ${step.tool}`,
       pathRole: "expanded",
       stepIndex: 20 + iteration,
-      observation: `证据控制器执行 ${step.tool}：${step.purpose}`,
-      rationale: "该 chunk 进入 EvidenceMemory，后续抽取 EvidenceRow 并接受充分性判断。",
+      observation: `Evidence controller executed ${step.tool}: ${step.purpose}`,
+      rationale: "This chunk entered EvidenceMemory for EvidenceRow extraction and sufficiency judgment.",
       label: chunkLabel(chunk),
       excerpt: chunk.text.slice(0, 220),
     });
@@ -984,6 +1015,9 @@ export class PulseEvidenceController {
       contextUnits: (memory.contextUnits ?? []).slice(0, 40),
       retrievalUnits: (memory.retrievalUnits ?? []).slice(0, 80),
       contextBlocks: (memory.contextBlocks ?? []).slice(0, 120),
+      aoriAspects: (memory.aoriAspects ?? []).slice(0, 12),
+      aoriAspectItems: (memory.aoriAspectItems ?? []).slice(0, 80),
+      aoriAspectRelations: (memory.aoriAspectRelations ?? []).slice(0, 80),
       evidenceRows: memory.evidenceRows.slice(0, 120),
       currentFindings: memory.currentFindings.slice(-20),
       retrievalHistory: memory.retrievalHistory.slice(-30),
@@ -1011,6 +1045,8 @@ export class PulseEvidenceController {
           expectedResult: "Retrieved source chunks for EvidenceMemory.",
         })),
         citedChunkIds: memory.citedChunkIds,
+        answerScope: memory.answerScope,
+        scopeClosureReport: memory.scopeClosureReport,
         warnings: [...(output.diagnostics?.warnings ?? []), ...warnings],
       },
     };
@@ -1060,6 +1096,8 @@ export class PulseEvidenceController {
       answerModeReason: answerMode.reason,
       answerModeOverridden: answerMode.overridden,
       questionPlan: memory.questionPlan,
+      answerScope: memory.answerScope,
+      scopeClosureReport: memory.scopeClosureReport,
       usedIndexProfile: memory.usedIndexProfile ?? "v1",
       sufficiencyHistory: memory.sufficiencyHistory,
       contextUnits: memory.contextUnits ?? [],
@@ -1089,15 +1127,15 @@ export class PulseEvidenceController {
     evidenceStatus: PulseEvidenceStatus,
     verification: PulseVerificationResult,
   ): PulseAnswerOutput {
-    const facts = memory.evidenceRows.slice(0, 6).map((row) => `- ${row.claimText}（${row.evidenceQuote}）`).join("\n");
+    const facts = memory.evidenceRows.slice(0, 6).map((row) => `- ${row.claimText}: ${row.evidenceQuote}`).join("\n");
     const gaps = evidenceStatus.gaps.map((gap) => `- ${gap.description}`).join("\n");
     return this.attachDiagnostics({
       answer: [
-        `当前证据不足以完整回答“${question}”。`,
-        facts ? `可确认的部分事实：\n${facts}` : "尚未抽取到可引用的结构化事实。",
-        gaps ? `仍存在的证据缺口：\n${gaps}` : "仍需补充更多可引用来源后再作结论。",
+        `Current evidence is insufficient to answer completely: ${question}`,
+        facts ? `Confirmed partial facts:\n${facts}` : "No citeable structured facts were extracted.",
+        gaps ? `Remaining evidence gaps:\n${gaps}` : "More citeable sources are needed before drawing a conclusion.",
       ].join("\n\n"),
-      summary: "证据校验未通过，已返回保守回答。",
+      summary: "Evidence verification did not pass; returned a guarded answer.",
     }, memory, evidenceStatus, verification.errors);
   }
 }

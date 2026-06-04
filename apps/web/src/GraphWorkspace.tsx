@@ -24,9 +24,13 @@ import {
   aspectKinds,
   relationStatuses,
   relationTypes,
+  type AoriGraphEdge,
+  type AoriGraphNode,
+  type AoriGraphView,
   type AbstractNode,
   type AspectKind,
   type Citation,
+  type Document,
   type DocumentTreeNode,
   type EvidencePack,
   type GraphEdge,
@@ -48,11 +52,13 @@ import {
 } from "@agent-thinking/contracts";
 import { api } from "./api";
 
-type VisualNode = Node<{ label: ReactNode; entity: GraphNode }>;
-type VisualEdge = Edge<{ entity: GraphEdge }>;
+type VisualNode = Node<{ label: ReactNode; entity?: GraphNode; aori?: AoriGraphNode }>;
+type VisualEdge = Edge<{ entity?: GraphEdge; aori?: AoriGraphEdge }>;
 type LayoutMode = "layered" | "network" | "tree";
 type PulseLayerMode = "normal" | "current" | "stats" | "wrong" | "correct";
 type WorkspaceViewMode = "graph" | "evidence" | "document" | "retrieval" | "governance";
+type GraphSurfaceMode = "legacy" | "aori_overview" | "aori_detail" | "hybrid";
+type AoriGraphMode = AoriGraphView["layoutHints"]["mode"];
 interface RuleGovernanceFeed {
   stage?: GraphRuleStage;
   summary?: GraphRulesSummary;
@@ -141,13 +147,31 @@ const edgeTypes = {
 } satisfies EdgeTypes;
 
 const aspectLabels: Record<AspectKind, string> = {
+  entity: "实体",
   person: "人物",
+  organization: "组织",
+  place: "地点",
+  object: "对象",
+  event: "事件",
+  timeline: "时间线",
+  causality: "因果",
+  state_change: "状态变化",
+  amount: "数值",
+  evidence: "证据",
+  argument: "论证",
+  counterargument: "反论证",
+  finding: "认定",
+  method: "方法",
+  experiment: "实验",
+  result: "结果",
+  limitation: "限制",
   operation: "操作",
   system: "系统",
   story: "事件",
   claim: "命题",
   conflict: "冲突",
-  time: "时间",
+  question: "问题",
+  gap: "缺口",
   other: "其他",
 };
 
@@ -179,8 +203,53 @@ const workspaceViewLabels: Record<WorkspaceViewMode, string> = {
   governance: "治理",
 };
 
+const graphSurfaceLabels: Record<GraphSurfaceMode, string> = {
+  legacy: "Legacy",
+  aori_overview: "AORI 概览",
+  aori_detail: "AORI 细节",
+  hybrid: "Hybrid",
+};
+
+const aoriNodeTypeLabels: Record<AoriGraphNode["type"], string> = {
+  document_center: "文档中心",
+  aspect: "切面",
+  aspect_item: "切面项",
+  relation: "关系",
+  gap: "缺口",
+  self_question: "自问",
+  source_chunk: "原文片段",
+  warning: "告警",
+};
+
+const evidenceStatusLabels = {
+  supported: "supported",
+  partially_supported: "partial",
+  unsupported: "unsupported",
+  disputed: "disputed",
+} satisfies Record<NonNullable<AoriGraphNode["evidenceStatus"]>, string>;
+
+const closureStatusLabels = {
+  closed: "closed",
+  partial: "partial",
+  open: "open",
+} satisfies Record<NonNullable<AoriGraphNode["closureStatus"]>, string>;
+
 const pulseInitialRevealDelayMs = 455;
 const pulseRevealDelayMs = 1050;
+
+function isAoriGraphMode(mode: GraphSurfaceMode): mode is Exclude<GraphSurfaceMode, "legacy"> {
+  return mode !== "legacy";
+}
+
+function aoriModeFromSurface(mode: Exclude<GraphSurfaceMode, "legacy">): AoriGraphMode {
+  if (mode === "aori_overview") return "overview";
+  if (mode === "aori_detail") return "detail";
+  return "hybrid";
+}
+
+function confidenceText(confidence: number | undefined): string | undefined {
+  return typeof confidence === "number" ? `${Math.round(confidence * 100)}%` : undefined;
+}
 
 function relationColor(status: RelationStatus): string {
   if (status === "suggested") return "#e7a93c";
@@ -851,14 +920,176 @@ function displayEdges(records: GraphEdge[], layout: LayoutMode, pulseMode: Pulse
   });
 }
 
+function aoriNodeMeta(record: AoriGraphNode): string {
+  return [
+    record.kind ? aspectLabels[record.kind] : aoriNodeTypeLabels[record.type],
+    record.domainKind && record.domainKind !== "unknown" ? record.domainKind : undefined,
+    record.evidenceStatus ? evidenceStatusLabels[record.evidenceStatus] : undefined,
+    record.fallbackOnly ? "fallback" : undefined,
+    record.closureStatus ? closureStatusLabels[record.closureStatus] : undefined,
+    confidenceText(record.confidence),
+  ].filter(Boolean).slice(0, 5).join(" · ");
+}
+
+function aoriNodeClass(record: AoriGraphNode, collapsedNodeIds: ReadonlySet<string>): string {
+  return [
+    "flow-aori",
+    `flow-aori-${record.type.replaceAll("_", "-")}`,
+    record.evidenceStatus ? `flow-aori-evidence-${record.evidenceStatus.replaceAll("_", "-")}` : "",
+    record.closureStatus ? `flow-aori-closure-${record.closureStatus}` : "",
+    record.fallbackOnly ? "flow-aori-fallback-only" : "",
+    collapsedNodeIds.has(record.id) ? "flow-aori-collapsed" : "",
+  ].filter(Boolean).join(" ");
+}
+
+function aoriNodeWidth(record: AoriGraphNode): number {
+  if (record.type === "document_center") return 280;
+  if (record.type === "aspect") return 250;
+  if (record.type === "source_chunk") return 220;
+  return 235;
+}
+
+function aoriNodeOrder(record: AoriGraphNode, graph: AoriGraphView): string {
+  const groupIndex = graph.groups.findIndex((group) => group.nodeIds.includes(record.id));
+  const typeRank = {
+    document_center: 0,
+    aspect: 1,
+    aspect_item: 2,
+    relation: 3,
+    gap: 4,
+    self_question: 5,
+    source_chunk: 6,
+    warning: 7,
+  } satisfies Record<AoriGraphNode["type"], number>;
+  return [
+    String(groupIndex < 0 ? 9999 : groupIndex).padStart(4, "0"),
+    String(typeRank[record.type]).padStart(2, "0"),
+    record.label,
+    record.id,
+  ].join(":");
+}
+
+function aoriVisualNodes(graph: AoriGraphView): VisualNode[] {
+  const collapsedNodeIds = new Set(graph.layoutHints.collapsedNodeIds);
+  const positions = new Map<string, { x: number; y: number }>();
+  const center = graph.nodes.find((node) => node.id === graph.layoutHints.centerNodeId) ?? graph.centerNode;
+
+  if (graph.layoutHints.mode === "overview") {
+    positions.set(center.id, { x: 360, y: 280 });
+    const aspects = graph.nodes
+      .filter((node) => node.type === "aspect")
+      .sort((left, right) => aoriNodeOrder(left, graph).localeCompare(aoriNodeOrder(right, graph), "zh-CN"));
+    const radiusX = Math.max(360, Math.min(620, 300 + aspects.length * 16));
+    const radiusY = Math.max(210, Math.min(430, 180 + aspects.length * 11));
+    aspects.forEach((node, index) => {
+      const angle = aspects.length === 1 ? 0 : (-Math.PI / 2) + (index * Math.PI * 2 / aspects.length);
+      positions.set(node.id, {
+        x: 360 + Math.cos(angle) * radiusX,
+        y: 280 + Math.sin(angle) * radiusY,
+      });
+    });
+  } else {
+    const layers = new Map<number, AoriGraphNode[]>();
+    for (const node of graph.nodes) {
+      const layer = graph.layoutHints.layers[node.id] ?? 0;
+      const bucket = layers.get(layer) ?? [];
+      bucket.push(node);
+      layers.set(layer, bucket);
+    }
+    [...layers.entries()].forEach(([layerIndex, layerNodes]) => {
+      layerNodes.sort((left, right) => aoriNodeOrder(left, graph).localeCompare(aoriNodeOrder(right, graph), "zh-CN"));
+      const rowGap = layerNodes.some((node) => node.type === "source_chunk") ? 118 : 146;
+      layerNodes.forEach((node, rowIndex) => {
+        positions.set(node.id, {
+          x: layerIndex * 330,
+          y: 310 + (rowIndex - ((layerNodes.length - 1) / 2)) * rowGap,
+        });
+      });
+    });
+  }
+
+  return graph.nodes.map((record) => {
+    const point = positions.get(record.id) ?? { x: 0, y: 0 };
+    const meta = aoriNodeMeta(record);
+    return {
+      id: record.id,
+      position: point,
+      sourcePosition: graph.layoutHints.mode === "overview" ? Position.Right : Position.Right,
+      targetPosition: graph.layoutHints.mode === "overview" ? Position.Left : Position.Left,
+      data: {
+        aori: record,
+        label: (
+          <div className="flow-label flow-aori-label">
+            <span>{record.label}</span>
+            {meta && <small>{meta}</small>}
+          </div>
+        ),
+      },
+      className: aoriNodeClass(record, collapsedNodeIds),
+      style: {
+        width: aoriNodeWidth(record),
+        minHeight: record.type === "source_chunk" ? 58 : 72,
+        borderRadius: 8,
+      },
+    };
+  });
+}
+
+function aoriEdgeColor(record: AoriGraphEdge): string {
+  if (record.type === "relates") return "#a8b2ff";
+  if (record.type === "evidence") return "#64748b";
+  if (record.type === "has_gap") return "#ef8fa5";
+  if (record.type === "asks") return "#f0c86d";
+  if (record.type === "warning" || record.evidenceStatus === "unsupported") return "#e7ba63";
+  return "#56c7b0";
+}
+
+function displayAoriEdges(graph: AoriGraphView): VisualEdge[] {
+  return graph.edges.map((record) => {
+    const warning = record.type === "warning" || record.evidenceStatus === "unsupported" || record.closureStatus === "open";
+    const edge: VisualEdge = {
+      id: record.id,
+      source: record.source,
+      target: record.target,
+      type: graph.layoutHints.mode === "overview" ? "default" : "smoothstep",
+      data: { aori: record },
+      label: record.domainRelation || record.label,
+      animated: warning,
+      className: `flow-aori-edge flow-aori-edge-${record.type.replaceAll("_", "-")}`,
+      style: {
+        stroke: aoriEdgeColor(record),
+        strokeWidth: record.type === "relates" ? 2.8 : record.type === "evidence" ? 1.5 : 2.2,
+        opacity: record.type === "evidence" ? 0.72 : 0.95,
+        ...(warning || record.type === "evidence" ? { strokeDasharray: "5 4" } : {}),
+      },
+      labelStyle: { fill: "#c7d4e7", fontSize: 12, fontWeight: 700 },
+    };
+    if (record.type !== "evidence") edge.markerEnd = { type: MarkerType.ArrowClosed };
+    return edge;
+  });
+}
+
+function miniMapNodeColor(node: Node): string {
+  const className = String(node.className ?? "");
+  if (className.includes("flow-aori-document-center")) return "#56c7b0";
+  if (className.includes("flow-aori-aspect")) return "#f0c86d";
+  if (className.includes("flow-aori-gap") || className.includes("unsupported")) return "#ef8fa5";
+  if (className.includes("flow-aori-source-chunk")) return "#64748b";
+  if (className.includes("flow-chunk")) return "#56627c";
+  if (className.includes("flow-theme")) return "#cb9b54";
+  return "#40bca2";
+}
+
 export function GraphWorkspace({
   libraryId,
+  documents,
   refreshKey,
   ruleGovernanceFeed,
   onError,
   onOpenCitation,
 }: {
   libraryId: string;
+  documents: Document[];
   refreshKey: number;
   ruleGovernanceFeed: RuleGovernanceFeed;
   onError: (message: string) => void;
@@ -873,8 +1104,19 @@ export function GraphWorkspace({
   const [selected, setSelected] = useState<GraphNode>();
   const [selectedRelation, setSelectedRelation] = useState<Relation>();
   const [selectedAggregate, setSelectedAggregate] = useState<GraphEdge["aggregate"]>();
+  const [selectedAoriNode, setSelectedAoriNode] = useState<AoriGraphNode>();
+  const [selectedAoriEdge, setSelectedAoriEdge] = useState<AoriGraphEdge>();
   const [view, setView] = useState<GraphView>("detail");
   const [viewMode, setViewMode] = useState<WorkspaceViewMode>("graph");
+  const [graphMode, setGraphMode] = useState<GraphSurfaceMode>(() =>
+    documents.some((document) => document.latestVersion?.status === "completed" && document.latestVersion.indexStrategy === "aspect_oriented_reflective")
+      ? "aori_overview"
+      : "legacy",
+  );
+  const [aoriVersionId, setAoriVersionId] = useState<string | undefined>(() =>
+    documents.find((document) => document.latestVersion?.status === "completed" && document.latestVersion.indexStrategy === "aspect_oriented_reflective")?.latestVersion?.id,
+  );
+  const [aoriGraph, setAoriGraph] = useState<AoriGraphView>();
   const [layout, setLayout] = useState<LayoutMode>("layered");
   const [focusedNodeId, setFocusedNodeId] = useState<string>();
   const [status, setStatus] = useState<RelationStatus | "">("");
@@ -904,8 +1146,23 @@ export function GraphWorkspace({
   const activeLibraryIdRef = useRef(libraryId);
   const graphRequestSeqRef = useRef(0);
   const pendingFocusNodeIdRef = useRef<string | undefined>(undefined);
+  const aoriDefaultAppliedRef = useRef(false);
   activeLibraryIdRef.current = libraryId;
   const visibleCurrentPulse = currentPulse?.pulse.libraryId === libraryId ? currentPulse : undefined;
+  const isAoriMode = isAoriGraphMode(graphMode);
+  const activeAoriMode = isAoriMode ? aoriModeFromSurface(graphMode) : undefined;
+  const aoriDocuments = useMemo(
+    () => documents.filter((document) =>
+      document.libraryId === libraryId &&
+      document.latestVersion?.status === "completed" &&
+      document.latestVersion.indexStrategy === "aspect_oriented_reflective",
+    ),
+    [documents, libraryId],
+  );
+  const activeAoriDocument = useMemo(
+    () => aoriDocuments.find((document) => document.latestVersion?.id === aoriVersionId) ?? aoriDocuments[0],
+    [aoriDocuments, aoriVersionId],
+  );
   const activePulseHistory = useMemo(
     () => pulseHistory.filter((pulse) => pulse.libraryId === libraryId),
     [pulseHistory, libraryId],
@@ -974,8 +1231,63 @@ export function GraphWorkspace({
     }
   };
 
+  const applyAoriGraph = (graph: AoriGraphView) => {
+    setAoriGraph(graph);
+    setRecords([]);
+    setEdgeRecords([]);
+    setAspectFilter(undefined);
+    setSelected(undefined);
+    setSelectedRelation(undefined);
+    setSelectedAggregate(undefined);
+    setSelectedAoriNode((current) => current ? graph.nodes.find((node) => node.id === current.id) : undefined);
+    setSelectedAoriEdge((current) => current ? graph.edges.find((edge) => edge.id === current.id) : undefined);
+    setNodes(aoriVisualNodes(graph));
+    setEdges(displayAoriEdges(graph));
+  };
+
+  const loadAoriGraph = async (mode: AoriGraphMode = activeAoriMode ?? "overview") => {
+    const requestLibraryId = libraryId;
+    const requestVersionId = aoriVersionId;
+    if (!requestVersionId) {
+      setAoriGraph(undefined);
+      setNodes([]);
+      setEdges([]);
+      return undefined;
+    }
+    const requestSeq = graphRequestSeqRef.current + 1;
+    graphRequestSeqRef.current = requestSeq;
+    try {
+      const graph = await api.aoriGraph(requestVersionId, mode);
+      if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return undefined;
+      applyAoriGraph(graph);
+      return graph;
+    } catch (cause) {
+      if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return undefined;
+      onError((cause as Error).message);
+      return undefined;
+    }
+  };
+
   useEffect(() => {
-    if (!flowInstance || records.length === 0) return;
+    const firstAoriVersionId = aoriDocuments[0]?.latestVersion?.id;
+    if (!firstAoriVersionId) {
+      aoriDefaultAppliedRef.current = false;
+      setAoriVersionId(undefined);
+      setAoriGraph(undefined);
+      if (isAoriMode) setGraphMode("legacy");
+      return;
+    }
+    setAoriVersionId((current) =>
+      current && aoriDocuments.some((document) => document.latestVersion?.id === current) ? current : firstAoriVersionId,
+    );
+    if (!aoriDefaultAppliedRef.current) {
+      aoriDefaultAppliedRef.current = true;
+      if (graphMode === "legacy") setGraphMode("aori_overview");
+    }
+  }, [aoriDocuments, graphMode, isAoriMode]);
+
+  useEffect(() => {
+    if (!flowInstance || nodes.length === 0) return;
     const focusNodeId = pendingFocusNodeIdRef.current;
     window.requestAnimationFrame(() => {
       if (focusNodeId) {
@@ -991,7 +1303,7 @@ export function GraphWorkspace({
       }
       void flowInstance.fitView({ padding: 0.16, minZoom: 0.35, maxZoom: 1.18 });
     });
-  }, [flowInstance, records, layout]);
+  }, [flowInstance, nodes.length, layout, graphMode, aoriGraph?.layoutHints.mode]);
 
   useEffect(() => {
     if (pulseMode !== "current" || !visibleCurrentPulse || !pulsePlaying) return;
@@ -1006,18 +1318,20 @@ export function GraphWorkspace({
   }, [pulseMode, visibleCurrentPulse?.pulse.id, pulsePlaying, pulseRevealCount, currentPulsePlaybackSteps.length]);
 
   useEffect(() => {
+    if (isAoriMode) return;
     if (records.length === 0) return;
     const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, visibleCurrentPulse, pulseRevealCount);
     setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, pulseMode, searchFocus));
     setEdges(displayEdges(visibleGraph.edges, layout, pulseMode));
-  }, [pulseMode, pulseRevealCount, visibleCurrentPulse?.pulse.id, records, edgeRecords, layout, aspect, searchFocus]);
+  }, [isAoriMode, pulseMode, pulseRevealCount, visibleCurrentPulse?.pulse.id, records, edgeRecords, layout, aspect, searchFocus]);
 
   useEffect(() => {
+    if (isAoriMode) return;
     if (!pulsing || visibleCurrentPulse || pulseStreamHits.length === 0 || records.length === 0) return;
     const visibleGraph = decoratePulseStreamGraph(records, edgeRecords, pulseStreamHits);
     setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, "current", searchFocus));
     setEdges(displayEdges(visibleGraph.edges, layout, "current"));
-  }, [pulsing, visibleCurrentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect, searchFocus]);
+  }, [isAoriMode, pulsing, visibleCurrentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect, searchFocus]);
 
   useEffect(() => {
     if (viewMode !== "document" || documentTree.length > 0 || documentTreeLoading) return;
@@ -1059,11 +1373,14 @@ export function GraphWorkspace({
     setSelected(undefined);
     setSelectedRelation(undefined);
     setSelectedAggregate(undefined);
+    setSelectedAoriNode(undefined);
+    setSelectedAoriEdge(undefined);
     setResults([]);
     setActiveSearchChunkId(undefined);
     setRecords([]);
     setEdgeRecords([]);
     setAspectFilter(undefined);
+    setAoriGraph(undefined);
     setNodes([]);
     setEdges([]);
     void api.pulses(requestLibraryId)
@@ -1084,10 +1401,18 @@ export function GraphWorkspace({
     setSelected(undefined);
     setSelectedRelation(undefined);
     setSelectedAggregate(undefined);
+    setSelectedAoriNode(undefined);
+    setSelectedAoriEdge(undefined);
     setResults([]);
     setActiveSearchChunkId(undefined);
+    if (isAoriMode) {
+      setFocusedNodeId(undefined);
+      void loadAoriGraph(activeAoriMode ?? "overview");
+      return;
+    }
+    setAoriGraph(undefined);
     void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view, [], undefined);
-  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, visibleCurrentPulse?.pulse.id]);
+  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, visibleCurrentPulse?.pulse.id, isAoriMode, activeAoriMode, aoriVersionId]);
 
   useEffect(() => {
     if (selected?.nodeType !== "abstract") {
@@ -1103,7 +1428,7 @@ export function GraphWorkspace({
   }, [selected?.id, selected?.nodeType]);
 
   const suggested = useMemo(
-    () => edges.flatMap((edge) => edge.data?.entity.relation?.status === "suggested" ? [edge.data.entity.relation] : []),
+    () => edges.flatMap((edge) => edge.data?.entity?.relation?.status === "suggested" ? [edge.data.entity.relation] : []),
     [edges],
   );
   const titles = useMemo(
@@ -1113,6 +1438,7 @@ export function GraphWorkspace({
 
   const search = async (event: FormEvent) => {
     event.preventDefault();
+    if (isAoriMode) return;
     const trimmed = query.trim();
     if (!trimmed) return;
     const requestLibraryId = libraryId;
@@ -1141,6 +1467,7 @@ export function GraphWorkspace({
 
   const runPulse = async (event: FormEvent) => {
     event.preventDefault();
+    if (isAoriMode) return;
     if (!pulseQuestion.trim() || pulsing) return;
     const requestLibraryId = libraryId;
     const question = pulseQuestion.trim();
@@ -1296,6 +1623,7 @@ export function GraphWorkspace({
   };
 
   const review = async (relation: Relation, nextStatus: "accepted" | "rejected") => {
+    if (isAoriMode) return;
     try {
       await api.reviewRelation(relation.id, nextStatus);
       await loadGraph(selected?.id, selected?.nodeType === "abstract", "detail");
@@ -1305,6 +1633,7 @@ export function GraphWorkspace({
   };
 
   const onConnect = async (connection: Connection) => {
+    if (isAoriMode) return;
     if (!connection.source || !connection.target || connection.source === connection.target) return;
     const source = records.find((record) => record.id === connection.source);
     const target = records.find((record) => record.id === connection.target);
@@ -1325,8 +1654,33 @@ export function GraphWorkspace({
     }
   };
 
+  const changeGraphMode = (nextMode: GraphSurfaceMode) => {
+    if (nextMode !== "legacy" && !aoriVersionId) return;
+    setGraphMode(nextMode);
+    setFocusedNodeId(undefined);
+    setSelected(undefined);
+    setSelectedRelation(undefined);
+    setSelectedAggregate(undefined);
+    setSelectedAoriNode(undefined);
+    setSelectedAoriEdge(undefined);
+    setResults([]);
+    setActiveSearchChunkId(undefined);
+    if (nextMode !== "legacy") {
+      setPulseMode("normal");
+      setPulseRevealCount(0);
+      setPulsePlaying(false);
+    }
+  };
+
   const changeLayout = (nextLayout: LayoutMode) => {
     setLayout(nextLayout);
+    if (isAoriMode) {
+      if (aoriGraph) {
+        setNodes(aoriVisualNodes(aoriGraph));
+        setEdges(displayAoriEdges(aoriGraph));
+      }
+      return;
+    }
     const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, visibleCurrentPulse, pulseRevealCount);
     setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, pulseMode, searchFocus));
     setEdges(displayEdges(visibleGraph.edges, nextLayout, pulseMode));
@@ -1365,21 +1719,26 @@ export function GraphWorkspace({
         <div className="toolbar-group toolbar-search">
           <span className="toolbar-label">检索</span>
           <form onSubmit={(event) => void search(event)}>
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="模糊搜索 chunk 名称/内容..." />
-            <button type="submit">搜索</button>
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={isAoriMode ? "AORI 图谱按切面浏览" : "模糊搜索 chunk 名称/内容..."}
+              disabled={isAoriMode}
+            />
+            <button type="submit" disabled={isAoriMode}>搜索</button>
           </form>
         </div>
         <div className="toolbar-group">
           <span className="toolbar-label">筛选</span>
-          <select value={status} onChange={(event) => setStatus(event.target.value as RelationStatus | "")}>
+          <select value={status} onChange={(event) => setStatus(event.target.value as RelationStatus | "")} disabled={isAoriMode}>
             <option value="">可见关系</option>
             {relationStatuses.map((item) => <option key={item} value={item}>{item}</option>)}
           </select>
-          <select value={type} onChange={(event) => setType(event.target.value as RelationType | "")}>
+          <select value={type} onChange={(event) => setType(event.target.value as RelationType | "")} disabled={isAoriMode}>
             <option value="">所有类型</option>
             {relationTypes.map((item) => <option key={item} value={item}>{item}</option>)}
           </select>
-          <select className="aspect-filter" value={aspect} onChange={(event) => setAspect(event.target.value as AspectKind | "")}>
+          <select className="aspect-filter" value={aspect} onChange={(event) => setAspect(event.target.value as AspectKind | "")} disabled={isAoriMode}>
             <option value="">全部切面</option>
             {aspectKinds.map((item) => <option key={item} value={item}>{aspectLabels[item]}</option>)}
           </select>
@@ -1393,13 +1752,41 @@ export function GraphWorkspace({
               </button>
             ))}
           </div>
-          <div className="graph-depth" aria-label="图谱层级">
-            <button className={view === "overview" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("overview"); }}>概览</button>
-            <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
+          <div className="graph-depth" aria-label="图谱模式">
+            {(["legacy", "aori_overview", "aori_detail", "hybrid"] as GraphSurfaceMode[]).map((mode) => (
+              <button
+                key={mode}
+                className={graphMode === mode ? "selected" : ""}
+                disabled={mode !== "legacy" && !aoriVersionId}
+                onClick={() => changeGraphMode(mode)}
+              >
+                {graphSurfaceLabels[mode]}
+              </button>
+            ))}
           </div>
+          {graphMode === "legacy" && (
+            <div className="graph-depth" aria-label="Legacy 图谱层级">
+              <button className={view === "overview" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("overview"); }}>概览</button>
+              <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
+            </div>
+          )}
+          {aoriDocuments.length > 0 && (
+            <select
+              className="aori-version-select"
+              value={aoriVersionId ?? ""}
+              onChange={(event) => {
+                setAoriVersionId(event.target.value || undefined);
+                if (graphMode === "legacy") setGraphMode("aori_overview");
+              }}
+            >
+              {aoriDocuments.map((document) => (
+                <option key={document.latestVersion!.id} value={document.latestVersion!.id}>{document.name}</option>
+              ))}
+            </select>
+          )}
         </div>
       </div>
-      <div className="pulse-toolbar">
+      {!isAoriMode && <div className="pulse-toolbar">
         <div className="toolbar-group pulse-query">
           <span className="toolbar-label">脉冲</span>
           <form onSubmit={(event) => void runPulse(event)}>
@@ -1437,7 +1824,7 @@ export function GraphWorkspace({
             清空
           </button>
         </div>
-      </div>
+      </div>}
       <div className="graph-body">
         <div className="canvas">
           <ReactFlow
@@ -1447,23 +1834,45 @@ export function GraphWorkspace({
             onInit={setFlowInstance}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
-            nodesConnectable={view === "detail"}
+            nodesConnectable={!isAoriMode && view === "detail"}
             onConnect={(connection) => void onConnect(connection)}
             onNodeClick={(_event, node) => {
-              setSelected(node.data.entity);
+              if (node.data.aori) {
+                setSelectedAoriNode(node.data.aori);
+                setSelectedAoriEdge(undefined);
+                setSelected(undefined);
+                setSelectedRelation(undefined);
+                setSelectedAggregate(undefined);
+                return;
+              }
+              const entity = node.data.entity;
+              if (!entity) return;
+              setSelected(entity);
               setSelectedRelation(undefined);
               setSelectedAggregate(undefined);
-              if (node.data.entity.nodeType === "abstract" && node.data.entity.data.level === 2) {
+              setSelectedAoriNode(undefined);
+              setSelectedAoriEdge(undefined);
+              if (entity.nodeType === "abstract" && entity.data.level === 2) {
                 setFocusedNodeId(node.id);
                 setView("detail");
-              } else if (node.data.entity.nodeType === "abstract" && view === "detail") {
+              } else if (entity.nodeType === "abstract" && view === "detail") {
                 setFocusedNodeId(node.id);
               }
             }}
             onEdgeClick={(_event, edge) => {
-              setSelectedRelation(edge.data?.entity.relation);
-              setSelectedAggregate(edge.data?.entity.aggregate);
+              if (edge.data?.aori) {
+                setSelectedAoriEdge(edge.data.aori);
+                setSelectedAoriNode(undefined);
+                setSelected(undefined);
+                setSelectedRelation(undefined);
+                setSelectedAggregate(undefined);
+                return;
+              }
+              setSelectedRelation(edge.data?.entity?.relation);
+              setSelectedAggregate(edge.data?.entity?.aggregate);
               setSelected(undefined);
+              setSelectedAoriNode(undefined);
+              setSelectedAoriEdge(undefined);
             }}
             minZoom={0.35}
             maxZoom={2}
@@ -1471,20 +1880,23 @@ export function GraphWorkspace({
             fitViewOptions={{ padding: 0.16, minZoom: 0.82, maxZoom: 1.18 }}
           >
             <Background color="#28334c" gap={24} />
-            <MiniMap nodeColor={(node) => String(node.className).includes("flow-chunk") ? "#56627c" : String(node.className).includes("flow-theme") ? "#cb9b54" : "#40bca2"} />
-            <Controls className="layout-controls" position="bottom-left" showZoom={false} showFitView={false} showInteractive={false}>
+            <MiniMap nodeColor={miniMapNodeColor} />
+            {!isAoriMode && <Controls className="layout-controls" position="bottom-left" showZoom={false} showFitView={false} showInteractive={false}>
               <ControlButton className={layout === "layered" ? "layout-active" : ""} onClick={() => changeLayout("layered")} title="分层布局" aria-label="分层布局">层</ControlButton>
               <ControlButton className={layout === "network" ? "layout-active" : ""} onClick={() => changeLayout("network")} title="网状布局" aria-label="网状布局">网</ControlButton>
               <ControlButton className={layout === "tree" ? "layout-active" : ""} onClick={() => changeLayout("tree")} title="树形布局" aria-label="树形布局">树</ControlButton>
-            </Controls>
+            </Controls>}
             <Controls />
           </ReactFlow>
-          {aspect && records.length === 0 && (
+          {!isAoriMode && aspect && records.length === 0 && (
             <div className="graph-empty">
               {aspectFilter?.anyLabeled
                 ? `当前没有“${aspectLabels[aspect]}”切面节点。`
                 : "当前资料尚未生成切面标签，请重新分析资料后再筛选。"}
             </div>
+          )}
+          {isAoriMode && !aoriGraph && (
+            <div className="graph-empty">当前没有可显示的 AORI 图谱。</div>
           )}
         </div>
         <aside className="inspector">
@@ -1493,7 +1905,21 @@ export function GraphWorkspace({
           ) : (
             <RuleGovernanceCard feed={ruleGovernanceFeed} />
           )}
-          {viewMode === "document" && (
+          {isAoriMode && (
+            <>
+              <AoriGraphInspector graph={aoriGraph} document={activeAoriDocument} mode={activeAoriMode ?? "overview"} />
+              {selectedAoriNode && (
+                <AoriSelectedNode
+                  node={selectedAoriNode}
+                  graph={aoriGraph}
+                  document={activeAoriDocument}
+                  onOpenCitation={onOpenCitation}
+                />
+              )}
+              {selectedAoriEdge && <AoriSelectedEdge edge={selectedAoriEdge} />}
+            </>
+          )}
+          {!isAoriMode && viewMode === "document" && (
             <DocumentTreePanel
               nodes={documentTree}
               loading={documentTreeLoading}
@@ -1507,7 +1933,7 @@ export function GraphWorkspace({
               }}
             />
           )}
-          {viewMode === "evidence" && (
+          {!isAoriMode && viewMode === "evidence" && (
             <EvidencePackPanel evidencePack={visibleCurrentPulse?.evidencePack} onOpenChunk={(chunkId) => openPulseHit({
               id: chunkId,
               pulseId: visibleCurrentPulse?.pulse.id ?? "",
@@ -1524,10 +1950,10 @@ export function GraphWorkspace({
               excerpt: null,
             })} />
           )}
-          {viewMode === "retrieval" && (
+          {!isAoriMode && viewMode === "retrieval" && (
             <RetrievalTracePanel evidencePack={visibleCurrentPulse?.evidencePack} />
           )}
-          {!visibleCurrentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
+          {!isAoriMode && !visibleCurrentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
             <div className="pulse-panel pulse-stream-panel">
               <div className="pulse-panel-heading">
                 <h3>脉冲生成中</h3>
@@ -1591,7 +2017,7 @@ export function GraphWorkspace({
               </div>
             </div>
           )}
-          {visibleCurrentPulse && (
+          {!isAoriMode && visibleCurrentPulse && (
             <div className={`pulse-panel pulse-status-${visibleCurrentPulse.pulse.status}`}>
               <div className="pulse-panel-heading">
                 <h3>脉冲回答</h3>
@@ -1675,7 +2101,7 @@ export function GraphWorkspace({
               </div>
             </div>
           )}
-          {view === "detail" ? <div className="manual-edge">
+          {!isAoriMode && (view === "detail" ? <div className="manual-edge">
             <h3>连边工具</h3>
             <select value={manualType} onChange={(event) => setManualType(event.target.value as RelationType)}>
               {relationTypes.map((item) => <option key={item} value={item}>{item}</option>)}
@@ -1685,8 +2111,8 @@ export function GraphWorkspace({
           </div> : <div className="overview-hint">
             <h3>主题概览</h3>
             <p>主题节点折叠了底层概念；聚合边括号内为底层关系数量。点击主题进入可审核细节。</p>
-          </div>}
-          {results.length > 0 && (
+          </div>)}
+          {!isAoriMode && results.length > 0 && (
             <div className="search-results">
               <h3>搜索结果 <small>{results.length} 个，按关联度排序</small></h3>
               {results.map((result) => (
@@ -1704,7 +2130,7 @@ export function GraphWorkspace({
               ))}
             </div>
           )}
-          {selected && (
+          {!isAoriMode && selected && (
             <>
               <SelectedNode
                 node={selected}
@@ -1721,7 +2147,7 @@ export function GraphWorkspace({
               )}
             </>
           )}
-          {selectedRelation && (
+          {!isAoriMode && selectedRelation && (
             <div className="relation-detail">
               <h3>{selectedRelation.type}</h3>
               <p>{titles.get(selectedRelation.sourceNodeId)} → {titles.get(selectedRelation.targetNodeId)}</p>
@@ -1736,14 +2162,14 @@ export function GraphWorkspace({
               </div>
             </div>
           )}
-          {selectedAggregate && (
+          {!isAoriMode && selectedAggregate && (
             <div className="relation-detail">
               <h3>聚合关系：{selectedAggregate.type}</h3>
               <p>该主题连线汇总了 {selectedAggregate.count} 条底层关系。</p>
               <p className="muted">切换到细节视图查看证据并执行审核。</p>
             </div>
           )}
-          <div className="suggestions">
+          {!isAoriMode && <div className="suggestions">
             <div className="suggestion-header">
               <h3>待审核关系</h3>
               {suggested.length > 1 && (
@@ -1763,10 +2189,151 @@ export function GraphWorkspace({
               </div>
             ))}
             {suggested.length === 0 && <p className="muted">{view === "overview" ? "概览不直接审核关系，请进入主题细节。" : "当前局部图没有待审核关系。"}</p>}
-          </div>
+          </div>}
         </aside>
       </div>
     </section>
+  );
+}
+
+function AoriGraphInspector({
+  graph,
+  document,
+  mode,
+}: {
+  graph?: AoriGraphView | undefined;
+  document?: Document | undefined;
+  mode: AoriGraphMode;
+}) {
+  if (!graph) {
+    return (
+      <div className="aori-graph-panel">
+        <div className="pulse-panel-heading">
+          <h3>AORI 图谱</h3>
+          <small>{mode}</small>
+        </div>
+        <p className="muted">暂无可用 AORI 图谱。</p>
+      </div>
+    );
+  }
+  const diagnostics = graph.diagnostics;
+  const kindDistribution = Object.entries(diagnostics.aspectKindDistribution)
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "zh-CN"))
+    .slice(0, 8);
+  return (
+    <div className="aori-graph-panel">
+      <div className="pulse-panel-heading">
+        <h3>AORI 图谱</h3>
+        <small>{document?.name ?? graph.versionId} · {mode}</small>
+      </div>
+      <div className="aori-status-grid">
+        <span><strong>{diagnostics.aspectCount}</strong>切面</span>
+        <span><strong>{diagnostics.itemCount}</strong>切面项</span>
+        <span><strong>{diagnostics.relationCount}</strong>动态关系</span>
+        <span><strong>{diagnostics.isolatedItemCount}</strong>孤立项</span>
+        <span><strong>{diagnostics.unsupportedItemCount}</strong>unsupported</span>
+        <span><strong>{diagnostics.fallbackOnlyItemCount}</strong>fallback</span>
+      </div>
+      {kindDistribution.length > 0 && (
+        <div className="aori-distribution-list">
+          <strong>AspectKind</strong>
+          {kindDistribution.map(([label, count]) => (
+            <span key={label}><em>{aspectLabels[label as AspectKind] ?? label}</em><small>{count}</small></span>
+          ))}
+        </div>
+      )}
+      {diagnostics.domainKindTopK.length > 0 && (
+        <div className="aori-distribution-list">
+          <strong>DomainKind</strong>
+          {diagnostics.domainKindTopK.slice(0, 6).map((item) => (
+            <span key={item.label}><em>{item.label}</em><small>{item.count}</small></span>
+          ))}
+        </div>
+      )}
+      {diagnostics.domainRelationTopK.length > 0 && (
+        <div className="aori-distribution-list">
+          <strong>DomainRelation</strong>
+          {diagnostics.domainRelationTopK.slice(0, 6).map((item) => (
+            <span key={item.label}><em>{item.label}</em><small>{item.count}</small></span>
+          ))}
+        </div>
+      )}
+      {diagnostics.warnings.length > 0 && (
+        <div className="aori-warning-list">
+          <strong>Warnings</strong>
+          {diagnostics.warnings.slice(0, 8).map((warning, index) => <small key={`${warning}-${index}`}>{warning}</small>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AoriStatusTags({ record }: { record: AoriGraphNode | AoriGraphEdge }) {
+  return (
+    <div className="aori-tags">
+      {"type" in record && <span>{record.type}</span>}
+      {record.evidenceStatus && <span>{evidenceStatusLabels[record.evidenceStatus]}</span>}
+      {record.closureStatus && <span>{closureStatusLabels[record.closureStatus]}</span>}
+      {"fallbackOnly" in record && record.fallbackOnly && <span>fallback</span>}
+      {confidenceText(record.confidence) && <span>{confidenceText(record.confidence)}</span>}
+    </div>
+  );
+}
+
+function AoriSelectedNode({
+  node,
+  graph,
+  document,
+  onOpenCitation,
+}: {
+  node: AoriGraphNode;
+  graph?: AoriGraphView | undefined;
+  document?: Document | undefined;
+  onOpenCitation: (citation: Citation) => void;
+}) {
+  return (
+    <div className="aori-detail-card node-detail">
+      <h3>{node.label}</h3>
+      <small>{aoriNodeTypeLabels[node.type]}{node.kind ? ` · ${aspectLabels[node.kind]}` : ""}{node.domainKind ? ` · ${node.domainKind}` : ""}</small>
+      {node.summary && <p>{node.summary}</p>}
+      <AoriStatusTags record={node} />
+      {node.type === "source_chunk" && node.chunkId && graph && (
+        <div className="actions">
+          <button
+            type="button"
+            onClick={() => onOpenCitation({
+              versionId: graph.versionId,
+              chunkId: node.chunkId!,
+              documentName: document?.name ?? "AORI source",
+              mediaType: document?.mediaType ?? "text/plain",
+              headingPath: null,
+              pageNumber: null,
+              startLine: null,
+              endLine: null,
+              blockId: null,
+              excerpt: node.label,
+            })}
+          >
+            查看原文
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AoriSelectedEdge({ edge }: { edge: AoriGraphEdge }) {
+  return (
+    <div className="aori-detail-card relation-detail">
+      <h3>{edge.domainRelation || edge.label}</h3>
+      <p>{edge.source} → {edge.target}</p>
+      <AoriStatusTags record={edge} />
+      <div className="aori-edge-meta">
+        <span>{edge.type}</span>
+        {edge.baseRelation && <span>{edge.baseRelation}</span>}
+        {edge.domainRelation && <span>{edge.domainRelation}</span>}
+      </div>
+    </div>
   );
 }
 

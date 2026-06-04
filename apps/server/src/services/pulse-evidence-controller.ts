@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   AbstractNode,
   Chunk,
   ContextUnit,
@@ -15,7 +15,9 @@
   PulseInputMode,
   PulseQuestionPlan,
   PulseVerificationResult,
+  QuestionTask,
   Relation,
+  RetrievalTask,
   RetrievalUnit,
   SearchResult,
   SummaryTreeNode,
@@ -146,6 +148,18 @@ function rowDedupeKey(row: PulseEvidenceRow): string {
   return row.dedupeKey?.trim() || `${row.evidenceType}:${row.evidenceChunkId}:${row.evidenceQuote.trim()}`;
 }
 
+function canUseAsAnswerCore(row: PulseEvidenceRow, questionTask: QuestionTask | undefined, acceptedByCritic: boolean): boolean {
+  if (row.usage !== "answer_core") return false;
+  if (row.authority === "model_inferred") return false;
+  if (row.confidence < 0.5) return false;
+  if (!acceptedByCritic) return false;
+  if (row.warnings?.includes("unsupported_quote")) return false;
+  if (row.warnings?.includes("fallback_only")) return false;
+  if (typeof row.role === "string" && questionTask?.exclusionRoles.some((role) => role === row.role)) return false;
+  if (typeof row.role === "string" && row.role === "gap_candidate") return false;
+  return true;
+}
+
 export function computePulseReconciliation(rows: PulseEvidenceRow[]): PulseEvidenceReconciliation | undefined {
   return computeGenericReconciliation(rows);
 }
@@ -165,7 +179,7 @@ export function verifyPulseAnswer(
       errors.push("Answer is missing a verifiable source quote / 原文引用 / 完整.");
     }
   }
-  if (!evidenceStatus.sufficient && /鍏ㄩ儴|姣忎竴绗攟瀹屾暣|绌峰敖|鎵€鏈墊鏃犻仐婕弢complete|all|every/i.test(answer)) {
+  if (!evidenceStatus.sufficient && /全部|每一|完整|穷尽|所有|无遗漏|complete|all|every/i.test(answer)) {
     errors.push("Insufficient evidence cannot support complete or exhaustive wording / 完整.");
   }
   errors.push(...overclaimErrors(answer, questionPlan, evidenceStatus.sufficient));
@@ -178,7 +192,7 @@ export function verifyPulseAnswer(
   }
   if (questionPlan.answerMustExposeGaps && evidenceStatus.gaps.length > 0) {
     const exposesGap = evidenceStatus.gaps.some((gap) => answer.includes(gap.description.slice(0, Math.min(18, gap.description.length))));
-    if (!exposesGap && !/缂哄彛|涓嶈冻|鏃犳硶纭|浠嶉渶|gap|insufficient/i.test(answer)) {
+    if (!exposesGap && !/缺口|不足|无法确认|仍需|gap|insufficient/i.test(answer)) {
       errors.push("Evidence gaps must be explicitly exposed in the answer / 缺口.");
     }
   }
@@ -205,20 +219,37 @@ export class PulseEvidenceController {
     seedContext: PulseSeedContext,
     eventSink?: PulseEventSink,
   ): Promise<PulseEvidenceControllerResult> {
-    await eventSink?.({ type: "stage", message: "姝ｅ湪鍒嗘瀽闂鎵€闇€璇佹嵁" });
+    await eventSink?.({ type: "stage", message: "正在分析问题所需证据" });
     const analyzedQuestionPlan = await this.model.analyzePulseQuestion(question, mode);
+    await eventSink?.({ type: "stage", message: "正在定义问题任务" });
+    const questionTask = await this.model.classifyQuestionTask({
+      question,
+      mode,
+      questionPlan: analyzedQuestionPlan,
+      planningContext: this.planningContextForLibrary(libraryId),
+    });
     const scopeClosure = new ScopeClosureRetriever(this.db).close(libraryId, question, analyzedQuestionPlan);
     const questionPlan: PulseQuestionPlan = { ...analyzedQuestionPlan, answerScope: scopeClosure.answerScope };
     const memory = this.createMemory(question, questionPlan, seedContext);
+    memory.questionTask = questionTask;
     const hitMap = new Map<string, PendingPulseHit>();
     for (const hit of seedContext.hits) hitMap.set(`${hit.targetType}:${hit.targetId}`, hit);
 
     this.applyScopeClosure(memory, scopeClosure, hitMap);
+    memory.retrievalTasks = await this.model.planRetrievalTasks({
+      question,
+      mode,
+      questionPlan,
+      questionTask,
+      planningContext: this.memorySummary(memory),
+    });
     await this.extractRowsForChunks(question, memory, "Seed evidence from the existing pulse graph.");
     const planned = await this.model.planPulseEvidence({
       question,
       mode,
       questionPlan,
+      questionTask,
+      retrievalTasks: memory.retrievalTasks,
       memorySummary: this.memorySummary(memory),
       tools: allowedTools,
     });
@@ -272,11 +303,12 @@ export class PulseEvidenceController {
       reasoning: "No sufficiency judgment was produced; answer must stay guarded.",
       ...(computePulseReconciliation(memory.evidenceRows) ? { reconciliation: computePulseReconciliation(memory.evidenceRows) } : {}),
     };
+    const answerMemory = this.answerCoreMemory(memory);
     await eventSink?.({ type: "stage", message: "Synthesizing answer from EvidenceMemory" });
     let output = await this.model.synthesizePulseAnswer({
       question,
       questionPlan,
-      memory: this.memorySummary(memory),
+      memory: this.memorySummary(answerMemory),
       evidenceStatus: finalStatus,
     });
     output = this.attachDiagnostics(output, memory, finalStatus);
@@ -287,7 +319,7 @@ export class PulseEvidenceController {
         question,
         draft: output,
         rewriteInstructions: verification.rewriteInstructions,
-        memory: this.memorySummary(memory),
+        memory: this.memorySummary(answerMemory),
         evidenceStatus: finalStatus,
       });
       output = this.attachDiagnostics(rewritten, memory, finalStatus, verification.warnings);
@@ -331,6 +363,53 @@ export class PulseEvidenceController {
       currentFindings: [],
       gaps: [],
       sufficiencyHistory: [],
+    };
+  }
+
+  private planningContextForLibrary(libraryId: string): unknown {
+    const aoriIndexes = this.db.listAoriDocumentIndexes(libraryId).slice(0, 5);
+    return {
+      planningIndexAvailable: aoriIndexes.length > 0,
+      documents: aoriIndexes.map((index) => ({
+        versionId: index.versionId,
+        documentName: index.documentName,
+        understanding: {
+          summary: index.understanding.summary.slice(0, 1200),
+          centralQuestion: index.understanding.centralQuestion,
+          evidenceStatus: index.understanding.evidenceStatus,
+          closureStatus: index.understanding.closureStatus,
+        },
+        aspects: index.aspects.slice(0, 20).map((aspect) => ({
+          id: aspect.id,
+          kind: aspect.kind,
+          domainKind: aspect.domainKind,
+          title: aspect.title,
+          summary: aspect.summary.slice(0, 600),
+          centralQuestion: aspect.centralQuestion,
+          evidenceStatus: aspect.evidenceStatus,
+          closureStatus: aspect.closureStatus,
+          closureReport: {
+            status: aspect.closureReport.status,
+            warnings: aspect.closureReport.warnings,
+            gaps: aspect.closureReport.gaps.map((gap) => ({ type: "aori_gap", description: gap.description, severity: gap.severity })),
+          },
+        })),
+        relationLexicon: index.relationLexicon.entries.slice(0, 40).map((entry) => ({
+          relationName: entry.relationName,
+          domainRelation: entry.domainRelation,
+          normalizedMeaning: entry.normalizedMeaning,
+          baseRelation: entry.baseRelation,
+          confidence: entry.confidence,
+        })),
+        knownGaps: index.closureReports.flatMap((report) => report.gaps.map((gap) => ({
+          description: gap.description,
+          severity: gap.severity,
+        }))).slice(0, 20),
+        selfQuestions: index.selfQuestions.slice(0, 20).map((question) => ({
+          question: question.question,
+          status: question.status,
+        })),
+      })),
     };
   }
 
@@ -826,6 +905,7 @@ export class PulseEvidenceController {
       if (!retrievalByContextId.has(unit.contextUnitId)) retrievalByContextId.set(unit.contextUnitId, unit);
     }
     let added = 0;
+    const addedRows: PulseEvidenceRow[] = [];
     for (const row of rows) {
       const contextUnit = row.contextUnitId
         ? contextById.get(row.contextUnitId)
@@ -837,8 +917,18 @@ export class PulseEvidenceController {
       if (existing.has(key)) continue;
       existing.add(key);
       memory.evidenceRows.push(validated);
+      addedRows.push(validated);
       added += 1;
       if (!memory.citedChunkIds.includes(validated.evidenceChunkId)) memory.citedChunkIds.push(validated.evidenceChunkId);
+    }
+    if (addedRows.length > 0) {
+      const reviews = await this.model.reviewEvidenceRowClassifications({
+        question,
+        questionTask: memory.questionTask,
+        rows: addedRows,
+      });
+      memory.semanticClassificationReviews ??= [];
+      memory.semanticClassificationReviews.push(...reviews);
     }
     return added;
   }
@@ -1009,6 +1099,10 @@ export class PulseEvidenceController {
   private memorySummary(memory: PulseEvidenceMemory): PulseEvidenceMemory {
     return {
       ...memory,
+      retrievalTasks: (memory.retrievalTasks ?? []).slice(0, 20),
+      semanticClassificationReviews: (memory.semanticClassificationReviews ?? []).slice(0, 160),
+      usageGateRejectedRows: (memory.usageGateRejectedRows ?? []).slice(0, 160),
+      finalAnswerInputs: (memory.finalAnswerInputs ?? []).slice(0, 160),
       collectedChunks: memory.collectedChunks.slice(0, 80),
       graphNodes: memory.graphNodes.slice(0, 60),
       graphRelations: memory.graphRelations.slice(0, 80),
@@ -1021,6 +1115,32 @@ export class PulseEvidenceController {
       evidenceRows: memory.evidenceRows.slice(0, 120),
       currentFindings: memory.currentFindings.slice(-20),
       retrievalHistory: memory.retrievalHistory.slice(-30),
+    };
+  }
+
+  private answerCoreMemory(memory: PulseEvidenceMemory): PulseEvidenceMemory {
+    const reviews = new Map((memory.semanticClassificationReviews ?? []).map((review) => [review.itemId, review]));
+    const rejected: Array<{ rowId: string; reason: string }> = [];
+    const evidenceRows = memory.evidenceRows.filter((row) => {
+      const review = reviews.get(row.rowId);
+      const acceptedByCritic = review?.accepted === true;
+      const accepted = canUseAsAnswerCore(row, memory.questionTask, acceptedByCritic);
+      if (!accepted) {
+        rejected.push({
+          rowId: row.rowId,
+          reason: review?.reason ?? "Evidence row did not pass answer_core usage gate.",
+        });
+      }
+      return accepted;
+    });
+    memory.usageGateRejectedRows = rejected;
+    memory.finalAnswerInputs = evidenceRows.map((row) => row.rowId);
+    return {
+      ...memory,
+      evidenceRows,
+      citedChunkIds: [...new Set(evidenceRows.map((row) => row.evidenceChunkId))],
+      usageGateRejectedRows: rejected,
+      finalAnswerInputs: evidenceRows.map((row) => row.rowId),
     };
   }
 
@@ -1037,6 +1157,11 @@ export class PulseEvidenceController {
       diagnostics: {
         ...output.diagnostics,
         questionPlan: memory.questionPlan,
+        questionTask: memory.questionTask,
+        retrievalTasks: memory.retrievalTasks,
+        semanticClassificationReviews: memory.semanticClassificationReviews,
+        usageGateRejectedRows: memory.usageGateRejectedRows,
+        finalAnswerInputs: memory.finalAnswerInputs,
         retrievalSteps: memory.retrievalHistory.map((history) => ({
           tool: history.tool,
           ...(history.query ? { query: history.query } : {}),
@@ -1096,8 +1221,12 @@ export class PulseEvidenceController {
       answerModeReason: answerMode.reason,
       answerModeOverridden: answerMode.overridden,
       questionPlan: memory.questionPlan,
+      questionTask: memory.questionTask,
       answerScope: memory.answerScope,
       scopeClosureReport: memory.scopeClosureReport,
+      semanticClassificationReviews: memory.semanticClassificationReviews,
+      usageGateRejectedRows: memory.usageGateRejectedRows,
+      finalAnswerInputs: memory.finalAnswerInputs,
       usedIndexProfile: memory.usedIndexProfile ?? "v1",
       sufficiencyHistory: memory.sufficiencyHistory,
       contextUnits: memory.contextUnits ?? [],
@@ -1127,7 +1256,8 @@ export class PulseEvidenceController {
     evidenceStatus: PulseEvidenceStatus,
     verification: PulseVerificationResult,
   ): PulseAnswerOutput {
-    const facts = memory.evidenceRows.slice(0, 6).map((row) => `- ${row.claimText}: ${row.evidenceQuote}`).join("\n");
+    const answerMemory = this.answerCoreMemory(memory);
+    const facts = answerMemory.evidenceRows.slice(0, 6).map((row) => `- ${row.claimText}: ${row.evidenceQuote}`).join("\n");
     const gaps = evidenceStatus.gaps.map((gap) => `- ${gap.description}`).join("\n");
     return this.attachDiagnostics({
       answer: [

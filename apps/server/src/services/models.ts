@@ -22,13 +22,18 @@ import type {
   PulseQuestionPlan,
   PulseNavigationCandidate,
   PulseNavigationDecision,
+  QuestionTask,
+  RetrievalTask,
   RelationType,
+  SemanticClassificationReview,
   StatementPrecheckOutput,
 } from "@agent-thinking/contracts";
 import {
   abstractNodeKinds,
   aoriDocumentDraftSchema,
   aspectKinds,
+  closureStatuses,
+  evidenceStatuses,
   extractionSchema,
   mappingAuditFindingKinds,
   mappingAuditResultSchema,
@@ -40,7 +45,10 @@ import {
   pulseEvidenceStatusSchema,
   pulseNavigationDecisionSchema,
   pulseQuestionPlanSchema,
+  questionTaskSchema,
+  retrievalTaskSchema,
   relationTypes,
+  semanticClassificationReviewSchema,
   statementPrecheckSchema,
 } from "@agent-thinking/contracts";
 import { ZodError } from "zod";
@@ -256,6 +264,101 @@ function fallbackPulseEvidencePlan(question: string, mode: PulseAnswerContext["m
   };
 }
 
+function fallbackQuestionTask(question: string, plan?: PulseQuestionPlan): QuestionTask {
+  const taskType: QuestionTask["taskType"] = plan?.requiresNumericalReconciliation || plan?.questionType === "numerical_aggregation"
+    ? "numeric_reconciliation"
+    : plan?.questionType === "timeline"
+      ? "timeline"
+      : plan?.questionType === "exhaustive_list"
+        ? "exhaustive_list"
+        : plan?.questionType === "entity_relation"
+          ? "entity_relation"
+          : plan?.questionType === "claim_support"
+            ? "claim_support"
+            : plan?.questionType === "comparison"
+              ? "argument_comparison"
+              : plan?.questionType === "summary"
+                ? "summary"
+                : "mixed";
+  const expectedAnswerShape: QuestionTask["expectedAnswerShape"] = taskType === "numeric_reconciliation"
+    ? "numeric_table"
+    : taskType === "timeline"
+      ? "timeline"
+      : taskType === "exhaustive_list"
+        ? "list"
+        : taskType === "entity_relation"
+          ? "table"
+          : taskType === "claim_support" || taskType === "argument_comparison"
+            ? "argument_map"
+            : "summary";
+  return {
+    question,
+    taskType,
+    targetSubjects: plan?.keyEntities ?? [],
+    targetObjects: plan?.evidenceTargets ?? [],
+    expectedAnswerShape,
+    requiredEvidenceRoles: plan?.requiresNumericalReconciliation
+      ? ["declared_total", "itemized_value", "offset_value", "excluded_value"]
+      : ["direct_fact"],
+    exclusionRoles: ["background_fact", "contextual_fact", "gap_candidate"],
+    ambiguityNotes: [],
+    needsDedupe: Boolean(plan?.requiresExhaustiveEvidence),
+    needsReconciliation: Boolean(plan?.requiresNumericalReconciliation),
+    needsPerspectiveOrAuthority: plan?.questionType === "claim_support" || plan?.questionType === "entity_relation",
+    mustExposeGaps: plan?.answerMustExposeGaps ?? true,
+    rationale: "Conservative fallback task derived from the existing model-produced question plan; no regex semantic classification was used.",
+    confidence: 0.45,
+  };
+}
+
+function fallbackRetrievalTasks(question: string, questionTask: QuestionTask): RetrievalTask[] {
+  return [{
+    id: "retrieval-task-source-evidence",
+    purpose: questionTask.needsReconciliation ? "find_itemized_components" : "find_direct_facts",
+    query: question,
+    targetRoles: questionTask.requiredEvidenceRoles,
+    excludeRoles: questionTask.exclusionRoles,
+    requiredContext: questionTask.needsReconciliation ? "same_section" : "retrieval_unit",
+    expectedOutput: questionTask.needsReconciliation ? "amount_components" : "evidence_rows",
+    rationale: "Fallback retrieval task keeps the query source-bound and delegates role decisions to evidence extraction.",
+  }];
+}
+
+function cleanRetrievalTasks(value: unknown, question: string, questionTask: QuestionTask): RetrievalTask[] {
+  const rows = Array.isArray(value)
+    ? value
+    : value && typeof value === "object" && Array.isArray((value as { retrievalTasks?: unknown }).retrievalTasks)
+      ? (value as { retrievalTasks: unknown[] }).retrievalTasks
+      : [];
+  const parsed = rows.flatMap((entry, index): RetrievalTask[] => {
+    const result = retrievalTaskSchema.safeParse({
+      ...(entry && typeof entry === "object" ? entry as Record<string, unknown> : {}),
+      id: entry && typeof entry === "object" && typeof (entry as { id?: unknown }).id === "string"
+        ? (entry as { id: string }).id
+        : `retrieval-task-${index + 1}`,
+    });
+    return result.success ? [result.data] : [];
+  }).slice(0, 12);
+  return parsed.length > 0 ? parsed : fallbackRetrievalTasks(question, questionTask);
+}
+
+function acceptedSemanticReviewsForRows(rows: PulseEvidenceRow[]): SemanticClassificationReview[] {
+  return rows.map((row) => {
+    const role = typeof row.role === "string" && row.role.trim() ? row.role.trim() : undefined;
+    const accepted = Boolean(role && row.authority && row.usage && row.classificationRationale && row.confidence >= 0.5);
+    return {
+      itemId: row.rowId,
+      accepted,
+      ...(role ? { correctedLabel: role } : {}),
+      reason: accepted
+        ? "Evidence row contains model-provided role, authority, usage, rationale, and source binding."
+        : "Evidence row is missing a model semantic classification field or has low confidence; it stays outside answer_core until reviewed.",
+      requiredAdditionalEvidence: accepted ? [] : ["model_semantic_classification"],
+      risk: accepted ? "low" : "medium",
+    };
+  });
+}
+
 function cleanPulseEvidenceRows(rowsValue: unknown, allowedChunkIds: Set<string>): PulseEvidenceRow[] {
   const rows = Array.isArray(rowsValue) ? rowsValue : (rowsValue && typeof rowsValue === "object" && Array.isArray((rowsValue as { rows?: unknown }).rows) ? (rowsValue as { rows: unknown[] }).rows : []);
   return rows.flatMap((entry, index): PulseEvidenceRow[] => {
@@ -286,13 +389,23 @@ function cleanAoriDraft(value: unknown, chunks: Chunk[]): AoriDocumentDraft {
     const items = rawItems.slice(0, 80).map((itemEntry, itemIndex) => {
       const item = itemEntry && typeof itemEntry === "object" && !Array.isArray(itemEntry) ? itemEntry as Record<string, unknown> : {};
       const evidenceChunkIds = safeEvidenceIds(item.evidenceChunkIds, allowedChunkIds);
-      const fallbackChunk = chunks.find((chunk) => evidenceChunkIds.includes(chunk.id)) ?? chunks[itemIndex % Math.max(1, chunks.length)];
       return {
         key: normalizedText(item.key, `a${aspectIndex + 1}_i${itemIndex + 1}`, 100),
-        title: normalizedText(item.title, fallbackChunk ? firstSentence(fallbackChunk.text, `切面条目 ${itemIndex + 1}`) : `切面条目 ${itemIndex + 1}`, 240),
-        summary: normalizedText(item.summary, fallbackChunk?.text.slice(0, 500) ?? "模型未提供条目摘要。", 2000),
-        evidenceChunkIds: evidenceChunkIds.length > 0 ? evidenceChunkIds : (fallbackChunk ? [fallbackChunk.id] : []),
+        title: normalizedText(item.title, `切面条目 ${itemIndex + 1}`, 240),
+        summary: normalizedText(item.summary, "模型未提供条目摘要。", 2000),
+        evidenceChunkIds,
         sourceNodeIds: normalizedStringArray(item.sourceNodeIds),
+        evidenceStatus: safeEvidenceStatus(item.evidenceStatus, evidenceChunkIds),
+        closureStatus: safeClosureStatus(item.closureStatus, evidenceChunkIds),
+        fallbackOnly: item.fallbackOnly === true,
+        classificationRationale: normalizedText(
+          item.classificationRationale,
+          evidenceChunkIds.length > 0
+            ? "Model supplied source-bound evidence for this AORI item."
+            : "Model did not supply valid evidenceChunkIds; item is retained as unsupported/open.",
+          1000,
+        ),
+        confidence: item.confidence === undefined ? (evidenceChunkIds.length > 0 ? 0.5 : 0.3) : safeConfidence(item.confidence),
       };
     });
     const itemKeys = new Set(items.map((item) => item.key));
@@ -304,18 +417,33 @@ function cleanAoriDraft(value: unknown, chunks: Chunk[]): AoriDocumentDraft {
       return [{
         sourceKey,
         targetKey,
+        domainRelation: typeof relation.domainRelation === "string" ? truncateText(relation.domainRelation.trim(), 240) : undefined,
         relationTextInSource: typeof relation.relationTextInSource === "string" ? truncateText(relation.relationTextInSource.trim(), 240) : undefined,
         normalizedRelation: typeof relation.normalizedRelation === "string" ? truncateText(relation.normalizedRelation.trim(), 240) : undefined,
         baseRelation: relationTypes.includes(relation.baseRelation as RelationType) ? relation.baseRelation as RelationType : "related_to",
         reason: normalizedText(relation.reason, "模型未提供关系理由。", 1000),
         confidence: safeConfidence(relation.confidence),
         evidenceChunkIds: safeEvidenceIds(relation.evidenceChunkIds, allowedChunkIds),
+        evidenceStatus: safeEvidenceStatus(relation.evidenceStatus, safeEvidenceIds(relation.evidenceChunkIds, allowedChunkIds)),
+        closureStatus: safeClosureStatus(relation.closureStatus, safeEvidenceIds(relation.evidenceChunkIds, allowedChunkIds)),
       }];
     });
+    const aspectEvidenceChunkIds = [...new Set(items.flatMap((item) => item.evidenceChunkIds))];
     return {
+      kind: safeAspectKind(aspect.kind),
+      domainKind: normalizedText(aspect.domainKind, "unknown", 120),
       title: normalizedText(aspect.title, `切面 ${aspectIndex + 1}`, 240),
       summary: normalizedText(aspect.summary, "模型未提供切面摘要。", 3000),
       centralQuestion: normalizedText(aspect.centralQuestion, "该切面的中心问题是什么？", 1000),
+      classificationRationale: normalizedText(
+        aspect.classificationRationale,
+        aspectKinds.includes(aspect.kind as AspectKind)
+          ? "Model selected this aspect kind but did not provide a rationale."
+          : "Model did not classify aspect kind; kept as other/open without regex inference.",
+        1000,
+      ),
+      confidence: aspect.confidence === undefined ? 0.3 : safeConfidence(aspect.confidence),
+      closureStatus: safeClosureStatus(aspect.closureStatus, aspectEvidenceChunkIds),
       items,
       relations,
       gaps: Array.isArray(aspect.gaps) ? aspect.gaps.slice(0, 20).flatMap((gapEntry) => {
@@ -331,18 +459,32 @@ function cleanAoriDraft(value: unknown, chunks: Chunk[]): AoriDocumentDraft {
     };
   });
   const fallbackAspect = aspects.length > 0 ? aspects : [{
+    kind: "other" as const,
+    domainKind: "unknown",
     title: "全局切面",
     summary: fallbackSummary.slice(0, 1000),
     centralQuestion: "这份文档的核心内容是什么？",
-    items: chunks.slice(0, 12).map((chunk, index) => ({
+    classificationRationale: "AORI model did not return aspects; fallback aspect is marked open and unsupported.",
+    confidence: 0.2,
+    closureStatus: "open" as const,
+    items: chunks.slice(0, 12).map((_chunk, index) => ({
       key: `fallback_${index + 1}`,
-      title: chunk.headingPath || firstSentence(chunk.text, `条目 ${index + 1}`),
-      summary: chunk.text.slice(0, 500),
-      evidenceChunkIds: [chunk.id],
-      sourceNodeIds: chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : [],
+      title: `Fallback item ${index + 1}`,
+      summary: "Fallback item retained for diagnostics only; it is not source-bound evidence.",
+      evidenceChunkIds: [],
+      sourceNodeIds: [],
+      evidenceStatus: "unsupported" as const,
+      closureStatus: "open" as const,
+      fallbackOnly: true,
+      classificationRationale: "Generated by fallback because the model did not return a source-bound AORI item.",
+      confidence: 0.2,
     })),
     relations: [],
-    gaps: [],
+    gaps: [{
+      description: "AORI model did not return source-bound aspects; fallback output is open and unsupported.",
+      severity: "high" as const,
+      evidenceChunkIds: [],
+    }],
   }];
   return aoriDocumentDraftSchema.parse({
     understanding: {
@@ -350,6 +492,14 @@ function cleanAoriDraft(value: unknown, chunks: Chunk[]): AoriDocumentDraft {
       centralQuestion: normalizedText(rawUnderstanding.centralQuestion, "这份文档的核心问题是什么？", 1000),
       centralNodeTitle: typeof rawUnderstanding.centralNodeTitle === "string" ? truncateText(rawUnderstanding.centralNodeTitle.trim(), 240) : undefined,
       evidenceChunkIds: safeEvidenceIds(rawUnderstanding.evidenceChunkIds, allowedChunkIds),
+      evidenceStatus: safeEvidenceStatus(rawUnderstanding.evidenceStatus, safeEvidenceIds(rawUnderstanding.evidenceChunkIds, allowedChunkIds)),
+      closureStatus: safeClosureStatus(rawUnderstanding.closureStatus, safeEvidenceIds(rawUnderstanding.evidenceChunkIds, allowedChunkIds)),
+      classificationRationale: normalizedText(
+        rawUnderstanding.classificationRationale,
+        "Global understanding evidence binding came from model output; missing evidence remains unsupported.",
+        1000,
+      ),
+      confidence: rawUnderstanding.confidence === undefined ? 0.5 : safeConfidence(rawUnderstanding.confidence),
     },
     aspects: fallbackAspect,
     selfQuestions: (Array.isArray(source.selfQuestions) ? source.selfQuestions : []).slice(0, 24).flatMap((entry) => {
@@ -385,6 +535,22 @@ function safeAspectArray(value: unknown, fallback: AspectKind[] = []): AspectKin
   return [...new Set(value.filter((entry): entry is AspectKind => aspectKinds.includes(entry as AspectKind)))];
 }
 
+function safeAspectKind(value: unknown): AspectKind {
+  return aspectKinds.includes(value as AspectKind) ? value as AspectKind : "other";
+}
+
+function safeEvidenceStatus(value: unknown, evidenceChunkIds: string[]): "supported" | "partially_supported" | "unsupported" | "disputed" {
+  if (evidenceStatuses.includes(value as "supported" | "partially_supported" | "unsupported" | "disputed")) {
+    return value as "supported" | "partially_supported" | "unsupported" | "disputed";
+  }
+  return evidenceChunkIds.length > 0 ? "supported" : "unsupported";
+}
+
+function safeClosureStatus(value: unknown, evidenceChunkIds: string[]): "closed" | "partial" | "open" {
+  if (closureStatuses.includes(value as "closed" | "partial" | "open")) return value as "closed" | "partial" | "open";
+  return evidenceChunkIds.length > 0 ? "partial" : "open";
+}
+
 function safeEvidenceIds(value: unknown, allowedChunkIds: Set<string>): string[] {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.filter((entry): entry is string => (
@@ -401,16 +567,13 @@ function safeConfidence(value: unknown): number {
 function fallbackExtractionFromChunks(chunks: Chunk[], note = "模型结构化输出不可用，系统生成保守候选。"): ExtractionOutput {
   const selected = chunks.slice(0, 8);
   const nodes = selected.map((chunk, index) => {
-    const kind = /认为|证明|应当|导致|因此|所以|主张|结论|claim|therefore/i.test(chunk.text)
-      ? "claim" as const
-      : "concept" as const;
     return {
       key: `fallback_${index}`,
-      kind,
+      kind: "concept" as const,
       title: truncateText(chunk.headingPath || firstSentence(chunk.text, `片段 ${index + 1}`), 80),
       summary: truncateText(`${note} ${chunk.text.trim()}`.trim(), 500),
       evidenceChunkIds: [chunk.id],
-      aspects: demoAspects(chunk.text, kind),
+      aspects: ["other" as const],
     };
   });
   return { nodes, relations: [], themes: [] };
@@ -447,7 +610,7 @@ function sanitizeExtractionOutput(
       title: normalizedText(node.title, fallbackChunk ? firstSentence(fallbackChunk.text, `候选节点 ${index + 1}`) : `候选节点 ${index + 1}`, 180),
       summary: normalizedText(node.summary, fallbackChunk?.text.slice(0, 500) ?? "模型未提供摘要。", 2000),
       evidenceChunkIds: evidenceChunkIds.length > 0 ? evidenceChunkIds : (fallbackChunk ? [fallbackChunk.id] : []),
-      aspects: safeAspectArray(node.aspects, demoAspects(String(node.title ?? node.summary ?? fallbackChunk?.text ?? ""), kind)),
+      aspects: safeAspectArray(node.aspects, ["other"]),
     };
   });
   if (nodes.length === 0 && allowedChunks.length > 0) return fallbackExtractionFromChunks(allowedChunks, fallbackNote);
@@ -548,10 +711,25 @@ export interface ModelProvider {
     options?: ExtractionRuleOptions,
   ): Promise<ExtractionOutput>;
   analyzePulseQuestion(question: string, mode: PulseAnswerContext["mode"]): Promise<PulseQuestionPlan>;
+  classifyQuestionTask(input: {
+    question: string;
+    mode: PulseAnswerContext["mode"];
+    questionPlan: PulseQuestionPlan;
+    planningContext?: unknown;
+  }): Promise<QuestionTask>;
+  planRetrievalTasks(input: {
+    question: string;
+    mode: PulseAnswerContext["mode"];
+    questionPlan: PulseQuestionPlan;
+    questionTask: QuestionTask;
+    planningContext?: unknown;
+  }): Promise<RetrievalTask[]>;
   planPulseEvidence(input: {
     question: string;
     mode: PulseAnswerContext["mode"];
     questionPlan: PulseQuestionPlan;
+    questionTask?: QuestionTask | undefined;
+    retrievalTasks?: RetrievalTask[] | undefined;
     memorySummary: unknown;
     tools: string[];
   }): Promise<PulseEvidencePlan>;
@@ -562,6 +740,11 @@ export interface ModelProvider {
     chunks: Array<{ id: string; text: string; headingPath: string | null; pageNumber: number | null }>;
     existingRows: PulseEvidenceRow[];
   }): Promise<PulseEvidenceRow[]>;
+  reviewEvidenceRowClassifications(input: {
+    question: string;
+    questionTask?: QuestionTask | undefined;
+    rows: PulseEvidenceRow[];
+  }): Promise<SemanticClassificationReview[]>;
   judgePulseEvidenceSufficiency(input: {
     question: string;
     questionPlan: PulseQuestionPlan;
@@ -615,12 +798,8 @@ function hashedEmbedding(text: string, dimensions = 384): number[] {
   return normalizedVector(vector);
 }
 
-function demoAspects(text: string, kind: "concept" | "claim"): AspectKind[] {
+function demoAspects(_text: string, kind: "concept" | "claim"): AspectKind[] {
   if (kind === "claim") return ["claim"];
-  if (/人|用户|研究者|author|person|team/i.test(text)) return ["person"];
-  if (/系统|模型|平台|数据集|system|model|dataset|schema|programming/i.test(text)) return ["system"];
-  if (/步骤|操作|更新|流程|方法|operation|process|update/i.test(text)) return ["operation"];
-  if (/时间|阶段|日期|年|time|date|phase/i.test(text)) return ["time"];
   return ["other"];
 }
 
@@ -697,9 +876,13 @@ export class FakeModelProvider implements ModelProvider {
         evidenceChunkIds: selected.flatMap((chunk) => [chunk.id]),
       },
       aspects: [{
+        kind: "other",
+        domainKind: "演示切面",
         title: "全局理解",
         summary: "演示模型生成的切面，用于验证 AORI 独立产物保存和展示。",
         centralQuestion: "文档整体表达了什么？",
+        classificationRationale: "演示模型直接提供受控 schema 标签。",
+        confidence: 0.55,
         items,
         relations,
         gaps: input.context.truncated ? [{
@@ -865,10 +1048,26 @@ export class FakeModelProvider implements ModelProvider {
     return fallbackPulseQuestionPlan();
   }
 
+  async classifyQuestionTask(input: {
+    question: string;
+    questionPlan: PulseQuestionPlan;
+  }): Promise<QuestionTask> {
+    return fallbackQuestionTask(input.question, input.questionPlan);
+  }
+
+  async planRetrievalTasks(input: {
+    question: string;
+    questionTask: QuestionTask;
+  }): Promise<RetrievalTask[]> {
+    return fallbackRetrievalTasks(input.question, input.questionTask);
+  }
+
   async planPulseEvidence(input: {
     question: string;
     mode: PulseAnswerContext["mode"];
     questionPlan: PulseQuestionPlan;
+    questionTask?: QuestionTask | undefined;
+    retrievalTasks?: RetrievalTask[] | undefined;
     memorySummary: unknown;
     tools: string[];
   }): Promise<PulseEvidencePlan> {
@@ -888,8 +1087,18 @@ export class FakeModelProvider implements ModelProvider {
       claimText: chunk.text.slice(0, 180) || "证据片段",
       evidenceChunkId: chunk.id,
       evidenceQuote: chunk.text.slice(0, 220) || "证据片段",
+      role: "direct_fact",
+      authority: "unknown",
+      usage: "answer_core",
+      classificationRationale: "Fake model marks the row as a source-bound direct fact for tests.",
       confidence: 0.55,
     }));
+  }
+
+  async reviewEvidenceRowClassifications(input: {
+    rows: PulseEvidenceRow[];
+  }): Promise<SemanticClassificationReview[]> {
+    return acceptedSemanticReviewsForRows(input.rows);
   }
 
   async judgePulseEvidenceSufficiency(input: {
@@ -1059,7 +1268,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
           content:
             "Repair the supplied malformed knowledge-graph JSON into valid JSON matching exactly this shape: " +
             '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["system"]}],"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],"themes":[{"title":"...","summary":"...","memberKeys":["n1"],"evidenceChunkIds":["..."],"aspects":["other"]}]}. ' +
-            "Use only the supplied allowedChunkIds in evidenceChunkIds. Use only valid relation types and aspects. " +
+            `Use only the supplied allowedChunkIds in evidenceChunkIds. Use only valid relation types and aspects from ${aspectKinds.join(", ")}. ` +
             "If a field is missing, choose a conservative valid value. All human-readable strings must be Simplified Chinese. Return JSON only.",
         },
         { role: "user", content: JSON.stringify({ parseError: errorMessage, allowedChunkIds: allowedChunks.map((chunk) => chunk.id), malformedJson: raw.slice(0, 14000) }) },
@@ -1120,7 +1329,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
       '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
       '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
       "Node kind is concept or claim. Relation type must be supports, contradicts, explains, depends_on, example_of, or related_to. " +
-      "Every node and theme must include an aspects array (it may be empty) chosen from person, operation, system, story, claim, conflict, time, other. " +
+      `Every node and theme must include an aspects array (it may be empty) chosen from ${aspectKinds.join(", ")}. ` +
       "Create a small number of themes only when multiple nodes share a defensible higher-level subject; themes organize navigation and must cite evidence. " +
       "Candidate evidence may come from other documents and should be used to identify contradictions. " +
       "Every node and relation must cite evidenceChunkIds from supplied evidence or candidate ids; only create defensible relationships. " +
@@ -1142,10 +1351,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
       "Never infer from omitted ranges. Do not use paragraph-sized or sentence-sized fragments as the main understanding unit; small chunks are only for quote lookup and evidence backtracking. " +
       `When this group is truncated, its usedTokenEstimate must be at least ${aori?.minTruncatedContextTokens ?? 10_000} unless the remaining original text is smaller. ` +
       "Return JSON with exactly this shape: " +
-      '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["person|operation|system|story|claim|conflict|time|other"]}],' +
+      '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["entity|event|claim|system|other"]}],' +
       '"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],' +
       '"themes":[{"title":"...","summary":"...","memberKeys":["n1","n2"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
-      "Every node, relation, and theme must cite evidenceChunkIds from supplied evidence ids. Use Simplified Chinese for every title, summary, and reason. " +
+      `Every node, relation, and theme must cite evidenceChunkIds from supplied evidence ids. Aspects must be chosen from ${aspectKinds.join(", ")}. Use Simplified Chinese for every title, summary, and reason. ` +
       "Relation Governance Rules: only use allowed relation types; co-occurrence is not a strong relation; strong relations require direct evidence; direction matters; contradiction requires same scope; if unsure, omit the relation or use related_to with low confidence. " +
       "Closure Check: before returning, check whether important sections in the supplied large context group are missing from nodes/themes, and prefer adding a source-faithful node over over-compressing unrelated meanings.";
     const body: Record<string, unknown> = {
@@ -1219,11 +1428,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "Every item, relation, self-question answer, and global understanding must cite evidenceChunkIds from the supplied evidence ids. " +
             "Aspect relations must use sourceKey/targetKey from the same aspect items. " +
             "The formal document relation name must come from relationTextInSource or normalizedRelation; baseRelation is only a compatibility enum. " +
+            "Choose aspect kind from the controlled schema and add domainKind as an open document-local label. Include classificationRationale and confidence. " +
             "Do not invent relation names without source evidence. If coverage is incomplete, add gaps. " +
             "Use Simplified Chinese for human-readable text. Return exactly this shape: " +
-            '{"understanding":{"summary":"...","centralQuestion":"...","centralNodeTitle":"...","evidenceChunkIds":["chunk-id"]},' +
-            '"aspects":[{"title":"...","summary":"...","centralQuestion":"...","items":[{"key":"i1","title":"...","summary":"...","evidenceChunkIds":["chunk-id"],"sourceNodeIds":["optional-tree-node-id"]}],' +
-            '"relations":[{"sourceKey":"i1","targetKey":"i2","relationTextInSource":"source phrase","normalizedRelation":"document relation name","baseRelation":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["chunk-id"]}],' +
+            '{"understanding":{"summary":"...","centralQuestion":"...","centralNodeTitle":"...","evidenceChunkIds":["chunk-id"],"evidenceStatus":"supported|partially_supported|unsupported|disputed","closureStatus":"closed|partial|open","classificationRationale":"...","confidence":0.8},' +
+            '"aspects":[{"kind":"entity|event|amount|evidence|argument|claim|finding|timeline|other","domainKind":"document-local label","title":"...","summary":"...","centralQuestion":"...","classificationRationale":"...","confidence":0.8,"closureStatus":"closed|partial|open","items":[{"key":"i1","title":"...","summary":"...","evidenceChunkIds":["chunk-id"],"sourceNodeIds":["optional-tree-node-id"],"evidenceStatus":"supported|partially_supported|unsupported|disputed","closureStatus":"closed|partial|open","fallbackOnly":false,"classificationRationale":"...","confidence":0.8}],' +
+            '"relations":[{"sourceKey":"i1","targetKey":"i2","domainRelation":"document relation label","relationTextInSource":"source phrase","normalizedRelation":"document relation name","baseRelation":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["chunk-id"],"evidenceStatus":"supported|partially_supported|unsupported|disputed","closureStatus":"closed|partial|open"}],' +
             '"gaps":[{"description":"...","severity":"low|medium|high","evidenceChunkIds":["chunk-id"]}]}],' +
             '"selfQuestions":[{"question":"...","answer":"...","evidenceChunkIds":["chunk-id"],"status":"answered|gap|unchecked"}],' +
             '"reflectiveReport":{"summary":"...","completenessRisk":"none|low|medium|high","warnings":["..."],"truncationCount":0}}',
@@ -1509,7 +1719,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "6. It will be checked by graphRules and quick rule audit. " +
             "不要输出解释文本，只返回 JSON，形状必须是：" +
             '{"nodes":[{"key":"n1","kind":"concept|claim","title":"...","summary":"...","evidenceChunkIds":["..."],"aspects":["claim"]}],"relations":[{"sourceKey":"n1","targetKey":"n2","type":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["..."]}],"themes":[{"title":"...","summary":"...","memberKeys":["n1"],"evidenceChunkIds":["..."],"aspects":["system"]}]}. ' +
-            "aspects 只能从 person, operation, system, story, claim, conflict, time, other 中选择。所有 evidenceChunkIds 必须来自提供的 original chunk id。节点数量保持紧凑，关系只生成可由原文支撑的候选。",
+            `aspects 只能从 ${aspectKinds.join(", ")} 中选择。所有 evidenceChunkIds 必须来自提供的 original chunk id。节点数量保持紧凑，关系只生成可由原文支撑的候选。`,
         },
         { role: "user", content: JSON.stringify({ document: graphContext.documentName, auditSummary: audit.summary, findings, original, graph, reconstruction: audit.reconstruction, previousGraphRebuild }) },
       ],
@@ -1572,10 +1782,87 @@ export class OpenAICompatibleProvider implements ModelProvider {
     }
   }
 
+  async classifyQuestionTask(input: {
+    question: string;
+    mode: PulseAnswerContext["mode"];
+    questionPlan: PulseQuestionPlan;
+    planningContext?: unknown;
+  }): Promise<QuestionTask> {
+    if (!this.config.chatModel) return fallbackQuestionTask(input.question, input.questionPlan);
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "QuestionTask semantic classifier. Decide the task from the supplied question, questionPlan, and planning context. " +
+            "Use the schema labels only as labels; do not use regex or keyword rules. Bind the decision to visible planning evidence and explain uncertainty. " +
+            'Return JSON only: {"question":"...","taskType":"summary|fact_lookup|exhaustive_list|numeric_reconciliation|timeline|entity_relation|claim_support|argument_comparison|event_count|scope_classification|mixed","targetSubjects":["..."],"targetObjects":["..."],"expectedAnswerShape":"summary|single_fact|table|list|timeline|numeric_table|event_table|argument_map","requiredEvidenceRoles":["direct_fact"],"exclusionRoles":["background_fact"],"ambiguityNotes":["..."],"needsDedupe":false,"needsReconciliation":false,"needsPerspectiveOrAuthority":false,"mustExposeGaps":true,"rationale":"...","confidence":0.8}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1000,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    try {
+      const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+        this.config.aiBaseUrl,
+        this.config.aiApiKey,
+        "/chat/completions",
+        body,
+      );
+      return questionTaskSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+    } catch {
+      return fallbackQuestionTask(input.question, input.questionPlan);
+    }
+  }
+
+  async planRetrievalTasks(input: {
+    question: string;
+    mode: PulseAnswerContext["mode"];
+    questionPlan: PulseQuestionPlan;
+    questionTask: QuestionTask;
+    planningContext?: unknown;
+  }): Promise<RetrievalTask[]> {
+    if (!this.config.chatModel) return fallbackRetrievalTasks(input.question, input.questionTask);
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "RetrievalTask planner. Generate semantic retrieval tasks before tool selection. " +
+            "Do not use regex scanners or domain-specific special cases. Choose purposes, targetRoles, and requiredContext from the schema. " +
+            'Return JSON only: {"retrievalTasks":[{"id":"rt1","purpose":"find_direct_facts|find_itemized_components|find_offsets_or_exclusions|find_authority_finding|find_counterargument|find_supporting_evidence|find_scope_boundary|find_possible_duplicates|find_perspective_or_speaker|find_gap_verification","query":"...","targetRoles":["direct_fact"],"excludeRoles":["background_fact"],"requiredContext":"aori_aspect|retrieval_unit|context_unit|section|same_section|remaining_after|document_outline","expectedOutput":"evidence_rows|amount_components|event_candidates|argument_pairs|authority_scope|gap_evidence","rationale":"..."}]}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1200,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    try {
+      const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+        this.config.aiBaseUrl,
+        this.config.aiApiKey,
+        "/chat/completions",
+        body,
+      );
+      return cleanRetrievalTasks(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input.question, input.questionTask);
+    } catch {
+      return fallbackRetrievalTasks(input.question, input.questionTask);
+    }
+  }
+
   async planPulseEvidence(input: {
     question: string;
     mode: PulseAnswerContext["mode"];
     questionPlan: PulseQuestionPlan;
+    questionTask?: QuestionTask | undefined;
+    retrievalTasks?: RetrievalTask[] | undefined;
     memorySummary: unknown;
     tools: string[];
   }): Promise<PulseEvidencePlan> {
@@ -1634,7 +1921,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "Pulse Evidence Extractor. Extract structured EvidenceRows only from supplied chunks. " +
             "Every row must cite evidenceChunkId and evidenceQuote. Do not infer facts not present. If uncertain, lower confidence or omit the row. " +
             "For exhaustive/list questions, distinguish declared totals from itemized rows. Do not mix declared totals with itemized amounts. " +
-            'Return JSON only: {"rows":[{"rowId":"...","evidenceType":"fact|amount|date|entity_relation|claim|quote|other","claimText":"...","structuredValue":{},"sourceEntity":"...","targetEntity":"...","relationType":"...","evidenceChunkId":"...","evidenceQuote":"...","confidence":0.8,"countedInAnswer":true,"dedupeKey":"...","warnings":["..."]}]}',
+            "Classify role, authority, and usage semantically from the source and explain the classification. Do not use regex or keyword shortcuts. " +
+            'Return JSON only: {"rows":[{"rowId":"...","evidenceType":"fact|amount|date|entity_relation|claim|quote|other","claimText":"...","structuredValue":{},"sourceEntity":"...","targetEntity":"...","relationType":"...","evidenceChunkId":"...","evidenceQuote":"...","role":"direct_fact|declared_total|itemized_value|authority_finding|defense_argument|gap_candidate","authority":"court_finding|prosecution_claim|defense_argument|witness|documentary_record|narrator|character_perspective|news_report|model_inferred|unknown","usage":"answer_core|supporting_detail|counterpoint|excluded_from_answer|gap_verification|background_only","classificationRationale":"...","confidence":0.8,"countedInAnswer":true,"dedupeKey":"...","warnings":["..."]}]}',
         },
         { role: "user", content: JSON.stringify(input) },
       ],
@@ -1646,6 +1934,47 @@ export class OpenAICompatibleProvider implements ModelProvider {
       return cleanPulseEvidenceRows(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), allowedChunkIds);
     } catch {
       return [];
+    }
+  }
+
+  async reviewEvidenceRowClassifications(input: {
+    question: string;
+    questionTask?: QuestionTask | undefined;
+    rows: PulseEvidenceRow[];
+  }): Promise<SemanticClassificationReview[]> {
+    if (!this.config.chatModel || input.rows.length === 0) return acceptedSemanticReviewsForRows(input.rows);
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Semantic classification critic. Review each EvidenceRow role, authority, usage, and rationale against its quote and the QuestionTask. " +
+            "Accept only source-bound classifications. If a label is unsupported or too uncertain, reject it or provide correctedLabel; do not repair with regex rules. " +
+            'Return JSON only: {"reviews":[{"itemId":"row-id","accepted":true,"correctedLabel":"direct_fact","reason":"...","requiredAdditionalEvidence":["..."],"risk":"low|medium|high"}]}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1400,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    try {
+      const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+        this.config.aiBaseUrl,
+        this.config.aiApiKey,
+        "/chat/completions",
+        body,
+      );
+      const parsed = parseJsonModelObject(response.choices[0]?.message.content ?? "{}") as { reviews?: unknown };
+      const reviews = Array.isArray(parsed.reviews) ? parsed.reviews : [];
+      return reviews.flatMap((entry): SemanticClassificationReview[] => {
+        const result = semanticClassificationReviewSchema.safeParse(entry);
+        return result.success ? [result.data] : [];
+      });
+    } catch {
+      return acceptedSemanticReviewsForRows(input.rows);
     }
   }
 

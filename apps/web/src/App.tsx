@@ -690,6 +690,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
             <GraphWorkspace
               key={library.id}
               libraryId={library.id}
+              documents={documents}
               refreshKey={refreshGraph}
               ruleGovernanceFeed={ruleGovernanceFeed}
               onError={onError}

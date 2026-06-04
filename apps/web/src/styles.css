@@ -465,6 +465,12 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .graph-depth { display: flex; gap: 4px; padding: 3px; background: #0d1728; border: 1px solid #25334c; border-radius: 9px; }
 .graph-depth button { padding: 6px 10px; border: 0; background: transparent; color: #8d9db7; }
 .graph-depth button.selected { background: #1b393a; color: #82e4ca; }
+.graph-depth button:disabled { opacity: .42; cursor: not-allowed; }
+.aori-version-select { max-width: 190px; }
+.toolbar-search input:disabled, .toolbar-group select:disabled {
+  opacity: .62;
+  cursor: not-allowed;
+}
 .graph-body { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px; }
 .canvas { position: relative; min-width: 0; background: #0b1426; }
 .graph-empty {
@@ -486,7 +492,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   background: #0c1526;
 }
 .inspector h3 { font-size: 13px; margin: 0 0 9px; color: #aab8d1; }
-.manual-edge, .overview-hint, .node-detail, .relation-detail, .suggestions, .search-results, .pulse-panel, .rule-governance-card {
+.manual-edge, .overview-hint, .node-detail, .relation-detail, .suggestions, .search-results, .pulse-panel, .rule-governance-card, .aori-graph-panel, .aori-detail-card {
   border: 1px solid #1d2940; background: #111b30; border-radius: 10px; padding: 10px;
 }
 .rule-governance-card { display: grid; gap: 9px; border-color: #254456; }
@@ -512,6 +518,33 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .rule-trace span { color: #8bd9c7; font-size: 11px; }
 .rule-trace strong { color: #dce7f6; font-size: 12px; overflow-wrap: anywhere; }
 .rule-trace small { color: #9eafc8; line-height: 1.4; overflow-wrap: anywhere; }
+.aori-graph-panel { display: grid; gap: 9px; border-color: #2b4f5e; }
+.aori-status-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px;
+}
+.aori-status-grid span {
+  min-width: 0; padding: 7px 8px; border-radius: 8px; background: #0d1728;
+  color: #9eafc8; font-size: 11px; overflow-wrap: anywhere;
+}
+.aori-status-grid strong { display: block; color: #e4edf7; font-size: 15px; }
+.aori-distribution-list, .aori-warning-list {
+  display: grid; gap: 6px; padding: 8px; border: 1px solid #23334b; border-radius: 8px; background: #0d1728;
+}
+.aori-distribution-list > strong, .aori-warning-list > strong { color: #8bd9c7; font-size: 12px; }
+.aori-distribution-list span {
+  display: flex; justify-content: space-between; gap: 8px; min-width: 0; color: #c7d4e7; font-size: 12px;
+}
+.aori-distribution-list em {
+  min-width: 0; color: #c7d4e7; font-style: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.aori-distribution-list small, .aori-warning-list small { color: #93a4be; line-height: 1.4; overflow-wrap: anywhere; }
+.aori-tags, .aori-edge-meta {
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.aori-tags span, .aori-edge-meta span {
+  padding: 3px 7px; border: 1px solid #2c405e; border-radius: 999px;
+  background: #101d2f; color: #9ebfff; font-size: 11px; font-weight: 700;
+}
 .pulse-panel { display: grid; gap: 9px; }
 .pulse-panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .pulse-panel-heading h3 { margin: 0; color: #8bd9c7; }
@@ -737,6 +770,37 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .flow-claim { background: #263154 !important; color: #9bbdff !important; }
 .flow-theme { background: #3a3022 !important; color: #efc981 !important; border: 1px solid #705834 !important; }
 .flow-chunk { background: #1d2639 !important; color: #c3cee0 !important; }
+.flow-aori {
+  color: #e4edf7 !important;
+  font-size: 13px !important;
+  line-height: 1.35 !important;
+  padding: 10px 12px !important;
+  border: 1px solid #27364f !important;
+  box-shadow: 0 3px 18px #0004;
+  overflow-wrap: anywhere;
+}
+.flow-aori-document-center { background: #123734 !important; border-color: #2c7c70 !important; color: #9af1dd !important; }
+.flow-aori-aspect { background: #2f2a1e !important; border-color: #735f31 !important; color: #f2d184 !important; }
+.flow-aori-aspect-item { background: #16243a !important; border-color: #2d4d72 !important; color: #c8dcf8 !important; }
+.flow-aori-self-question { background: #1c273d !important; border-color: #3d5580 !important; color: #a9c8ff !important; }
+.flow-aori-source-chunk { background: #202838 !important; border-color: #3a465c !important; color: #bdc9dc !important; }
+.flow-aori-gap, .flow-aori-warning, .flow-aori-evidence-unsupported, .flow-aori-fallback-only {
+  background: #2b1d27 !important;
+  border-color: #7a4055 !important;
+  color: #f2b3c4 !important;
+}
+.flow-aori-closure-open { box-shadow: 0 0 0 1px #e7ba63, 0 4px 20px #e7ba6338 !important; }
+.flow-aori-closure-closed { box-shadow: 0 0 0 1px #37a78355, 0 3px 18px #0004 !important; }
+.flow-aori-collapsed { opacity: .72; }
+.flow-aori-label { justify-items: start; text-align: left; }
+.flow-aori-label span {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.flow-aori-label small { color: #9fb0c8; font-size: 11px; line-height: 1.35; }
+.flow-aori-edge path { filter: drop-shadow(0 0 3px #0007); }
 .flow-context { opacity: .46; }
 .flow-aspect-match { box-shadow: 0 0 0 1px #65ddbf, 0 4px 22px #40c29f42 !important; }
 .flow-search-match {

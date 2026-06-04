@@ -275,9 +275,10 @@ function parseAspects(value: Row[string] | undefined): AspectKind[] {
   try {
     const parsed = JSON.parse(value) as unknown;
     if (!Array.isArray(parsed)) return [];
-    return normalizeAspects(parsed.filter(
-      (entry): entry is AspectKind => typeof entry === "string" && aspectKinds.includes(entry as AspectKind),
-    ));
+    return normalizeAspects(parsed.flatMap((entry): AspectKind[] => {
+      if (entry === "time") return ["timeline"];
+      return typeof entry === "string" && aspectKinds.includes(entry as AspectKind) ? [entry as AspectKind] : [];
+    }));
   } catch {
     return [];
   }
@@ -704,9 +705,15 @@ export class AgentDatabase {
       CREATE TABLE IF NOT EXISTS aori_aspects (
         id TEXT PRIMARY KEY,
         version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL DEFAULT 'other',
+        domain_kind TEXT NOT NULL DEFAULT 'unknown',
         title TEXT NOT NULL,
         summary TEXT NOT NULL,
         central_question TEXT NOT NULL,
+        classification_rationale TEXT NOT NULL DEFAULT '',
+        confidence REAL NOT NULL DEFAULT 0.3,
+        evidence_status TEXT NOT NULL DEFAULT 'unsupported',
+        closure_status TEXT NOT NULL DEFAULT 'open',
         item_ids_json TEXT NOT NULL DEFAULT '[]',
         relation_ids_json TEXT NOT NULL DEFAULT '[]'
       );
@@ -717,7 +724,12 @@ export class AgentDatabase {
         title TEXT NOT NULL,
         summary TEXT NOT NULL,
         source_node_ids_json TEXT NOT NULL DEFAULT '[]',
-        evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]'
+        evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+        evidence_status TEXT NOT NULL DEFAULT 'unsupported',
+        closure_status TEXT NOT NULL DEFAULT 'open',
+        fallback_only INTEGER NOT NULL DEFAULT 0,
+        classification_rationale TEXT NOT NULL DEFAULT '',
+        confidence REAL NOT NULL DEFAULT 0.3
       );
       CREATE TABLE IF NOT EXISTS aori_aspect_relations (
         id TEXT PRIMARY KEY,
@@ -726,17 +738,23 @@ export class AgentDatabase {
         source_item_id TEXT NOT NULL REFERENCES aori_aspect_items(id) ON DELETE CASCADE,
         target_item_id TEXT NOT NULL REFERENCES aori_aspect_items(id) ON DELETE CASCADE,
         relation_name TEXT NOT NULL,
+        domain_relation TEXT NOT NULL DEFAULT 'unknown',
         base_relation TEXT NOT NULL CHECK (base_relation IN ('supports','contradicts','explains','depends_on','example_of','related_to')),
         relation_text_in_source TEXT,
         normalized_relation TEXT,
         reason TEXT NOT NULL,
         confidence REAL NOT NULL,
-        evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]'
+        evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+        evidence_status TEXT NOT NULL DEFAULT 'unsupported',
+        closure_status TEXT NOT NULL DEFAULT 'open'
       );
       CREATE TABLE IF NOT EXISTS aori_relation_lexicon (
         version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
         relation_name TEXT NOT NULL,
+        domain_relation TEXT,
+        normalized_meaning TEXT,
         base_relation TEXT NOT NULL CHECK (base_relation IN ('supports','contradicts','explains','depends_on','example_of','related_to')),
+        confidence REAL,
         source_examples_json TEXT NOT NULL DEFAULT '[]',
         PRIMARY KEY(version_id, relation_name)
       );
@@ -953,6 +971,23 @@ export class AgentDatabase {
     this.addColumn("document_versions", "index_warnings_json", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumn("document_versions", "index_strategy", "TEXT NOT NULL DEFAULT 'bottom_up_evidence'");
     this.addColumn("document_versions", "record_indexing_rationale", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("aori_aspects", "kind", "TEXT NOT NULL DEFAULT 'other'");
+    this.addColumn("aori_aspects", "domain_kind", "TEXT NOT NULL DEFAULT 'unknown'");
+    this.addColumn("aori_aspects", "classification_rationale", "TEXT NOT NULL DEFAULT ''");
+    this.addColumn("aori_aspects", "confidence", "REAL NOT NULL DEFAULT 0.3");
+    this.addColumn("aori_aspects", "evidence_status", "TEXT NOT NULL DEFAULT 'unsupported'");
+    this.addColumn("aori_aspects", "closure_status", "TEXT NOT NULL DEFAULT 'open'");
+    this.addColumn("aori_aspect_items", "evidence_status", "TEXT NOT NULL DEFAULT 'unsupported'");
+    this.addColumn("aori_aspect_items", "closure_status", "TEXT NOT NULL DEFAULT 'open'");
+    this.addColumn("aori_aspect_items", "fallback_only", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("aori_aspect_items", "classification_rationale", "TEXT NOT NULL DEFAULT ''");
+    this.addColumn("aori_aspect_items", "confidence", "REAL NOT NULL DEFAULT 0.3");
+    this.addColumn("aori_aspect_relations", "domain_relation", "TEXT NOT NULL DEFAULT 'unknown'");
+    this.addColumn("aori_aspect_relations", "evidence_status", "TEXT NOT NULL DEFAULT 'unsupported'");
+    this.addColumn("aori_aspect_relations", "closure_status", "TEXT NOT NULL DEFAULT 'open'");
+    this.addColumn("aori_relation_lexicon", "domain_relation", "TEXT");
+    this.addColumn("aori_relation_lexicon", "normalized_meaning", "TEXT");
+    this.addColumn("aori_relation_lexicon", "confidence", "REAL");
     this.addColumn("ingest_jobs", "index_strategy", "TEXT NOT NULL DEFAULT 'bottom_up_evidence'");
     this.addColumn("ingest_jobs", "record_indexing_rationale", "INTEGER NOT NULL DEFAULT 0");
     this.addColumn("pulse_hits", "step_index", "INTEGER");
@@ -2246,19 +2281,22 @@ export class AgentDatabase {
       );
       const insertAspect = this.sql.prepare(`
         INSERT INTO aori_aspects
-          (id, version_id, title, summary, central_question, item_ids_json, relation_ids_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+          (id, version_id, kind, domain_kind, title, summary, central_question, classification_rationale,
+            confidence, evidence_status, closure_status, item_ids_json, relation_ids_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const insertItem = this.sql.prepare(`
         INSERT INTO aori_aspect_items
-          (id, version_id, aspect_id, title, summary, source_node_ids_json, evidence_chunk_ids_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+          (id, version_id, aspect_id, title, summary, source_node_ids_json, evidence_chunk_ids_json,
+            evidence_status, closure_status, fallback_only, classification_rationale, confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const insertRelation = this.sql.prepare(`
         INSERT INTO aori_aspect_relations
-          (id, version_id, aspect_id, source_item_id, target_item_id, relation_name, base_relation,
-            relation_text_in_source, normalized_relation, reason, confidence, evidence_chunk_ids_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, version_id, aspect_id, source_item_id, target_item_id, relation_name, domain_relation, base_relation,
+            relation_text_in_source, normalized_relation, reason, confidence, evidence_chunk_ids_json,
+            evidence_status, closure_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const insertClosure = this.sql.prepare(`
         INSERT INTO aori_closure_reports
@@ -2269,9 +2307,15 @@ export class AgentDatabase {
         insertAspect.run(
           aspect.id,
           index.versionId,
+          aspect.kind,
+          aspect.domainKind,
           aspect.title,
           aspect.summary,
           aspect.centralQuestion,
+          aspect.classificationRationale,
+          aspect.confidence,
+          aspect.evidenceStatus,
+          aspect.closureStatus,
           JSON.stringify(aspect.itemIds),
           JSON.stringify(aspect.relationIds),
         );
@@ -2284,6 +2328,11 @@ export class AgentDatabase {
             item.summary,
             JSON.stringify(item.sourceNodeIds),
             JSON.stringify(item.evidenceChunkIds),
+            item.evidenceStatus,
+            item.closureStatus,
+            item.fallbackOnly ? 1 : 0,
+            item.classificationRationale,
+            item.confidence,
           );
         }
         for (const relation of aspect.relations) {
@@ -2294,12 +2343,15 @@ export class AgentDatabase {
             relation.sourceItemId,
             relation.targetItemId,
             relation.relationName,
+            relation.domainRelation,
             relation.baseRelation,
             relation.relationTextInSource ?? null,
             relation.normalizedRelation ?? null,
             relation.reason,
             relation.confidence,
             JSON.stringify(relation.evidenceChunkIds),
+            relation.evidenceStatus,
+            relation.closureStatus,
           );
         }
         const report = aspect.closureReport;
@@ -2331,11 +2383,19 @@ export class AgentDatabase {
       }
       const insertLexicon = this.sql.prepare(`
         INSERT INTO aori_relation_lexicon
-          (version_id, relation_name, base_relation, source_examples_json)
-        VALUES (?, ?, ?, ?)
+          (version_id, relation_name, domain_relation, normalized_meaning, base_relation, confidence, source_examples_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
       for (const entry of index.relationLexicon.entries) {
-        insertLexicon.run(index.versionId, entry.relationName, entry.baseRelation, JSON.stringify(entry.sourceExamples));
+        insertLexicon.run(
+          index.versionId,
+          entry.relationName,
+          entry.domainRelation ?? null,
+          entry.normalizedMeaning ?? null,
+          entry.baseRelation,
+          entry.confidence ?? null,
+          JSON.stringify(entry.sourceExamples),
+        );
       }
       const insertQuestion = this.sql.prepare(`
         INSERT INTO aori_self_questions
@@ -2398,6 +2458,11 @@ export class AgentDatabase {
         summary: String(entry.summary),
         sourceNodeIds: parseTextList(entry.source_node_ids_json),
         evidenceChunkIds: parseTextList(entry.evidence_chunk_ids_json),
+        evidenceStatus: String(entry.evidence_status ?? "unsupported") as AspectItem["evidenceStatus"],
+        closureStatus: String(entry.closure_status ?? "open") as AspectItem["closureStatus"],
+        fallbackOnly: Boolean(Number(entry.fallback_only ?? 0)),
+        classificationRationale: String(entry.classification_rationale ?? ""),
+        confidence: Number(entry.confidence ?? 0.3),
       }));
     const relations = rows(this.sql.prepare("SELECT * FROM aori_aspect_relations WHERE version_id = ?"), versionId)
       .map((entry): AspectRelation => ({
@@ -2407,12 +2472,15 @@ export class AgentDatabase {
         sourceItemId: String(entry.source_item_id),
         targetItemId: String(entry.target_item_id),
         relationName: String(entry.relation_name),
+        domainRelation: String(entry.domain_relation ?? entry.relation_name ?? "unknown"),
         baseRelation: String(entry.base_relation) as RelationType,
         ...(entry.relation_text_in_source === null ? {} : { relationTextInSource: String(entry.relation_text_in_source) }),
         ...(entry.normalized_relation === null ? {} : { normalizedRelation: String(entry.normalized_relation) }),
         reason: String(entry.reason),
         confidence: Number(entry.confidence),
         evidenceChunkIds: parseTextList(entry.evidence_chunk_ids_json),
+        evidenceStatus: String(entry.evidence_status ?? "unsupported") as AspectRelation["evidenceStatus"],
+        closureStatus: String(entry.closure_status ?? "open") as AspectRelation["closureStatus"],
       }));
     const closureReports = rows(this.sql.prepare("SELECT * FROM aori_closure_reports WHERE version_id = ?"), versionId)
       .map((entry): ClosureReport => ({
@@ -2457,9 +2525,15 @@ export class AgentDatabase {
         return {
           id: String(entry.id),
           versionId,
+          kind: aspectKinds.includes(entry.kind as AspectKind) ? entry.kind as AspectKind : "other",
+          domainKind: String(entry.domain_kind ?? "unknown"),
           title: String(entry.title),
           summary: String(entry.summary),
           centralQuestion: String(entry.central_question),
+          classificationRationale: String(entry.classification_rationale ?? ""),
+          confidence: Number(entry.confidence ?? 0.3),
+          evidenceStatus: String(entry.evidence_status ?? "unsupported") as Aspect["evidenceStatus"],
+          closureStatus: String(entry.closure_status ?? closureReport.status) as Aspect["closureStatus"],
           itemIds: parseTextList(entry.item_ids_json),
           relationIds: parseTextList(entry.relation_ids_json),
           items: aspectItems,
@@ -2472,7 +2546,10 @@ export class AgentDatabase {
       entries: rows(this.sql.prepare("SELECT * FROM aori_relation_lexicon WHERE version_id = ? ORDER BY relation_name"), versionId)
         .map((entry) => ({
           relationName: String(entry.relation_name),
+          ...(entry.domain_relation === null || entry.domain_relation === undefined ? {} : { domainRelation: String(entry.domain_relation) }),
+          ...(entry.normalized_meaning === null || entry.normalized_meaning === undefined ? {} : { normalizedMeaning: String(entry.normalized_meaning) }),
           baseRelation: String(entry.base_relation) as RelationType,
+          ...(entry.confidence === null || entry.confidence === undefined ? {} : { confidence: Number(entry.confidence) }),
           sourceExamples: parseJsonValue(entry.source_examples_json, []),
         })),
     };

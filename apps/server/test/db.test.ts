@@ -359,7 +359,7 @@ describe("knowledge database", () => {
     }, secondVersion.id);
 
     const shared = db.getGraph(library.id, {}).nodes.find((node) => node.nodeType === "abstract")!;
-    expect(shared.nodeType === "abstract" && shared.data.aspects).toEqual(["system", "claim"]);
+    expect(shared.nodeType === "abstract" && shared.data.aspects).toEqual(["claim", "system"]);
     expect(db.updateNodeAspects(shared.id, [])).toMatchObject({ aspects: [], aspectSource: "manual" });
     expect(db.getGraph(library.id, { aspect: "system" }).aspectFilter).toMatchObject({ anyLabeled: false, matchCount: 0 });
     db.resetNodeAspects(shared.id);

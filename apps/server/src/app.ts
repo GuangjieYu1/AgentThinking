@@ -46,6 +46,7 @@ import { AnalysisPublisher } from "./services/analysis.js";
 import { LibraryEventBus } from "./services/library-events.js";
 import { MappingAuditService } from "./services/mapping-audit.js";
 import { PulseEngine } from "./services/pulse.js";
+import { buildAoriGraphDiagnostics, buildAoriGraphView } from "./services/aori.js";
 
 export interface AppServices {
   config: AppConfig;
@@ -346,6 +347,40 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     if (!source) return reply.status(404).send({ error: "导入版本不存在" });
     requireLibrary(db, source.libraryId, request.user);
     return db.getAoriDocumentIndex(request.params.versionId);
+  });
+  app.get<{ Params: { versionId: string }; Querystring: { mode?: string } }>("/api/versions/:versionId/aori/graph", async (request, reply) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) return reply.status(404).send({ error: "导入版本不存在" });
+    requireLibrary(db, source.libraryId, request.user);
+    const aori = db.getAoriDocumentIndex(request.params.versionId);
+    if (!aori.available) return reply.status(404).send(aori);
+    const mode = request.query.mode === "detail" || request.query.mode === "hybrid" ? request.query.mode : "overview";
+    return buildAoriGraphView(aori, mode);
+  });
+  app.get<{ Params: { versionId: string } }>("/api/versions/:versionId/aori/debug", async (request) => {
+    const source = db.getVersionSource(request.params.versionId);
+    if (!source) throw new Error("导入版本不存在");
+    requireLibrary(db, source.libraryId, request.user);
+    const aori = db.getAoriDocumentIndex(request.params.versionId);
+    if (!aori.available) {
+      return {
+        versionId: request.params.versionId,
+        hasAori: false,
+        aspectCount: 0,
+        itemCount: 0,
+        relationCount: 0,
+        aspectKindDistribution: {},
+        domainKindTopK: [],
+        domainRelationTopK: [],
+        closureDistribution: {},
+        unsupportedItemCount: 0,
+        fallbackOnlyItemCount: 0,
+        isolatedItemCount: 0,
+        legacyProjectionOtherRatio: 0,
+        warnings: [aori.message],
+      };
+    }
+    return { versionId: request.params.versionId, ...buildAoriGraphDiagnostics(aori) };
   });
   app.get<{ Params: { versionId: string } }>("/api/debug/versions/:versionId/v2-index-health", async (request) => {
     requireDebugAccess(config, request);

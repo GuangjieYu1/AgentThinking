@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import type {
   AoriDocumentDraft,
   AoriDocumentIndex,
+  AoriGraphDiagnostics,
+  AoriGraphEdge,
+  AoriGraphNode,
+  AoriGraphView,
   AoriGapItem,
   Aspect,
   AspectItem,
@@ -51,7 +55,7 @@ function mergeRisk(left: ReflectiveIndexReport["completenessRisk"], right: Refle
 }
 
 function relationNameOf(relation: AoriDocumentDraft["aspects"][number]["relations"][number]): string {
-  return (relation.normalizedRelation?.trim() || relation.relationTextInSource?.trim() || "").slice(0, 240);
+  return (relation.domainRelation?.trim() || relation.normalizedRelation?.trim() || relation.relationTextInSource?.trim() || "").slice(0, 240);
 }
 
 function quoteForChunk(chunk: Chunk | undefined): string {
@@ -100,6 +104,26 @@ function makeClosure(input: {
   };
 }
 
+function aspectEvidenceStatus(items: AspectItem[], relations: AspectRelation[]): Aspect["evidenceStatus"] {
+  const statuses = [...items.map((item) => item.evidenceStatus), ...relations.map((relation) => relation.evidenceStatus)];
+  if (statuses.length === 0 || statuses.every((status) => status === "unsupported")) return "unsupported";
+  if (statuses.some((status) => status === "disputed")) return "disputed";
+  if (statuses.every((status) => status === "supported")) return "supported";
+  return "partially_supported";
+}
+
+function aspectClosureStatus(report: ClosureReport): Aspect["closureStatus"] {
+  return report.status;
+}
+
+function supportedStatus(evidenceChunkIds: string[]): AspectItem["evidenceStatus"] {
+  return evidenceChunkIds.length > 0 ? "supported" : "unsupported";
+}
+
+function closureStatus(evidenceChunkIds: string[]): AspectItem["closureStatus"] {
+  return evidenceChunkIds.length > 0 ? "partial" : "open";
+}
+
 export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): AoriDocumentIndex {
   const createdAt = input.createdAt ?? new Date().toISOString();
   const chunkById = new Map(input.chunks.map((chunk) => [chunk.id, chunk]));
@@ -136,10 +160,9 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
         if (evidenceChunkIds.length === 0) {
           gaps.push(makeGap({
             aspectId,
-            description: `Aspect item "${draftItem.title}" has no source evidence and was excluded from the closed V_A set.`,
+            description: `Aspect item "${draftItem.title}" has no source evidence and remains unsupported/open.`,
             severity: "high",
           }));
-          continue;
         }
         const item: AspectItem = {
           id: `aori-item-${randomUUID()}`,
@@ -149,6 +172,18 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
           summary: truncateText(draftItem.summary || "", 2000),
           sourceNodeIds: uniqueStrings(draftItem.sourceNodeIds ?? []),
           evidenceChunkIds,
+          evidenceStatus: draftItem.evidenceStatus ?? supportedStatus(evidenceChunkIds),
+          closureStatus: draftItem.closureStatus ?? closureStatus(evidenceChunkIds),
+          fallbackOnly: draftItem.fallbackOnly === true,
+          classificationRationale: truncateText(
+            draftItem.classificationRationale || (
+              evidenceChunkIds.length > 0
+                ? "Model supplied source evidence for this AORI item."
+                : "Model did not supply valid evidenceChunkIds; no fallback evidence was bound."
+            ),
+            1000,
+          ),
+          confidence: Math.max(0, Math.min(1, draftItem.confidence ?? (evidenceChunkIds.length > 0 ? 0.5 : 0.3))),
         };
         items.push(item);
         itemIdByKey.set(draftItem.key, item.id);
@@ -164,13 +199,11 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
           warnings.push(`Relation "${relationName || draftRelation.baseRelation}" was excluded because source/target is outside V_A.`);
           continue;
         }
-        if (!relationName) {
-          warnings.push(`Relation ${draftRelation.sourceKey} -> ${draftRelation.targetKey} was excluded because it has no document relation name.`);
-          continue;
-        }
         if (evidenceChunkIds.length === 0) {
-          warnings.push(`Relation "${relationName}" was excluded because it has no source evidence.`);
-          continue;
+          warnings.push(`Relation "${relationName || "unknown"}" has no source evidence and remains unsupported/open.`);
+        }
+        if (!relationName) {
+          warnings.push(`Relation ${draftRelation.sourceKey} -> ${draftRelation.targetKey} has no document relation name and remains unsupported/open.`);
         }
         const relation: AspectRelation = {
           id: `aori-relation-${randomUUID()}`,
@@ -178,13 +211,16 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
           aspectId,
           sourceItemId,
           targetItemId,
-          relationName,
+          relationName: relationName || "unknown",
+          domainRelation: truncateText(draftRelation.domainRelation || relationName || "unknown", 240),
           baseRelation: draftRelation.baseRelation,
           ...(draftRelation.relationTextInSource ? { relationTextInSource: truncateText(draftRelation.relationTextInSource, 240) } : {}),
           ...(draftRelation.normalizedRelation ? { normalizedRelation: truncateText(draftRelation.normalizedRelation, 240) } : {}),
           reason: truncateText(draftRelation.reason || "AORI relation extracted from source evidence.", 1000),
           confidence: Math.max(0, Math.min(1, draftRelation.confidence)),
           evidenceChunkIds,
+          evidenceStatus: draftRelation.evidenceStatus ?? supportedStatus(evidenceChunkIds),
+          closureStatus: draftRelation.closureStatus ?? closureStatus(evidenceChunkIds),
         };
         relations.push(relation);
         allRelations.push(relation);
@@ -200,7 +236,7 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
       }
       if (items.length === 0) warnings.push("Aspect has no evidence-bound items in V_A.");
       if (draftAspect.centralQuestion.trim() && items.length < draftAspect.items.length) {
-        warnings.push("Aspect central question coverage is incomplete because some items lacked source evidence.");
+        warnings.push("Aspect central question coverage is incomplete because some items are unsupported/open.");
       }
 
       const closureReport = makeClosure({
@@ -215,9 +251,15 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
       const aspect: Aspect = {
         id: aspectId,
         versionId: input.versionId,
+        kind: draftAspect.kind,
+        domainKind: truncateText(draftAspect.domainKind || "unknown", 120),
         title: truncateText(draftAspect.title || `AORI aspect ${draftIndex + 1}.${aspectIndex + 1}`, 240),
         summary: truncateText(draftAspect.summary || "", 3000),
         centralQuestion: truncateText(draftAspect.centralQuestion || "该切面需要回答什么？", 1000),
+        classificationRationale: truncateText(draftAspect.classificationRationale || "Model did not provide an aspect classification rationale.", 1000),
+        confidence: Math.max(0, Math.min(1, draftAspect.confidence)),
+        evidenceStatus: aspectEvidenceStatus(items, relations),
+        closureStatus: aspectClosureStatus(closureReport),
         itemIds: items.map((item) => item.id),
         relationIds: relations.map((relation) => relation.id),
         items,
@@ -235,7 +277,10 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
     if (!firstEvidenceChunkId) continue;
     const entry = lexiconByName.get(relation.relationName) ?? {
       relationName: relation.relationName,
+      domainRelation: relation.domainRelation,
+      normalizedMeaning: relation.normalizedRelation ?? relation.relationName,
       baseRelation: relation.baseRelation,
+      confidence: relation.confidence,
       sourceExamples: [],
     };
     if (entry.sourceExamples.length < 5) {
@@ -290,24 +335,258 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
   };
 }
 
+function increment(map: Map<string, number>, key: string): void {
+  map.set(key, (map.get(key) ?? 0) + 1);
+}
+
+function topK(map: Map<string, number>, limit = 10): Array<{ label: string; count: number }> {
+  return [...map.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, limit)
+    .map(([label, count]) => ({ label, count }));
+}
+
+export function buildAoriGraphDiagnostics(index: AoriDocumentIndex): AoriGraphDiagnostics {
+  const kindCounts = new Map<string, number>();
+  const domainKindCounts = new Map<string, number>();
+  const domainRelationCounts = new Map<string, number>();
+  const closureCounts = new Map<string, number>();
+  let unsupportedItemCount = 0;
+  let fallbackOnlyItemCount = 0;
+  let isolatedItemCount = 0;
+  const relatedItemIds = new Set(index.aspects.flatMap((aspect) => aspect.relations.flatMap((relation) => [relation.sourceItemId, relation.targetItemId])));
+  for (const aspect of index.aspects) {
+    increment(kindCounts, aspect.kind);
+    increment(domainKindCounts, aspect.domainKind || "unknown");
+    increment(closureCounts, aspect.closureStatus);
+    for (const item of aspect.items) {
+      if (item.evidenceStatus === "unsupported") unsupportedItemCount += 1;
+      if (item.fallbackOnly) fallbackOnlyItemCount += 1;
+      if (!relatedItemIds.has(item.id)) isolatedItemCount += 1;
+    }
+    for (const relation of aspect.relations) increment(domainRelationCounts, relation.domainRelation || relation.relationName);
+  }
+  const projectable = aoriIndexToExtraction(index);
+  const projectedAspectCount = projectable.nodes.reduce((count, node) => count + (node.aspects.includes("other") ? 1 : 0), 0);
+  const legacyProjectionOtherRatio = projectable.nodes.length === 0 ? 0 : projectedAspectCount / projectable.nodes.length;
+  const warnings = [
+    ...index.reflectiveReport.warnings,
+    ...index.closureReports.flatMap((report) => report.warnings),
+  ];
+  if (unsupportedItemCount > 0) warnings.push(`${unsupportedItemCount} AORI items are unsupported/open.`);
+  if (fallbackOnlyItemCount > 0) warnings.push(`${fallbackOnlyItemCount} AORI items are fallback-only diagnostics.`);
+  return {
+    hasAori: true,
+    aspectCount: index.aspects.length,
+    itemCount: index.aspects.reduce((sum, aspect) => sum + aspect.items.length, 0),
+    relationCount: index.aspects.reduce((sum, aspect) => sum + aspect.relations.length, 0),
+    aspectKindDistribution: Object.fromEntries(kindCounts),
+    domainKindTopK: topK(domainKindCounts),
+    domainRelationTopK: topK(domainRelationCounts),
+    closureDistribution: Object.fromEntries(closureCounts),
+    unsupportedItemCount,
+    fallbackOnlyItemCount,
+    isolatedItemCount,
+    legacyProjectionOtherRatio,
+    warnings: uniqueStrings(warnings),
+  };
+}
+
+export function buildAoriGraphView(index: AoriDocumentIndex, mode: "overview" | "detail" | "hybrid" = "overview"): AoriGraphView {
+  const centerNode: AoriGraphNode = {
+    id: `aori-document-${index.versionId}`,
+    type: "document_center",
+    label: index.understanding.centralNodeTitle || index.documentName,
+    summary: index.understanding.summary,
+    evidenceStatus: index.understanding.evidenceStatus,
+    closureStatus: index.understanding.closureStatus,
+    confidence: index.understanding.confidence,
+  };
+  const nodes = new Map<string, AoriGraphNode>([[centerNode.id, centerNode]]);
+  const edges = new Map<string, AoriGraphEdge>();
+  const groups: AoriGraphView["groups"] = [];
+  const layers: Record<string, number> = { [centerNode.id]: 0 };
+  const collapsedNodeIds = new Set<string>();
+
+  const addNode = (node: AoriGraphNode, layer: number) => {
+    nodes.set(node.id, node);
+    layers[node.id] = layer;
+  };
+  const addEdge = (edge: AoriGraphEdge) => edges.set(edge.id, edge);
+
+  for (const aspect of index.aspects) {
+    const aspectNodeId = `aori-aspect-node-${aspect.id}`;
+    const aspectNode: AoriGraphNode = {
+      id: aspectNodeId,
+      type: "aspect",
+      label: aspect.title,
+      summary: aspect.summary,
+      aspectId: aspect.id,
+      kind: aspect.kind,
+      domainKind: aspect.domainKind,
+      evidenceStatus: aspect.evidenceStatus,
+      closureStatus: aspect.closureStatus,
+      confidence: aspect.confidence,
+    };
+    addNode(aspectNode, 1);
+    addEdge({
+      id: `aori-edge-document-${aspect.id}`,
+      source: centerNode.id,
+      target: aspectNodeId,
+      type: "contains",
+      label: aspect.domainKind || aspect.kind,
+      evidenceStatus: aspect.evidenceStatus,
+      closureStatus: aspect.closureStatus,
+      confidence: aspect.confidence,
+    });
+    const groupNodeIds = [aspectNodeId];
+    if (mode !== "overview") {
+      for (const item of aspect.items) {
+        const itemNodeId = `aori-item-node-${item.id}`;
+        addNode({
+          id: itemNodeId,
+          type: "aspect_item",
+          label: item.title,
+          summary: item.summary,
+          aspectId: aspect.id,
+          itemId: item.id,
+          evidenceStatus: item.evidenceStatus,
+          closureStatus: item.closureStatus,
+          fallbackOnly: item.fallbackOnly,
+          confidence: item.confidence,
+        }, item.evidenceStatus === "unsupported" || item.fallbackOnly ? 3 : 2);
+        if (item.evidenceStatus === "unsupported" || item.fallbackOnly) collapsedNodeIds.add(itemNodeId);
+        groupNodeIds.push(itemNodeId);
+        addEdge({
+          id: `aori-edge-aspect-item-${item.id}`,
+          source: aspectNodeId,
+          target: itemNodeId,
+          type: item.evidenceStatus === "unsupported" || item.fallbackOnly ? "warning" : "contains",
+          label: item.evidenceStatus,
+          evidenceStatus: item.evidenceStatus,
+          closureStatus: item.closureStatus,
+          confidence: item.confidence,
+        });
+        for (const chunkId of item.evidenceChunkIds) {
+          const chunkNodeId = `aori-chunk-node-${chunkId}`;
+          if (!nodes.has(chunkNodeId)) {
+            addNode({ id: chunkNodeId, type: "source_chunk", label: chunkId, chunkId, evidenceStatus: "supported", closureStatus: "closed" }, 4);
+            collapsedNodeIds.add(chunkNodeId);
+          }
+          addEdge({
+            id: `aori-edge-item-evidence-${item.id}-${chunkId}`,
+            source: itemNodeId,
+            target: chunkNodeId,
+            type: "evidence",
+            label: "evidence",
+            evidenceStatus: "supported",
+            closureStatus: "closed",
+          });
+        }
+      }
+      for (const relation of aspect.relations) {
+        const sourceNodeId = `aori-item-node-${relation.sourceItemId}`;
+        const targetNodeId = `aori-item-node-${relation.targetItemId}`;
+        if (!nodes.has(sourceNodeId) || !nodes.has(targetNodeId)) continue;
+        addEdge({
+          id: `aori-edge-relation-${relation.id}`,
+          source: sourceNodeId,
+          target: targetNodeId,
+          type: "relates",
+          label: relation.domainRelation || relation.relationName,
+          baseRelation: relation.baseRelation,
+          domainRelation: relation.domainRelation,
+          evidenceStatus: relation.evidenceStatus,
+          closureStatus: relation.closureStatus,
+          confidence: relation.confidence,
+        });
+      }
+      for (const gap of aspect.closureReport.gaps) {
+        const gapNodeId = `aori-gap-node-${gap.id}`;
+        addNode({ id: gapNodeId, type: "gap", label: gap.description, aspectId: aspect.id, closureStatus: "open", evidenceStatus: "unsupported" }, 3);
+        groupNodeIds.push(gapNodeId);
+        addEdge({
+          id: `aori-edge-aspect-gap-${gap.id}`,
+          source: aspectNodeId,
+          target: gapNodeId,
+          type: "has_gap",
+          label: gap.severity,
+          evidenceStatus: "unsupported",
+          closureStatus: "open",
+        });
+      }
+    }
+    groups.push({
+      id: `aori-group-${aspect.id}`,
+      label: aspect.title,
+      aspectId: aspect.id,
+      kind: aspect.kind,
+      domainKind: aspect.domainKind,
+      nodeIds: groupNodeIds,
+      evidenceStatus: aspect.evidenceStatus,
+      closureStatus: aspect.closureStatus,
+    });
+  }
+
+  if (mode !== "overview") {
+    for (const question of index.selfQuestions) {
+      const nodeId = `aori-self-question-node-${question.id}`;
+      addNode({
+        id: nodeId,
+        type: "self_question",
+        label: question.question,
+        summary: question.answer,
+        evidenceStatus: question.status === "answered" ? "supported" : "unsupported",
+        closureStatus: question.status === "answered" ? "partial" : "open",
+      }, 2);
+      addEdge({
+        id: `aori-edge-document-question-${question.id}`,
+        source: centerNode.id,
+        target: nodeId,
+        type: "asks",
+        label: question.status,
+      });
+    }
+  }
+
+  return {
+    versionId: index.versionId,
+    documentId: index.documentId,
+    centerNode,
+    groups,
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    layoutHints: {
+      mode,
+      centerNodeId: centerNode.id,
+      layers,
+      collapsedNodeIds: [...collapsedNodeIds],
+    },
+    diagnostics: buildAoriGraphDiagnostics(index),
+  };
+}
+
 export function aoriIndexToExtraction(index: AoriDocumentIndex): ExtractionOutput {
   const nodeKeyByItemId = new Map<string, string>();
-  const nodes = index.aspects.flatMap((aspect) => aspect.items).map((item, index) => {
+  const projectableItems = index.aspects.flatMap((aspect) => aspect.items
+    .filter((item) => item.evidenceChunkIds.length > 0 && item.evidenceStatus !== "unsupported" && !item.fallbackOnly)
+    .map((item) => ({ item, aspect })));
+  const nodes = projectableItems.map(({ item, aspect }, index) => {
     const key = `aori_${index + 1}`;
     nodeKeyByItemId.set(item.id, key);
     return {
       key,
-      kind: "concept" as const,
+      kind: aspect.kind === "claim" ? "claim" as const : "concept" as const,
       title: truncateText(item.title, 180),
       summary: truncateText(item.summary, 2000),
       evidenceChunkIds: item.evidenceChunkIds,
-      aspects: ["other" as const],
+      aspects: [aspect.kind],
     };
   });
   const relations = index.aspects.flatMap((aspect) => aspect.relations).flatMap((relation) => {
     const sourceKey = nodeKeyByItemId.get(relation.sourceItemId);
     const targetKey = nodeKeyByItemId.get(relation.targetItemId);
-    if (!sourceKey || !targetKey) return [];
+    if (!sourceKey || !targetKey || relation.evidenceStatus === "unsupported" || relation.evidenceChunkIds.length === 0) return [];
     return [{
       sourceKey,
       targetKey,
@@ -328,7 +607,7 @@ export function aoriIndexToExtraction(index: AoriDocumentIndex): ExtractionOutpu
       summary: truncateText(aspect.summary, 2000),
       memberKeys,
       evidenceChunkIds: uniqueStrings(aspect.items.flatMap((item) => item.evidenceChunkIds)),
-      aspects: ["other" as const],
+      aspects: [aspect.kind],
     }];
   });
   return { nodes, relations, themes };

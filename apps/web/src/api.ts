@@ -1,5 +1,7 @@
 import type {
   AbstractNode,
+  AoriGraphDiagnostics,
+  AoriGraphView,
   AoriDocumentResponse,
   AspectKind,
   AnalysisDraft,
@@ -132,6 +134,9 @@ export const api = {
     request<RetrievalUnit[]>(`/debug/versions/${versionId}/retrieval-units${includeFullText ? "?includeFullText=true" : ""}`),
   structure: (versionId: string) => request<SourceStructure>(`/versions/${versionId}/structure`),
   aori: (versionId: string) => request<AoriDocumentResponse>(`/versions/${versionId}/aori`),
+  aoriGraph: (versionId: string, mode: "overview" | "detail" | "hybrid" = "overview") =>
+    request<AoriGraphView>(`/versions/${versionId}/aori/graph?mode=${mode}`),
+  aoriDebug: (versionId: string) => request<AoriGraphDiagnostics & { versionId: string }>(`/versions/${versionId}/aori/debug`),
   documentTree: (libraryId: string) => request<DocumentTreeNode[]>(`/libraries/${libraryId}/document-tree`),
   versionDocumentTree: (versionId: string) => request<DocumentTreeNode[]>(`/versions/${versionId}/document-tree`),
   sectionSubtree: (nodeId: string) => request<DocumentTreeNode[]>(`/document-tree/${nodeId}/subtree`),

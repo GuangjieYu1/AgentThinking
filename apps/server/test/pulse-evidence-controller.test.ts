@@ -95,6 +95,10 @@ class RecordingPulseModel extends FakeModelProvider {
       claimText: chunk.text,
       evidenceChunkId: chunk.id,
       evidenceQuote: chunk.text,
+      role: "direct_fact",
+      authority: "unknown",
+      usage: "answer_core",
+      classificationRationale: "Test row is directly quoted from the source chunk.",
       confidence: 0.8,
       dedupeKey: chunk.id,
     }));
@@ -208,6 +212,10 @@ class TwentyOneItemPulseModel extends FakeModelProvider {
         },
         evidenceChunkId: chunk.id,
         evidenceQuote: chunk.text,
+        role: amount.declared ? "declared_total" : "itemized_value",
+        authority: "documentary_record",
+        usage: "answer_core",
+        classificationRationale: "Test row is a source-bound numeric evidence row.",
         confidence: 0.95,
         countedInAnswer: !amount.declared,
         dedupeKey: amount.declared ? "declared-total" : `item-${amount.itemIndex}`,
@@ -321,6 +329,9 @@ describe("PulseEvidenceController", () => {
     expect(result.errors.join("\n")).toContain("原文引用");
     expect(result.errors.join("\n")).toContain("完整");
     expect(result.errors.join("\n")).toContain("差额");
+    const exhaustive = verifyPulseAnswer({ answer: "已经穷尽所有来源。", summary: "bad" }, plan(), memory, status);
+    expect(exhaustive.passed).toBe(false);
+    expect(exhaustive.errors.join("\n")).toContain("complete or exhaustive");
   });
 
   it("uses only generic tools and performs progressive gap retrieval", async () => {

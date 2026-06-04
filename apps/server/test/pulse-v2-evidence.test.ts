@@ -52,8 +52,8 @@ class V2PulseModel extends FakeModelProvider {
     return {
       objective: "Find declared and itemized values.",
       steps: [
-        { tool: "semanticSearchChildChunks", query: "declared total source values", purpose: "semantic", expectedResult: "evidence units" },
-        { tool: "fullTextSearchChildChunks", query: "Declared total Source A Source B", purpose: "literal", expectedResult: "evidence units" },
+        { tool: "semanticSearchRetrievalUnits", query: "declared total source values", purpose: "semantic", expectedResult: "evidence units" },
+        { tool: "fullTextSearchRetrievalUnits", query: "Declared total Source A Source B", purpose: "literal", expectedResult: "evidence units" },
       ],
       stopCondition: "reconciled",
       expectedEvidenceShape: "EvidenceRows",
@@ -163,8 +163,61 @@ describe("Pulse v2 evidence-heavy path", () => {
     expect(result.evidencePack.answerMode).toBe("evidence_heavy");
     expect(result.evidencePack.retrievalTrace.some((trace) => trace.actualIndexProfile === "v2" && trace.targetType === "retrieval_unit")).toBe(true);
     expect(result.evidencePack.retrievalTrace.some((trace) => (trace.outputRetrievalUnitIds ?? []).length > 0)).toBe(true);
-    expect(result.evidenceRows?.every((row) => row.contextUnitId && row.citation?.matchLevel === "exact")).toBe(true);
+    expect(result.evidencePack.retrievalTrace.some((trace) => (
+      (trace.outputContextUnitIds ?? []).length > 0
+      && (trace.selectedContextUnits ?? []).every((unit) => unit.contextUnitId && unit.estimatedTokens > 0 && unit.reason.length > 0)
+      && (trace.estimatedTokensAfterStep ?? 0) > 0
+    ))).toBe(true);
+    expect(result.evidenceRows?.every((row) => (
+      row.contextUnitId
+      && row.retrievalUnitId
+      && row.citation?.contextUnitId === row.contextUnitId
+      && row.citation?.retrievalUnitId === row.retrievalUnitId
+      && row.citation?.matchLevel === "exact"
+    ))).toBe(true);
     expect(result.evidenceStatus?.reconciliation).toMatchObject({ declaredTotal: 100, exactItemizedSum: 100, difference: 0, closed: true });
+    db.close();
+  });
+
+  it("falls back to v1 with a warning when retrieval-unit hits cannot backfill ContextUnits", async () => {
+    const db = await database();
+    const model = new V2PulseModel();
+    const vectors = new VectorStore(db);
+    const library = db.createLibrary("Pulse v2 corrupted context");
+    const version = db.createDocumentVersion(library.id, "values.md", "text/markdown", "hash", "values.md").version;
+    const chunks: Chunk[] = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "Values", pageNumber: null, startChar: 0, endChar: 96, text: "Declared total is 100 units.\n\nSource A contributes 40 units.\n\nSource B contributes 60 units." },
+    ]);
+    const build = db.createIndexBuild(version.id, "v2");
+    const sidecar = buildContextIndex({ buildId: build.buildId, versionId: version.id, chunks, treeNodes: [] });
+    db.saveContextIndex(build.buildId, sidecar.contextUnits, sidecar.retrievalUnits, sidecar.qualityReport, sidecar.performanceReport);
+    for (const unit of sidecar.retrievalUnits) {
+      const [embedding] = await model.embed([unit.text]);
+      vectors.saveRetrievalUnit(library.id, unit, embedding ?? []);
+    }
+    const [legacyEmbedding] = await model.embed([chunks[0]!.text]);
+    vectors.save(chunks[0]!, legacyEmbedding ?? []);
+    db.markIndexBuildReady(build.buildId, { vectorCount: sidecar.retrievalUnits.length });
+    db.sql.exec("PRAGMA foreign_keys = OFF");
+    db.sql.prepare("UPDATE retrieval_units SET context_unit_id = 'missing-context-unit' WHERE build_id = ?").run(build.buildId);
+    db.sql.exec("PRAGMA foreign_keys = ON");
+
+    const result = await new PulseEvidenceController(db, vectors, model).answer(library.id, "What is the declared total and each source value?", "full", {
+      hits: [],
+      chunks: [],
+      nodes: [],
+      relations: [],
+    });
+
+    const fallbackTrace = result.evidencePack.retrievalTrace.find((trace) => trace.fallbackReason?.includes("ContextUnit backfill failed"));
+    expect(fallbackTrace).toMatchObject({
+      actualIndexProfile: "v1",
+      targetType: "legacy_chunk",
+    });
+    expect(fallbackTrace?.outputRetrievalUnitIds?.length).toBeGreaterThan(0);
+    expect(fallbackTrace?.estimatedTokensAfterStep).toBeGreaterThan(0);
+    expect(result.evidencePack.warnings?.join("\n")).toContain("ContextUnit backfill failed");
+    expect(result.evidenceRows?.some((row) => row.evidenceChunkId === chunks[0]!.id)).toBe(true);
     db.close();
   });
 });

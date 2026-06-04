@@ -23,8 +23,17 @@ export interface CompactContextPack {
   modelProfile: ModelContextProfile;
   tokenBudget: TokenBudget;
   contextUnitId: string;
-  selectedBlocks: Array<ContextBlock & { includedReason: string }>;
-  omittedBlocks: Array<{ blockId: string; omittedReason: string }>;
+  selectedBlocks: Array<ContextBlock & { contextUnitId: string; headingPath: string[]; includedReason: string; reason: string }>;
+  omittedBlocks: Array<{
+    blockId: string;
+    contextUnitId: string;
+    headingPath: string[];
+    ordinal: number;
+    type: ContextBlock["type"];
+    omittedReason: string;
+    reason: string;
+    textPreview?: string | undefined;
+  }>;
   text: string;
   coverageWarnings: string[];
 }
@@ -103,6 +112,114 @@ function blockForRetrievalUnit(contextUnit: ContextUnit, retrievalUnit: Retrieva
   )) ?? contextUnit.blocks[0];
 }
 
+function contextHeadingPath(contextUnit: ContextUnit): string[] {
+  return contextUnit.displayHeadingPath.length > 0 ? contextUnit.displayHeadingPath : contextUnit.headingPath;
+}
+
+function selectedBlock(contextUnit: ContextUnit, block: ContextBlock, reason: string): CompactContextPack["selectedBlocks"][number] {
+  return {
+    ...block,
+    contextUnitId: contextUnit.id,
+    headingPath: contextHeadingPath(contextUnit),
+    includedReason: reason,
+    reason,
+  };
+}
+
+function omittedBlock(contextUnit: ContextUnit, block: ContextBlock, reason: string): CompactContextPack["omittedBlocks"][number] {
+  return {
+    blockId: block.blockId,
+    contextUnitId: contextUnit.id,
+    headingPath: contextHeadingPath(contextUnit),
+    ordinal: block.ordinal,
+    type: block.type,
+    omittedReason: reason,
+    reason,
+    ...(block.textPreview ? { textPreview: block.textPreview } : {}),
+  };
+}
+
+function isStrongSequenceBoundary(block: ContextBlock, hitType: ContextBlock["type"]): boolean {
+  return block.type === "heading" || (block.type === "table" && hitType !== "table");
+}
+
+function isSequenceCompatible(block: ContextBlock, hitBlock: ContextBlock): boolean {
+  if (isStrongSequenceBoundary(block, hitBlock.type)) return false;
+  if (hitBlock.type === "table") return block.type === "table";
+  if (hitBlock.type === "list_item" || hitBlock.type === "paragraph") {
+    return block.type === "list_item" || block.type === "paragraph";
+  }
+  return block.type === hitBlock.type;
+}
+
+function isAdjacent(left: ContextBlock, right: ContextBlock): boolean {
+  return right.ordinal - left.ordinal === 1;
+}
+
+function queryWindowBlocks(blocks: ContextBlock[], hitBlock: ContextBlock, radius = 2): ContextBlock[] {
+  return blocks.filter((block) => Math.abs(block.ordinal - hitBlock.ordinal) <= radius);
+}
+
+function sequenceGroupBlocks(blocks: ContextBlock[], hitBlock: ContextBlock): ContextBlock[] {
+  const hitIndex = blocks.findIndex((block) => block.blockId === hitBlock.blockId);
+  if (hitIndex < 0) return [hitBlock];
+  let start = hitIndex;
+  while (start > 0) {
+    const previous = blocks[start - 1]!;
+    const current = blocks[start]!;
+    if (!isAdjacent(previous, current) || !isSequenceCompatible(previous, hitBlock)) break;
+    start -= 1;
+  }
+  let end = hitIndex;
+  while (end + 1 < blocks.length) {
+    const current = blocks[end]!;
+    const next = blocks[end + 1]!;
+    if (!isAdjacent(current, next) || !isSequenceCompatible(next, hitBlock)) break;
+    end += 1;
+  }
+  return blocks.slice(start, end + 1);
+}
+
+function sectionOutlinePlusHitBlocks(blocks: ContextBlock[], hitBlock: ContextBlock): ContextBlock[] {
+  const selected = new Map<string, ContextBlock>();
+  for (const block of blocks) {
+    if (block.type === "heading") selected.set(block.blockId, block);
+  }
+  for (const block of queryWindowBlocks(blocks, hitBlock, 1)) selected.set(block.blockId, block);
+  return [...selected.values()].sort((left, right) => left.ordinal - right.ordinal);
+}
+
+function compactStrategy(questionPlan: PulseQuestionPlan): CompactContextPack["strategy"] {
+  if (
+    questionPlan.questionType === "exhaustive_list"
+    || questionPlan.questionType === "numerical_aggregation"
+    || questionPlan.questionType === "timeline"
+  ) return "list_or_sequence_group";
+  if (
+    questionPlan.questionType === "summary"
+    || questionPlan.questionType === "comparison"
+    || questionPlan.questionType === "critique"
+  ) return "section_outline_plus_hits";
+  return "query_window";
+}
+
+function nonCandidateReason(strategy: CompactContextPack["strategy"], block: ContextBlock): string {
+  if (strategy === "list_or_sequence_group") {
+    return block.type === "heading" || block.type === "table"
+      ? "strong boundary not crossed"
+      : "outside contiguous sequence group";
+  }
+  if (strategy === "section_outline_plus_hits") return "outside section outline and hit window";
+  return "outside query window";
+}
+
+function candidateReason(strategy: CompactContextPack["strategy"], block: ContextBlock, hitBlock: ContextBlock): string {
+  if (block.blockId === hitBlock.blockId) return "retrieval hit block";
+  if (strategy === "list_or_sequence_group") return "contiguous sequence block";
+  if (strategy === "section_outline_plus_hits") return block.type === "heading" ? "section outline heading" : "hit window block";
+  return "query window block";
+}
+
 export function buildCompactContextPack(
   questionPlan: PulseQuestionPlan,
   contextUnit: ContextUnit,
@@ -110,40 +227,42 @@ export function buildCompactContextPack(
   profile: ModelContextProfile,
 ): CompactContextPack {
   const hitBlock = blockForRetrievalUnit(contextUnit, retrievalUnit);
-  const hitOrdinal = hitBlock?.ordinal ?? 0;
-  const prefersSequence = questionPlan.questionType === "exhaustive_list" || questionPlan.questionType === "numerical_aggregation";
-  const candidateBlocks = contextUnit.blocks.filter((block) => (
-    prefersSequence
-      ? Math.abs(block.ordinal - hitOrdinal) <= 4 && (block.type === hitBlock?.type || block.type === "list_item" || block.type === "paragraph")
-      : Math.abs(block.ordinal - hitOrdinal) <= 2
-  ));
+  const orderedBlocks = [...contextUnit.blocks].sort((left, right) => left.ordinal - right.ordinal);
+  const strategy = compactStrategy(questionPlan);
+  const candidateBlocks = hitBlock
+    ? strategy === "list_or_sequence_group"
+      ? sequenceGroupBlocks(orderedBlocks, hitBlock)
+      : strategy === "section_outline_plus_hits"
+        ? sectionOutlinePlusHitBlocks(orderedBlocks, hitBlock)
+        : queryWindowBlocks(orderedBlocks, hitBlock)
+    : [];
   let used = 0;
   const selectedBlocks: CompactContextPack["selectedBlocks"] = [];
   const omittedBlocks: CompactContextPack["omittedBlocks"] = [];
   const budgetChars = Math.max(500, (profile.compactExcerptTokens ?? 12000) * 4);
   for (const block of candidateBlocks) {
     const text = contextUnit.text.slice(block.startChar, block.endChar);
-    if (used + text.length <= budgetChars || block.ordinal === hitOrdinal) {
-      selectedBlocks.push({ ...block, includedReason: block.ordinal === hitOrdinal ? "retrieval hit block" : "neighbor block" });
+    if (used + text.length <= budgetChars || block.blockId === hitBlock?.blockId) {
+      selectedBlocks.push(selectedBlock(contextUnit, block, hitBlock ? candidateReason(strategy, block, hitBlock) : "compact candidate block"));
       used += text.length;
     } else {
-      omittedBlocks.push({ blockId: block.blockId, omittedReason: "compact excerpt budget exceeded" });
+      omittedBlocks.push(omittedBlock(contextUnit, block, "compact excerpt budget exceeded"));
     }
   }
   const selectedIds = new Set(selectedBlocks.map((block) => block.blockId));
-  for (const block of contextUnit.blocks) {
+  for (const block of orderedBlocks) {
     if (!selectedIds.has(block.blockId) && !omittedBlocks.some((entry) => entry.blockId === block.blockId)) {
-      omittedBlocks.push({ blockId: block.blockId, omittedReason: "not in query window" });
+      omittedBlocks.push(omittedBlock(contextUnit, block, nonCandidateReason(strategy, block)));
     }
   }
   return {
-    strategy: prefersSequence ? "list_or_sequence_group" : "query_window",
+    strategy,
     modelProfile: profile,
     tokenBudget: profile.tokenBudget,
     contextUnitId: contextUnit.id,
     selectedBlocks,
     omittedBlocks,
-    text: selectedBlocks
+    text: [...selectedBlocks]
       .sort((left, right) => left.ordinal - right.ordinal)
       .map((block) => contextUnit.text.slice(block.startChar, block.endChar))
       .join("\n\n"),

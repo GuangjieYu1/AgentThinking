@@ -1854,6 +1854,7 @@ export class AgentDatabase {
 
   markIndexBuildReady(buildId: string, counts: { vectorCount?: number; summaryVectorCount?: number } = {}): IndexBuildRecord {
     const build = this.getIndexBuild(buildId);
+    if (build && build.status !== "building") throw new Error("Only building index builds can be marked ready.");
     if (!build) throw new Error("index build 不存在");
     const timestamp = now();
     this.sql.exec("BEGIN");

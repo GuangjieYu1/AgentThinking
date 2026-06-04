@@ -1,12 +1,16 @@
 import type {
   AbstractNode,
   Chunk,
+  EvidencePack,
+  PulseAnswerContext,
+  PulseAnswerOutput,
   PulseInputMode,
   PulseNavigationCandidate,
   PulseResponse,
   PulseStreamEvent,
   Relation,
 } from "@agent-thinking/contracts";
+import type { AppConfig } from "../config.js";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
 import { PulseEvidenceController } from "./pulse-evidence-controller.js";
@@ -95,6 +99,7 @@ export class PulseEngine {
     private readonly db: AgentDatabase,
     private readonly vectors: VectorStore,
     private readonly model: ModelProvider,
+    private readonly config: Pick<AppConfig, "enableV2PulsePack"> = { enableV2PulsePack: false },
   ) {}
 
   async create(
@@ -560,9 +565,95 @@ export class PulseEngine {
         left.label.localeCompare(right.label, "zh-CN"),
       )
       .slice(0, 80);
-    await emitPulse(eventSink, { type: "stage", message: "正在构建 EvidenceMemory" });
+    await emitPulse(eventSink, { type: "stage", message: "正在生成脉冲回答" });
+    const answer = this.config.enableV2PulsePack
+      ? await this.answerWithV2OrFallback(libraryId, question, mode, orderedHits, chunks, nodes, relations, eventSink)
+      : await this.answerWithLegacyPipeline(question, mode, orderedHits, chunks, nodes, relations, "v1 legacy");
+    await emitPulse(eventSink, { type: "answer", answer: answer.answer, summary: answer.summary });
+    await emitPulse(eventSink, { type: "stage", message: "正在保存脉冲结果" });
+    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits, answer.evidencePack);
+    const response = this.db.getPulseResponse(libraryId, pulse.id);
+    if (!response) throw new Error("脉冲创建后读取失败");
+    return response;
+  }
+
+  private hasReadyV2Index(libraryId: string): boolean {
+    const retrievalUnits = this.db.getReadyRetrievalUnitsForLibrary(libraryId);
+    if (retrievalUnits.length === 0) return false;
+    const contextUnitIds = [...new Set(retrievalUnits.map((unit) => unit.contextUnitId))];
+    return this.db.getContextUnitsByIds(contextUnitIds).length > 0;
+  }
+
+  private async answerWithV2OrFallback(
+    libraryId: string,
+    question: string,
+    mode: PulseInputMode,
+    orderedHits: PendingPulseHit[],
+    chunks: Map<string, Chunk>,
+    nodes: Map<string, AbstractNode>,
+    relations: Map<string, Relation>,
+    eventSink?: PulseEventSink,
+  ): Promise<PulseAnswerOutput & { evidencePack: EvidencePack }> {
+    if (!this.hasReadyV2Index(libraryId)) {
+      return this.answerWithLegacyPipeline(
+        question,
+        mode,
+        orderedHits,
+        chunks,
+        nodes,
+        relations,
+        "v2 fallback_to_v1",
+        ["v2 index is not ready; legacy Pulse answer path was used."],
+      );
+    }
     const controller = new PulseEvidenceController(this.db, this.vectors, this.model);
-    const answer = await controller.answer(libraryId, question, mode, {
+    try {
+      return await controller.answer(libraryId, question, mode, this.seedContext(orderedHits, chunks, nodes, relations), eventSink);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return this.answerWithLegacyPipeline(
+        question,
+        mode,
+        orderedHits,
+        chunks,
+        nodes,
+        relations,
+        "v2 fallback_to_v1",
+        [`v2 evidence pipeline failed; legacy Pulse answer path was used. ${detail}`],
+      );
+    }
+  }
+
+  private async answerWithLegacyPipeline(
+    question: string,
+    mode: PulseInputMode,
+    orderedHits: PendingPulseHit[],
+    chunks: Map<string, Chunk>,
+    nodes: Map<string, AbstractNode>,
+    relations: Map<string, Relation>,
+    pipelineKind: "v1 legacy" | "v2 fallback_to_v1",
+    warnings: string[] = [],
+  ): Promise<PulseAnswerOutput & { evidencePack: EvidencePack }> {
+    const context = this.legacyAnswerContext(mode, orderedHits, chunks, nodes, relations);
+    const output = await this.model.answerPulse(question, context);
+    const mergedWarnings = [...(output.diagnostics?.warnings ?? []), ...warnings];
+    return {
+      ...output,
+      diagnostics: {
+        ...(output.diagnostics ?? {}),
+        ...(mergedWarnings.length > 0 ? { warnings: mergedWarnings } : {}),
+      },
+      evidencePack: this.legacyEvidencePack(question, orderedHits, context, pipelineKind, mergedWarnings),
+    };
+  }
+
+  private seedContext(
+    orderedHits: PendingPulseHit[],
+    chunks: Map<string, Chunk>,
+    nodes: Map<string, AbstractNode>,
+    relations: Map<string, Relation>,
+  ) {
+    return {
       hits: orderedHits,
       navigationTrace: orderedHits.map((hit, index) => ({
         stepIndex: hit.stepIndex ?? index + 1,
@@ -589,12 +680,103 @@ export class PulseEngine {
           const relation = relations.get(hit.targetId) ?? this.db.getRelation(hit.targetId);
           return relation ? [relation] : [];
         }),
-    }, eventSink);
-    await emitPulse(eventSink, { type: "answer", answer: answer.answer, summary: answer.summary });
-    await emitPulse(eventSink, { type: "stage", message: "正在保存脉冲结果" });
-    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits, answer.evidencePack);
-    const response = this.db.getPulseResponse(libraryId, pulse.id);
-    if (!response) throw new Error("脉冲创建后读取失败");
-    return response;
+    };
+  }
+
+  private legacyAnswerContext(
+    mode: PulseInputMode,
+    orderedHits: PendingPulseHit[],
+    chunks: Map<string, Chunk>,
+    nodes: Map<string, AbstractNode>,
+    relations: Map<string, Relation>,
+  ): PulseAnswerContext {
+    const hitScore = new Map(orderedHits.map((hit) => [`${hit.targetType}:${hit.targetId}`, hit.score]));
+    const seed = this.seedContext(orderedHits, chunks, nodes, relations);
+    return {
+      mode,
+      navigationTrace: seed.navigationTrace,
+      chunks: seed.chunks.map((chunk) => ({
+        id: chunk.id,
+        text: chunk.text,
+        score: hitScore.get(`chunk:${chunk.id}`) ?? 0.5,
+        headingPath: chunk.headingPath,
+        pageNumber: chunk.pageNumber,
+      })),
+      nodes: seed.nodes.map((node) => ({
+        id: node.id,
+        title: node.title,
+        summary: node.summary,
+        score: hitScore.get(`node:${node.id}`) ?? 0.5,
+      })),
+      relations: seed.relations.map((relation) => {
+        const source = nodes.get(relation.sourceNodeId) ?? this.db.getAbstractNode(relation.sourceNodeId);
+        const target = nodes.get(relation.targetNodeId) ?? this.db.getAbstractNode(relation.targetNodeId);
+        return {
+          id: relation.id,
+          type: relation.type,
+          sourceTitle: source?.title ?? relation.sourceNodeId,
+          targetTitle: target?.title ?? relation.targetNodeId,
+          reason: relation.reason,
+          score: hitScore.get(`relation:${relation.id}`) ?? relation.confidence ?? 0.5,
+        };
+      }),
+    };
+  }
+
+  private legacyEvidencePack(
+    question: string,
+    orderedHits: PendingPulseHit[],
+    context: PulseAnswerContext,
+    pipelineKind: "v1 legacy" | "v2 fallback_to_v1",
+    warnings: string[],
+  ): EvidencePack {
+    return {
+      id: `evidence-pack-${Date.now()}`,
+      question,
+      evidencePackSchemaVersion: 1,
+      pipeline: {
+        kind: pipelineKind,
+        indexProfile: "v1",
+        packBuilder: "legacy",
+        model: this.model.name,
+        promptVersion: "pulse-legacy-generic",
+      },
+      pipelineVersion: {
+        indexerVersion: "legacy-v1",
+        contextUnitBuilderVersion: "not_used",
+        retrievalUnitBuilderVersion: "not_used",
+        packBuilderVersion: "legacy-v1",
+        evidenceExtractorVersion: "not_used",
+        validatorVersion: "not_used",
+        promptVersion: "pulse-legacy-generic",
+      },
+      usedIndexProfile: "v1",
+      treeNodes: [],
+      parentChunks: [],
+      semanticNodes: [],
+      semanticRelations: [],
+      summaryNodes: [],
+      evidenceRows: [],
+      citations: context.chunks.map((chunk) => ({
+        chunkId: chunk.id,
+        treeNodeId: null,
+        quote: chunk.text.slice(0, 240),
+        headingPath: chunk.headingPath,
+        pageNumber: chunk.pageNumber,
+      })),
+      gaps: [],
+      retrievalTrace: [{
+        stepIndex: 0,
+        tool: "buildEvidencePack",
+        purpose: pipelineKind === "v1 legacy" ? "Legacy Pulse answer path." : "v2 unavailable; legacy Pulse answer path.",
+        inputIds: [],
+        outputIds: orderedHits.map((hit) => hit.targetId),
+        actualIndexProfile: "v1",
+        targetType: "legacy_chunk",
+        newEvidenceRowCount: 0,
+        status: "success",
+      }],
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
   }
 }

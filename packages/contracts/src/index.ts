@@ -49,6 +49,7 @@ export const genericEvidenceRoles = [
   "contextual_fact",
 ] as const;
 export const answerModes = ["evidence_heavy", "citation_supported", "summary_answer"] as const;
+export const pulsePipelines = ["v1 legacy", "v2 evidence-heavy", "v2 compact", "v2 fallback_to_v1"] as const;
 export const documentTreeNodeTypes = ["document", "section", "paragraph", "sentence", "table", "unknown"] as const;
 export const summaryTreeLevels = ["paragraph", "section", "document", "cluster"] as const;
 export const mappingAuditStatuses = ["clean", "minor_issues", "major_issues", "failed"] as const;
@@ -134,6 +135,7 @@ export type QuoteMatchLevel = (typeof quoteMatchLevels)[number];
 export type ContextBlockType = (typeof contextBlockTypes)[number];
 export type GenericEvidenceRole = (typeof genericEvidenceRoles)[number];
 export type AnswerMode = (typeof answerModes)[number];
+export type PulsePipeline = (typeof pulsePipelines)[number];
 export type DocumentTreeNodeType = (typeof documentTreeNodeTypes)[number];
 export type SummaryTreeLevel = (typeof summaryTreeLevels)[number];
 export type MappingAuditStatus = (typeof mappingAuditStatuses)[number];
@@ -906,7 +908,15 @@ export type PulseEvidenceTool =
   | "readRemainingChunksAfter"
   | "getDocumentOutline"
   | "getChunkEvidenceAround"
-  | "getGraphContext";
+  | "getGraphContext"
+  | "semanticSearchRetrievalUnits"
+  | "fullTextSearchRetrievalUnits"
+  | "retrieveContextUnits"
+  | "readContextUnits"
+  | "retrieveNeighborContextUnits"
+  | "retrieveSameSectionContextUnits"
+  | "retrieveRemainingContextUnitsAfter"
+  | "getContextUnitOutline";
 
 export type PulseEvidenceType = "fact" | "amount" | "date" | "entity_relation" | "claim" | "quote" | "timeline_event" | "table_value" | "other";
 
@@ -1080,6 +1090,9 @@ export interface RetrievalTrace {
   targetType?: VectorTargetType | "legacy_chunk" | undefined;
   buildId?: string | undefined;
   outputRetrievalUnitIds?: string[] | undefined;
+  outputContextUnitIds?: string[] | undefined;
+  selectedContextUnits?: Array<{ contextUnitId: string; retrievalUnitIds: string[]; estimatedTokens: number; reason: string }> | undefined;
+  estimatedTokensAfterStep?: number | undefined;
   fallbackReason?: string | undefined;
   newEvidenceRowCount: number;
   status: "success" | "empty" | "error" | "skipped";
@@ -1090,6 +1103,7 @@ export interface EvidencePack {
   question: string;
   evidencePackSchemaVersion?: 1 | 2 | undefined;
   pipeline?: {
+    kind?: PulsePipeline | undefined;
     indexProfile: ActiveIndexProfile;
     packBuilder: "legacy" | "v2";
     model: string;
@@ -1116,6 +1130,7 @@ export interface EvidencePack {
   gaps: PulseEvidenceGap[];
   retrievalTrace: RetrievalTrace[];
   reconciliation?: PulseEvidenceReconciliation | undefined;
+  warnings?: string[] | undefined;
 }
 
 export interface PulseEvidenceGap {
@@ -1178,6 +1193,7 @@ export interface PulseEvidenceMemory {
   retrievalHistory: Array<{ tool: PulseEvidenceTool; query?: string | undefined; chunkIds: string[]; purpose: string }>;
   retrievalTrace?: RetrievalTrace[] | undefined;
   currentFindings: string[];
+  warnings?: string[] | undefined;
   gaps: PulseEvidenceGap[];
   sufficiencyHistory: PulseEvidenceStatus[];
 }
@@ -1613,6 +1629,14 @@ export const pulseEvidenceToolValues = [
   "getDocumentOutline",
   "getChunkEvidenceAround",
   "getGraphContext",
+  "semanticSearchRetrievalUnits",
+  "fullTextSearchRetrievalUnits",
+  "retrieveContextUnits",
+  "readContextUnits",
+  "retrieveNeighborContextUnits",
+  "retrieveSameSectionContextUnits",
+  "retrieveRemainingContextUnitsAfter",
+  "getContextUnitOutline",
 ] as const;
 
 export const pulseEvidenceStepSchema = z.object({

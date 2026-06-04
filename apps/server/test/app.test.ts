@@ -222,6 +222,7 @@ describe("HTTP application", () => {
       ocrCacheDir: join(dir, "ocr"),
       provider: "fake",
       aiApiKey: "never-return-this-key",
+      enableV2PulsePack: true,
     });
     const db = new AgentDatabase(dir);
     const vectors = new VectorStore(db);

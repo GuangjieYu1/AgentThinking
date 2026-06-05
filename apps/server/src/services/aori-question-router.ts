@@ -13,23 +13,6 @@ import type {
 } from "@agent-thinking/contracts";
 import type { AgentDatabase } from "../db.js";
 
-function normalizeText(value: string): string {
-  return value.normalize("NFKC").toLowerCase();
-}
-
-function terms(value: string): string[] {
-  return [...new Set(normalizeText(value).split(/[\s,，。；;:：、]+/).filter((term) => term.length > 0))].slice(0, 24);
-}
-
-function scoreText(text: string, question: string): number {
-  const normalized = normalizeText(text);
-  const queryTerms = terms(question);
-  if (queryTerms.length === 0) return 0;
-  let score = normalized.includes(normalizeText(question)) ? 0.45 : 0;
-  for (const term of queryTerms) if (normalized.includes(term)) score += Math.min(0.16, term.length * 0.025);
-  return Math.min(1, score);
-}
-
 function answerShape(plan: PulseQuestionPlan): EvidenceTable["type"] {
   if (plan.requiresNumericalReconciliation || plan.questionType === "numerical_aggregation") return "AmountFactTable";
   if (plan.requiresTimelineCompleteness || plan.questionType === "timeline") return "TimelineFactTable";
@@ -90,37 +73,20 @@ export class AoriQuestionRouter {
     const libraryAori = this.db.getLibraryAoriProfile(libraryId);
     const documentAori = this.db.listAoriDocumentIndexes(libraryId);
     const selectedAssertions = libraryAori.available
-      ? libraryAori.assertions
-        .map((assertion) => ({
-          assertion,
-          score: scoreText(`${assertion.assertionText}\n${assertion.domainRelation}\n${assertion.quote ?? ""}`, question),
-        }))
-        .filter((entry) => entry.score > 0.02)
-        .sort((left, right) => right.score - left.score)
-        .slice(0, 24)
-        .map((entry) => entry.assertion)
+      ? libraryAori.assertions.filter((assertion) => assertion.status !== "superseded").slice(0, 24)
       : [];
     const assertionVersionIds = new Set(selectedAssertions.map((assertion) => assertion.versionId));
-    const scoredDocuments = documentAori
-      .map((index) => ({
-        index,
-        score: Math.max(
-          scoreText(`${index.documentName}\n${index.understanding.summary}\n${index.understanding.centralQuestion}`, question),
-          ...index.aspects.map((aspect) => scoreText(`${aspect.title}\n${aspect.summary}\n${aspect.centralQuestion}`, question)),
-          assertionVersionIds.has(index.versionId) ? 0.9 : 0,
-        ),
-      }))
-      .filter((entry) => entry.score > 0.02 || assertionVersionIds.has(entry.index.versionId))
-      .sort((left, right) => right.score - left.score);
-    const selectedDocumentAori = scoredDocuments.length > 0
-      ? scoredDocuments.slice(0, questionPlan.questionType === "summary" ? 6 : 4).map((entry) => entry.index)
-      : documentAori.slice(0, Math.min(4, documentAori.length));
+    const documentLimit = questionPlan.questionType === "summary" ? 6 : 4;
+    const selectedDocumentAori = [
+      ...documentAori.filter((index) => assertionVersionIds.has(index.versionId)),
+      ...documentAori.filter((index) => !assertionVersionIds.has(index.versionId)),
+    ].slice(0, documentLimit);
     const selectedVersionIds = new Set(selectedDocumentAori.map((index) => index.versionId));
     const selectedLibraryAspects = libraryAori.available
       ? libraryAori.aspects.filter((aspect) =>
         aspect.relatedDocumentAspectIds.some((aspectId) =>
           selectedDocumentAori.some((index) => index.aspects.some((documentAspect) => documentAspect.id === aspectId)),
-        ) || scoreText(`${aspect.title}\n${aspect.summary}\n${aspect.domainKind}`, question) > 0.02,
+        ),
       ).slice(0, 20)
       : [];
     const selectedChunkIds = [
@@ -166,7 +132,7 @@ export class AoriQuestionRouter {
       })),
       excludedDocuments: documentAori
         .filter((index) => !selectedVersionIds.has(index.versionId))
-        .map((index) => ({ documentId: index.documentId, reason: "Lower AORI route score for this question." })),
+        .map((index) => ({ documentId: index.documentId, reason: "Outside bounded diagnostic AORI assembly window." })),
       selectedLibraryAspects: selectedLibraryAspects.map((aspect) => aspect.id),
       selectedLibraryEntities: libraryAori.available
         ? [...new Set(selectedAssertions.flatMap((assertion) => [assertion.sourceEntityId, assertion.targetEntityId]).filter((id): id is string => Boolean(id)))]
@@ -177,7 +143,7 @@ export class AoriQuestionRouter {
       selectedAssertions: selectedAssertions.map((assertion) => assertion.id),
       crossDocumentOperations: selectedDocumentAori.length > 1 ? ["compare_selected_aori_documents", "assemble_cross_document_assertions"] : [],
       ambiguity: selectedDocumentAori.length === 0 ? ["No AORI document matched the question strongly."] : [],
-      confidence: chunks.length > 0 ? 0.72 : 0.35,
+      confidence: chunks.length > 0 ? 0.62 : 0.35,
     };
     const frame: QuestionTaskFrame = {
       userQuestion: question,

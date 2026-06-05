@@ -1,12 +1,19 @@
 import type {
   AbstractNodeKind,
   AoriDocumentDraft,
+  BfsExpansionDecision,
+  BfsExpansionInput,
   AoriIndexingStage,
   AoriRiskLevel,
+  ChunkAnswerSummary,
+  ChunkSummaryInput,
   AspectKind,
   Chunk,
   Citation,
+  DfsStepDecision,
+  DfsStepInput,
   ExtractionOutput,
+  FinalAnswerFromChunksInput,
   GraphRuleStage,
   MappingAudit,
   MappingAuditResult,
@@ -357,6 +364,82 @@ function acceptedSemanticReviewsForRows(rows: PulseEvidenceRow[]): SemanticClass
       risk: accepted ? "low" : "medium",
     };
   });
+}
+
+function cleanBfsExpansionDecision(value: unknown, input: BfsExpansionInput): BfsExpansionDecision {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const allowedIds = new Set(input.currentLayer.map((node) => node.nodeId));
+  const rawDecisions = Array.isArray(source.decisions) ? source.decisions : [];
+  const decisions = rawDecisions.flatMap((entry): BfsExpansionDecision["decisions"] => {
+    const item = entry && typeof entry === "object" && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
+    const nodeId = typeof item.nodeId === "string" ? item.nodeId : "";
+    if (!allowedIds.has(nodeId)) return [];
+    const decision = item.decision === "skip" || item.decision === "maybe" || item.decision === "need" ? item.decision : "maybe";
+    return [{
+      nodeId,
+      decision,
+      answerRelevant: typeof item.answerRelevant === "boolean" ? item.answerRelevant : decision !== "skip",
+      shouldCollectChunks: typeof item.shouldCollectChunks === "boolean" ? item.shouldCollectChunks : decision !== "skip",
+      reason: normalizedText(item.reason, "模型基于当前层摘要作出 traversal 决策。", 800),
+    }];
+  });
+  const seen = new Set(decisions.map((decision) => decision.nodeId));
+  for (const node of input.currentLayer) {
+    if (seen.has(node.nodeId)) continue;
+    decisions.push({
+      nodeId: node.nodeId,
+      decision: "maybe",
+      answerRelevant: true,
+      shouldCollectChunks: node.chunkCount > 0,
+      reason: "模型未返回该节点决策，保守继续检查。",
+    });
+  }
+  return {
+    decisions,
+    stopTraversal: typeof source.stopTraversal === "boolean" ? source.stopTraversal : false,
+    ...(typeof source.stopReason === "string" && source.stopReason.trim()
+      ? { stopReason: truncateText(source.stopReason.trim(), 800) }
+      : {}),
+  };
+}
+
+function cleanDfsStepDecision(value: unknown, input: DfsStepInput): DfsStepDecision {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const allowedIds = new Set(input.candidates.map((candidate) => candidate.nodeId));
+  const selectedNextNodeIds = normalizedStringArray(source.selectedNextNodeIds)
+    .filter((id) => allowedIds.has(id))
+    .slice(0, 3);
+  return {
+    selectedNextNodeIds,
+    recordCurrentChunks: typeof source.recordCurrentChunks === "boolean"
+      ? source.recordCurrentChunks
+      : input.currentNode.chunkCount > 0,
+    backtrack: typeof source.backtrack === "boolean" ? source.backtrack : selectedNextNodeIds.length === 0,
+    stopTraversal: typeof source.stopTraversal === "boolean" ? source.stopTraversal : false,
+    reason: normalizedText(source.reason, "模型基于当前 DFS 路径选择下一步。", 800),
+  };
+}
+
+function cleanChunkAnswerSummary(value: unknown, input: ChunkSummaryInput): ChunkAnswerSummary {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const usage = source.usage === "answer_core" ||
+    source.usage === "supporting_detail" ||
+    source.usage === "background_only" ||
+    source.usage === "irrelevant"
+    ? source.usage
+    : undefined;
+  return {
+    chunkId: input.chunkId,
+    relevant: typeof source.relevant === "boolean" ? source.relevant : false,
+    shortSummary: normalizedText(source.shortSummary, "模型未提取到明确相关信息。", 600),
+    supportedFacts: normalizedStringArray(source.supportedFacts).slice(0, 8).map((fact) => truncateText(fact, 500)),
+    unsupportedClaims: normalizedStringArray(source.unsupportedClaims).slice(0, 8).map((claim) => truncateText(claim, 500)),
+    keyQuotes: normalizedStringArray(source.keyQuotes).slice(0, 5).map((quote) => truncateText(quote, 160)),
+    confidence: typeof source.confidence === "number" && Number.isFinite(source.confidence)
+      ? Math.max(0, Math.min(1, source.confidence))
+      : 0.3,
+    ...(usage ? { usage } : {}),
+  };
 }
 
 function cleanPulseEvidenceRows(rowsValue: unknown, allowedChunkIds: Set<string>): PulseEvidenceRow[] {
@@ -766,6 +849,10 @@ export interface ModelProvider {
   }): Promise<PulseAnswerOutput>;
   answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput>;
   selectPulseNavigation(question: string, step: string, candidates: PulseNavigationCandidate[]): Promise<PulseNavigationDecision>;
+  decideAoriBfsExpansion(input: BfsExpansionInput): Promise<BfsExpansionDecision>;
+  chooseAoriDfsNext(input: DfsStepInput): Promise<DfsStepDecision>;
+  summarizeChunkForQuestion(input: ChunkSummaryInput): Promise<ChunkAnswerSummary>;
+  synthesizeAnswerFromChunks(input: FinalAnswerFromChunksInput): Promise<PulseAnswerOutput>;
   stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }>;
   test(): Promise<ModelTestResult>;
 }
@@ -1172,6 +1259,76 @@ export class FakeModelProvider implements ModelProvider {
       rationale: selected.length > 0
         ? `选择 ${selected.map((candidate) => candidate.label).join("、")}，因为它们与问题词或候选分数更接近。`
         : "没有足够候选可继续展开。",
+    };
+  }
+
+  async decideAoriBfsExpansion(input: BfsExpansionInput): Promise<BfsExpansionDecision> {
+    const terms = input.question.normalize("NFKC").toLowerCase().split(/\s+/).filter(Boolean);
+    const decisions = input.currentLayer.map((node) => {
+      const text = `${node.title} ${node.summary} ${node.type}`.normalize("NFKC").toLowerCase();
+      const matches = terms.filter((term) => text.includes(term)).length;
+      const likelyRelevant = matches > 0 || node.type === "library_root" || node.type === "document";
+      return {
+        nodeId: node.nodeId,
+        decision: likelyRelevant ? "need" as const : node.childCount > 0 ? "maybe" as const : "skip" as const,
+        answerRelevant: likelyRelevant,
+        shouldCollectChunks: node.chunkCount > 0 && likelyRelevant,
+        reason: likelyRelevant
+          ? `演示模型认为「${node.title}」与问题可见语义相关。`
+          : `演示模型暂未看到「${node.title}」与问题的直接关联。`,
+      };
+    });
+    return { decisions, stopTraversal: false };
+  }
+
+  async chooseAoriDfsNext(input: DfsStepInput): Promise<DfsStepDecision> {
+    const terms = input.question.normalize("NFKC").toLowerCase().split(/\s+/).filter(Boolean);
+    const ranked = input.candidates
+      .map((candidate) => {
+        const text = `${candidate.title} ${candidate.summary} ${candidate.relationFromCurrent ?? ""}`.normalize("NFKC").toLowerCase();
+        const matches = terms.filter((term) => text.includes(term)).length;
+        return { candidate, score: matches * 2 + candidate.chunkCount + candidate.childCount * 0.2 };
+      })
+      .sort((left, right) => right.score - left.score);
+    const selected = ranked.filter((entry) => entry.score > 0).slice(0, 2).map((entry) => entry.candidate.nodeId);
+    return {
+      selectedNextNodeIds: selected.length > 0 ? selected : input.candidates.slice(0, 1).map((candidate) => candidate.nodeId),
+      recordCurrentChunks: input.currentNode.chunkCount > 0,
+      backtrack: input.candidates.length === 0,
+      stopTraversal: false,
+      reason: input.currentNode.chunkCount > 0
+        ? `演示模型在「${input.currentNode.title}」记录可回填原文 chunk。`
+        : `演示模型从「${input.currentNode.title}」继续向更具体节点探索。`,
+    };
+  }
+
+  async summarizeChunkForQuestion(input: ChunkSummaryInput): Promise<ChunkAnswerSummary> {
+    const text = input.chunkText.replace(/\s+/g, " ").trim();
+    const relevant = text.length > 0;
+    return {
+      chunkId: input.chunkId,
+      relevant,
+      shortSummary: relevant ? text.slice(0, 220) : "该 chunk 与问题没有明显关系。",
+      supportedFacts: relevant ? [text.slice(0, 220)] : [],
+      unsupportedClaims: [],
+      keyQuotes: relevant && text ? [text.slice(0, 120)] : [],
+      confidence: relevant ? 0.72 : 0.2,
+      usage: relevant ? "answer_core" : "irrelevant",
+    };
+  }
+
+  async synthesizeAnswerFromChunks(input: FinalAnswerFromChunksInput): Promise<PulseAnswerOutput> {
+    const relevant = input.chunkSummaries.filter((summary) => summary.relevant && summary.usage !== "background_only");
+    if (relevant.length === 0) {
+      return {
+        answer: `没有找到足够的原文 chunk 支撑回答“${input.question}”。`,
+        summary: "AORI traversal reached source chunks, but no relevant chunk summary survived.",
+      };
+    }
+    const facts = relevant.flatMap((summary) => summary.supportedFacts.map((fact) => `[${summary.chunkId}] ${fact}`)).slice(0, 6);
+    return {
+      answer: `基于原文 chunk，可以回答：${facts.join("；")}`,
+      summary: `使用 ${relevant.length} 个 relevant chunk summary 生成答案。`,
     };
   }
 
@@ -2160,6 +2317,120 @@ export class OpenAICompatibleProvider implements ModelProvider {
       };
     }
     return { ...parsed, selectedIds };
+  }
+
+  async decideAoriBfsExpansion(input: BfsExpansionInput): Promise<BfsExpansionDecision> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "AORI BFS traversal judge. Decide which visible summary-map nodes should be expanded or skipped for answering the question. " +
+            "AORI summaries are navigation hints only; do not answer the question. Return JSON only: " +
+            '{"decisions":[{"nodeId":"...","decision":"need|maybe|skip","answerRelevant":true,"shouldCollectChunks":true,"reason":"..."}],"stopTraversal":false,"stopReason":"..."}. ' +
+            "Use semantic judgment over the supplied summaries and relations; do not use keyword matching as the final basis. Reasons must be brief and auditable.",
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1200,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanBfsExpansionDecision(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input);
+  }
+
+  async chooseAoriDfsNext(input: DfsStepInput): Promise<DfsStepDecision> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "AORI DFS traversal navigator. Pick the next visible child nodes to explore from the current node. " +
+            "Record current chunks only when this node's source chunks may help answer the question. AORI path summaries are not evidence. " +
+            'Return JSON only: {"selectedNextNodeIds":["..."],"recordCurrentChunks":true,"backtrack":false,"stopTraversal":false,"reason":"..."}. ' +
+            "selectedNextNodeIds must come from candidates. Reasons must describe the visible path choice without hidden reasoning.",
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 900,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanDfsStepDecision(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input);
+  }
+
+  async summarizeChunkForQuestion(input: ChunkSummaryInput): Promise<ChunkAnswerSummary> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Summarize exactly one source chunk for a question. Use only chunkText for supportedFacts and keyQuotes. " +
+            "The retrievalTrace explains why the chunk was found, but it is not evidence. If the chunk is only context, set usage to background_only. " +
+            'Return JSON only: {"chunkId":"...","relevant":true,"shortSummary":"...","supportedFacts":["..."],"unsupportedClaims":["..."],"keyQuotes":["short quote"],"confidence":0.8,"usage":"answer_core|supporting_detail|background_only|irrelevant"}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1000,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanChunkAnswerSummary(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input);
+  }
+
+  async synthesizeAnswerFromChunks(input: FinalAnswerFromChunksInput): Promise<PulseAnswerOutput> {
+    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Final AORI traversal answer. Answer only from relevant=true chunkSummaries and their source chunks. " +
+            "Every key conclusion must trace to a chunkId. Do not use AORI summaries or traversal path summaries as factual evidence. " +
+            "If chunk summaries are insufficient, say the evidence is insufficient. Return JSON only: {\"answer\":\"...\",\"summary\":\"...\"}.",
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1600,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return pulseAnswerSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
   }
 
   async *stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }> {

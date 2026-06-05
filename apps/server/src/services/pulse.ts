@@ -8,6 +8,7 @@ import type {
   Relation,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
+import { AoriTraversalAnswerEngine } from "./aori-traversal-answer.js";
 import type { ModelProvider } from "./models.js";
 import { PulseEvidenceController } from "./pulse-evidence-controller.js";
 import type { VectorStore } from "./vector-store.js";
@@ -95,6 +96,7 @@ export class PulseEngine {
     private readonly db: AgentDatabase,
     private readonly vectors: VectorStore,
     private readonly model: ModelProvider,
+    private readonly options: { aoriAnswerMode?: "traversal" | "legacy" | "strict_evidence_table" } = {},
   ) {}
 
   async create(
@@ -104,6 +106,29 @@ export class PulseEngine {
     eventSink?: PulseEventSink,
   ): Promise<PulseResponse> {
     await emitPulse(eventSink, { type: "start", mode, question });
+    if ((this.options.aoriAnswerMode ?? "traversal") === "traversal" && this.db.listAoriDocumentIndexes(libraryId).length > 0) {
+      const result = await new AoriTraversalAnswerEngine(this.db, this.model).answer({
+        libraryId,
+        question,
+        mode,
+        ...(eventSink ? { eventSink } : {}),
+      });
+      await emitPulse(eventSink, { type: "answer", answer: result.answer.answer, summary: result.answer.summary });
+      await emitPulse(eventSink, { type: "stage", message: "正在保存 AORI traversal 脉冲结果" });
+      const pulse = this.db.createPulse(
+        libraryId,
+        question,
+        result.answer.answer,
+        result.answer.summary,
+        mode,
+        result.hits,
+        result.storageEvidencePack,
+      );
+      const response = this.db.getPulseResponse(libraryId, pulse.id);
+      if (!response) throw new Error("脉冲创建后读取失败");
+      await emitPulse(eventSink, { type: "done", response });
+      return response;
+    }
     const response = mode === "progressive"
       ? await this.createProgressive(libraryId, question, eventSink)
       : await this.createFull(libraryId, question, eventSink);

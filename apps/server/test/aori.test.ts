@@ -240,7 +240,7 @@ describe("AORI document index", () => {
       expect(profile.assertions).toHaveLength(2);
       expect(profile.relations).toHaveLength(1);
       expect(profile.relations[0]).toMatchObject({
-        aggregateRelation: "亦敌亦友",
+        aggregateRelation: "朋友 / 敌人",
         assertionIds: expect.arrayContaining(profile.assertions.map((assertion) => assertion.id)),
       });
     } finally {

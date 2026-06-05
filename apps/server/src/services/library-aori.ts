@@ -53,11 +53,7 @@ function relationFamily(domainRelation: string, baseRelation: string): string {
 
 function aggregateRelationLabel(assertions: LibraryRelationAssertion[]): string {
   const labels = uniqueStrings(assertions.map((assertion) => assertion.domainRelation));
-  const joined = labels.join(" / ");
-  const hasFriend = labels.some((label) => label.includes("朋友") || normalizeLabel(label).includes("friend"));
-  const hasEnemy = labels.some((label) => label.includes("敌") || normalizeLabel(label).includes("enemy"));
-  if (hasFriend && hasEnemy) return "亦敌亦友";
-  if (labels.length > 1) return "多重关系";
+  if (labels.length > 1) return labels.join(" / ");
   return labels[0] ?? "aggregate relation";
 }
 

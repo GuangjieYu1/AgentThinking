@@ -148,7 +148,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   const { config, db, vectors, model, queue } = services;
   const events = services.events ?? new LibraryEventBus();
   const publisher = new AnalysisPublisher(db, config);
-  const pulseEngine = new PulseEngine(db, vectors, model);
+  const pulseEngine = new PulseEngine(db, vectors, model, { aoriAnswerMode: config.aoriAnswerMode });
   const mappingAudit = new MappingAuditService(db, model, events);
   await app.register(cors, { origin: true, credentials: true });
   await app.register(multipart, { limits: { files: 100, fileSize: 60 * 1024 * 1024 } });

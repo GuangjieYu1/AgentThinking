@@ -211,6 +211,15 @@ export const aoriContextDecisionTypes = [
 export const aoriRiskLevels = ["low", "medium", "high"] as const;
 export const aoriGraphScopes = ["document", "library"] as const;
 export const aoriGraphViewModes = ["layer", "tree", "network"] as const;
+export const aoriTraversalNodeTypes = [
+  "library_root",
+  "document",
+  "aspect",
+  "aspect_item",
+  "relation",
+  "self_question",
+  "gap",
+] as const;
 export const libraryEntityAlignmentDecisions = ["same", "new", "ambiguous"] as const;
 export const libraryAspectAlignmentDecisions = ["map_to_existing", "new_aspect", "subaspect", "ambiguous"] as const;
 export const libraryRelationAlignmentDecisions = ["map_to_existing", "new_relation", "abstract_under_family", "ambiguous"] as const;
@@ -302,6 +311,7 @@ export type AoriContextDecisionType = (typeof aoriContextDecisionTypes)[number];
 export type AoriRiskLevel = (typeof aoriRiskLevels)[number];
 export type AoriGraphScope = (typeof aoriGraphScopes)[number];
 export type AoriGraphViewMode = (typeof aoriGraphViewModes)[number];
+export type AoriTraversalNodeType = (typeof aoriTraversalNodeTypes)[number];
 export type LibraryEntityAlignmentDecision = (typeof libraryEntityAlignmentDecisions)[number];
 export type LibraryAspectAlignmentDecision = (typeof libraryAspectAlignmentDecisions)[number];
 export type LibraryRelationAlignmentDecision = (typeof libraryRelationAlignmentDecisions)[number];
@@ -892,6 +902,188 @@ export interface LibraryAoriUnavailable {
 
 export type LibraryAoriResponse = LibraryAoriProfile | LibraryAoriUnavailable;
 
+export interface AoriTraversalRelation {
+  id: string;
+  sourceNodeId: string;
+  targetNodeId: string;
+  label: string;
+  summary?: string | undefined;
+  chunkIds: string[];
+  confidence?: number | undefined;
+}
+
+export interface AoriTraversalNode {
+  id: string;
+  type: AoriTraversalNodeType;
+  title: string;
+  summary: string;
+  documentId?: string | undefined;
+  versionId?: string | undefined;
+  aspectId?: string | undefined;
+  parentIds: string[];
+  childIds: string[];
+  relationIds: string[];
+  chunkIds: string[];
+  closureStatus?: string | undefined;
+  evidenceStatus?: string | undefined;
+  confidence?: number | undefined;
+}
+
+export interface AoriTraversalMap {
+  libraryId: string;
+  globalSummary: string;
+  centralQuestion?: string | undefined;
+  rootNodes: AoriTraversalNode[];
+  nodesById: Record<string, AoriTraversalNode>;
+  relations: AoriTraversalRelation[];
+  documentCards: Array<{
+    documentId: string;
+    versionId: string;
+    documentName: string;
+    summary: string;
+    centralQuestion?: string | undefined;
+  }>;
+}
+
+export interface BfsExpansionInput {
+  question: string;
+  globalSummary: string;
+  currentDepth: number;
+  currentLayer: Array<{
+    nodeId: string;
+    title: string;
+    type: string;
+    summary: string;
+    closureStatus?: string | undefined;
+    evidenceStatus?: string | undefined;
+    childCount: number;
+    chunkCount: number;
+  }>;
+  relationsAmongCurrentLayer: Array<{
+    sourceNodeId: string;
+    targetNodeId: string;
+    label: string;
+    summary?: string | undefined;
+  }>;
+}
+
+export interface BfsExpansionDecision {
+  decisions: Array<{
+    nodeId: string;
+    decision: "need" | "maybe" | "skip";
+    answerRelevant: boolean;
+    shouldCollectChunks: boolean;
+    reason: string;
+  }>;
+  stopTraversal: boolean;
+  stopReason?: string | undefined;
+}
+
+export interface DfsStepInput {
+  question: string;
+  globalSummary: string;
+  currentNode: {
+    nodeId: string;
+    title: string;
+    type: string;
+    summary: string;
+    chunkCount: number;
+    childCount: number;
+  };
+  path: Array<{
+    nodeId: string;
+    title: string;
+    relation?: string | undefined;
+    summary: string;
+    reason: string;
+  }>;
+  candidates: Array<{
+    nodeId: string;
+    title: string;
+    type: string;
+    summary: string;
+    relationFromCurrent?: string | undefined;
+    childCount: number;
+    chunkCount: number;
+  }>;
+}
+
+export interface DfsStepDecision {
+  selectedNextNodeIds: string[];
+  recordCurrentChunks: boolean;
+  backtrack: boolean;
+  stopTraversal: boolean;
+  reason: string;
+}
+
+export interface ChunkEvidencePack {
+  question: string;
+  mode: "bfs_full" | "dfs_pulse";
+  selectedChunks: Array<{
+    chunkId: string;
+    sourceNodeId?: string | undefined;
+    documentId?: string | undefined;
+    versionId?: string | undefined;
+    path: Array<{
+      nodeId: string;
+      title: string;
+      relation?: string | undefined;
+      summary: string;
+      decision: "need" | "maybe" | "selected";
+      reason: string;
+    }>;
+    retrievalSummary: string;
+    relevanceReason: string;
+    confidence: number;
+  }>;
+  skippedNodes: Array<{
+    nodeId: string;
+    title: string;
+    reason: string;
+  }>;
+  unresolvedQuestions: string[];
+  diagnostics: {
+    visitedNodeCount: number;
+    selectedChunkCount: number;
+    stoppedReason?: string | undefined;
+  };
+}
+
+export interface ChunkSummaryInput {
+  question: string;
+  chunkId: string;
+  chunkText: string;
+  retrievalTrace: {
+    sourceNodeId?: string | undefined;
+    path: ChunkEvidencePack["selectedChunks"][number]["path"];
+    retrievalSummary: string;
+    relevanceReason: string;
+  };
+}
+
+export interface ChunkAnswerSummary {
+  chunkId: string;
+  relevant: boolean;
+  shortSummary: string;
+  supportedFacts: string[];
+  unsupportedClaims: string[];
+  keyQuotes: string[];
+  confidence: number;
+  usage?: "answer_core" | "supporting_detail" | "background_only" | "irrelevant" | undefined;
+}
+
+export interface FinalAnswerFromChunksInput {
+  question: string;
+  evidencePack: ChunkEvidencePack;
+  chunkSummaries: ChunkAnswerSummary[];
+  chunks: Array<{
+    id: string;
+    text: string;
+    documentId: string;
+    versionId: string;
+  }>;
+}
+
 export interface AoriGraphNode {
   id: string;
   type:
@@ -1357,7 +1549,21 @@ export type PulseStreamEvent =
       | "fallback_retrieval_started"
       | "evidence_table_built"
       | "closure_checked"
-      | "answer_synthesized";
+      | "answer_synthesized"
+      | "aori_traversal_started"
+      | "bfs_layer_started"
+      | "bfs_node_decision"
+      | "bfs_node_expanded"
+      | "bfs_chunk_collected"
+      | "bfs_layer_finished"
+      | "dfs_node_entered"
+      | "dfs_candidate_selected"
+      | "dfs_chunk_found"
+      | "dfs_backtrack"
+      | "chunk_summary_started"
+      | "chunk_summary_finished"
+      | "final_answer_started"
+      | "final_answer_finished";
     message: string;
     payload?: unknown;
   }
@@ -1725,7 +1931,7 @@ export interface EvidencePack {
   evidencePackSchemaVersion?: 1 | 2 | undefined;
   pipeline?: {
     indexProfile: ActiveIndexProfile;
-    packBuilder: "legacy" | "v2";
+    packBuilder: "legacy" | "v2" | "aori_traversal";
     model: string;
     promptVersion: string;
   } | undefined;
@@ -1746,6 +1952,8 @@ export interface EvidencePack {
   verifiedGaps?: PulseEvidenceGap[] | undefined;
   refutedGaps?: PulseEvidenceGap[] | undefined;
   answerInputs?: string[] | undefined;
+  chunkEvidencePack?: ChunkEvidencePack | undefined;
+  chunkSummaries?: ChunkAnswerSummary[] | undefined;
   answerScope?: AnswerScope | undefined;
   scopeClosureReport?: ScopeClosureReport | undefined;
   semanticClassificationReviews?: SemanticClassificationReview[] | undefined;

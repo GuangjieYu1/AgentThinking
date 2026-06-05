@@ -1057,9 +1057,31 @@ function AoriPreview({ aori }: { aori: AoriDocumentResponse | undefined }) {
       </section>
       <section>
         <h3>索引生成理由</h3>
-        {aori.rationaleTrace.length > 0
-          ? <ul>{aori.rationaleTrace.map((trace) => <li key={trace.id ?? trace.summary}><b>{trace.decisionType}</b><span>{trace.summary}</span></li>)}</ul>
-          : <p className="muted">本次导入未记录索引生成理由。</p>}
+        {aori.rationaleTrace.length > 0 ? (
+          <ul>
+            {aori.rationaleTrace.map((trace) => (
+              <li key={trace.id ?? trace.summary}>
+                <b>{trace.stage} · {trace.decisionType} · {trace.risk}</b>
+                <span>{trace.summary}</span>
+                <small>
+                  input {trace.inputTokenEstimate} / used {trace.usedTokenEstimate}
+                  {" · "}保留：{trace.preservedRanges.join("；") || "-"}
+                  {" · "}省略：{trace.omittedRanges.join("；") || "-"}
+                </small>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="aori-rationale-empty">
+            <p className="muted">{aori.rationaleDebug.rationaleMissingReason ?? "索引生成理由未生成。"}</p>
+            <small>
+              requested {String(aori.rationaleDebug.rationaleRequested)}
+              {" · "}generated {String(aori.rationaleDebug.rationaleGenerated)}
+              {" · "}saved {String(aori.rationaleDebug.rationaleSaved)}
+              {" · "}count {aori.rationaleDebug.rationaleCount}
+            </small>
+          </div>
+        )}
       </section>
     </div>
   );

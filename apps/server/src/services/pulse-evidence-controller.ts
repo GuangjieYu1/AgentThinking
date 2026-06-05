@@ -14,6 +14,7 @@ import type {
   PulseEvidenceTool,
   PulseInputMode,
   PulseQuestionPlan,
+  PulseStreamEvent,
   PulseVerificationResult,
   QuestionTask,
   Relation,
@@ -26,9 +27,10 @@ import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import type { ModelProvider } from "./models.js";
 import type { VectorStore } from "./vector-store.js";
 import { computeGenericReconciliation, normalizeAnswerMode, overclaimErrors, validateEvidenceRow } from "./evidence-v2.js";
+import { AoriQuestionRouter } from "./aori-question-router.js";
 import { ScopeClosureRetriever, type ScopeClosureResult } from "./scope-closure.js";
 
-type PulseEventSink = (event: { type: "stage"; message: string }) => void | Promise<void>;
+type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
 
 export interface PulseSeedContext {
   hits: PendingPulseHit[];
@@ -221,19 +223,73 @@ export class PulseEvidenceController {
   ): Promise<PulseEvidenceControllerResult> {
     await eventSink?.({ type: "stage", message: "正在分析问题所需证据" });
     const analyzedQuestionPlan = await this.model.analyzePulseQuestion(question, mode);
+    await eventSink?.({ type: "library_route_started", message: "Library Router is selecting AORI documents, aspects, and assertions." });
+    const aoriRoute = new AoriQuestionRouter(this.db).route(libraryId, question, analyzedQuestionPlan);
+    for (const document of aoriRoute.routePlan.selectedDocuments) {
+      await eventSink?.({ type: "document_selected", message: `Selected document ${document.documentId}`, payload: document });
+    }
+    for (const aspect of aoriRoute.selectedLibraryAspects) {
+      await eventSink?.({ type: "aspect_selected", message: `Selected aspect ${aspect.title}`, payload: aspect });
+    }
+    for (const assertion of aoriRoute.selectedAssertions) {
+      await eventSink?.({ type: "assertion_selected", message: `Selected assertion ${assertion.domainRelation}`, payload: assertion });
+    }
+    await eventSink?.({ type: "question_task_generated", message: aoriRoute.questionTaskFrame.taskIntent.naturalLanguageGoal, payload: aoriRoute.questionTaskFrame });
     await eventSink?.({ type: "stage", message: "正在定义问题任务" });
     const questionTask = await this.model.classifyQuestionTask({
       question,
       mode,
       questionPlan: analyzedQuestionPlan,
-      planningContext: this.planningContextForLibrary(libraryId),
+      planningContext: {
+        routePlan: aoriRoute.routePlan,
+        questionTaskFrame: aoriRoute.questionTaskFrame,
+        libraryContext: this.planningContextForLibrary(libraryId),
+      },
     });
     const scopeClosure = new ScopeClosureRetriever(this.db).close(libraryId, question, analyzedQuestionPlan);
     const questionPlan: PulseQuestionPlan = { ...analyzedQuestionPlan, answerScope: scopeClosure.answerScope };
-    const memory = this.createMemory(question, questionPlan, seedContext);
+    const memory = this.createMemory(question, questionPlan, {
+      ...seedContext,
+      chunks: this.mergeChunkList([...aoriRoute.chunks, ...seedContext.chunks], 80),
+    });
     memory.questionTask = questionTask;
+    memory.questionTaskFrame = aoriRoute.questionTaskFrame;
+    memory.routePlan = aoriRoute.routePlan;
+    memory.selectedDocumentAori = aoriRoute.selectedDocumentAori;
+    memory.selectedLibraryAspects = aoriRoute.selectedLibraryAspects;
+    memory.selectedAssertions = aoriRoute.selectedAssertions;
+    memory.evidenceTables = aoriRoute.evidenceTables;
+    memory.closureChecks = aoriRoute.closureChecks;
+    memory.verifiedGaps = aoriRoute.verifiedGaps;
+    memory.refutedGaps = aoriRoute.refutedGaps;
+    memory.retrievalTrace ??= [];
+    memory.retrievalTrace.push({
+      stepIndex: 1,
+      tool: "buildEvidencePack",
+      purpose: "AORI Evidence Assembly",
+      query: question,
+      inputIds: [
+        ...aoriRoute.routePlan.selectedLibraryAspects,
+        ...aoriRoute.routePlan.selectedLibraryRelations,
+        ...aoriRoute.routePlan.selectedAssertions,
+      ],
+      outputIds: aoriRoute.chunks.map((chunk) => chunk.id),
+      targetType: "legacy_chunk",
+      newEvidenceRowCount: aoriRoute.evidenceTables.reduce((sum, table) => sum + table.rows.length, 0),
+      status: aoriRoute.chunks.length > 0 ? "success" : "empty",
+    });
+    memory.currentFindings.push(`AORI route ${aoriRoute.routePlan.routeType}: ${aoriRoute.routePlan.selectedDocuments.length} documents, ${aoriRoute.selectedAssertions.length} assertions, ${aoriRoute.chunks.length} chunks.`);
+    await eventSink?.({ type: "aori_evidence_bound", message: `Bound ${aoriRoute.chunks.length} chunks from AORI route.`, payload: aoriRoute.routePlan });
     const hitMap = new Map<string, PendingPulseHit>();
     for (const hit of seedContext.hits) hitMap.set(`${hit.targetType}:${hit.targetId}`, hit);
+    for (const chunk of aoriRoute.chunks) {
+      this.addChunkHit(hitMap, chunk, {
+        tool: "buildEvidencePack",
+        query: question,
+        purpose: "AORI Evidence Assembly",
+        expectedResult: "Source chunks bound from selected AORI assertions and aspects.",
+      }, -30);
+    }
 
     this.applyScopeClosure(memory, scopeClosure, hitMap);
     memory.retrievalTasks = await this.model.planRetrievalTasks({
@@ -254,6 +310,10 @@ export class PulseEvidenceController {
       tools: allowedTools,
     });
     const initialPlan = this.withEvidenceHeavySteps(planned, questionPlan);
+    if (initialPlan.steps.length > 0) {
+      memory.fallbackRetrieval = [];
+      await eventSink?.({ type: "fallback_retrieval_started", message: "AORI evidence is being supplemented with retrieval tools.", payload: initialPlan.steps });
+    }
     const defaultMaxIterations = mode === "progressive"
       ? questionPlan.riskLevel === "high" && questionPlan.requiresExhaustiveEvidence ? 6 : 5
       : 2;
@@ -303,6 +363,10 @@ export class PulseEvidenceController {
       reasoning: "No sufficiency judgment was produced; answer must stay guarded.",
       ...(computePulseReconciliation(memory.evidenceRows) ? { reconciliation: computePulseReconciliation(memory.evidenceRows) } : {}),
     };
+    if ((memory.evidenceTables ?? []).length > 0) {
+      await eventSink?.({ type: "evidence_table_built", message: `Built ${memory.evidenceTables?.length ?? 0} AORI evidence table(s).`, payload: memory.evidenceTables });
+    }
+    await eventSink?.({ type: "closure_checked", message: finalStatus.reasoning, payload: { status: finalStatus, closureChecks: memory.closureChecks } });
     const answerMemory = this.answerCoreMemory(memory);
     await eventSink?.({ type: "stage", message: "Synthesizing answer from EvidenceMemory" });
     let output = await this.model.synthesizePulseAnswer({
@@ -328,6 +392,7 @@ export class PulseEvidenceController {
     if (!verification.passed) {
       output = this.guardedAnswer(question, memory, finalStatus, verification);
     }
+    await eventSink?.({ type: "answer_synthesized", message: output.summary, payload: output.diagnostics });
     return { ...output, hits: [...hitMap.values()], evidencePack: this.buildEvidencePack(question, memory, finalStatus) };
   }
 
@@ -367,9 +432,28 @@ export class PulseEvidenceController {
   }
 
   private planningContextForLibrary(libraryId: string): unknown {
-    const aoriIndexes = this.db.listAoriDocumentIndexes(libraryId).slice(0, 5);
+    const aoriIndexes = this.db.listAoriDocumentIndexes(libraryId);
+    const libraryAori = this.db.getLibraryAoriProfile(libraryId);
     return {
       planningIndexAvailable: aoriIndexes.length > 0,
+      libraryAori: libraryAori.available ? {
+        entityCount: libraryAori.entities.length,
+        aspectCount: libraryAori.aspects.length,
+        assertionCount: libraryAori.assertions.length,
+        relationCount: libraryAori.relations.length,
+        aspects: libraryAori.aspects.slice(0, 40).map((aspect) => ({
+          id: aspect.id,
+          title: aspect.title,
+          kind: aspect.kind,
+          domainKind: aspect.domainKind,
+          summary: aspect.summary.slice(0, 500),
+        })),
+        relations: libraryAori.relations.slice(0, 40).map((relation) => ({
+          id: relation.id,
+          aggregateRelation: relation.aggregateRelation,
+          assertionIds: relation.assertionIds.slice(0, 12),
+        })),
+      } : undefined,
       documents: aoriIndexes.map((index) => ({
         versionId: index.versionId,
         documentName: index.documentName,
@@ -777,7 +861,7 @@ export class PulseEvidenceController {
     memory.retrievalHistory.push({ tool: step.tool, ...(step.query ? { query: step.query } : {}), chunkIds: chunks.map((chunk) => chunk.id), purpose: step.purpose });
     for (const chunk of chunks) this.addChunkHit(hitMap, chunk, step, iteration);
     memory.retrievalTrace ??= [];
-    memory.retrievalTrace.push({
+    const trace = {
       stepIndex: 20 + iteration,
       tool: step.tool,
       purpose: step.purpose,
@@ -794,7 +878,12 @@ export class PulseEvidenceController {
       ...(fallbackReason && actualIndexProfile === "v1" ? { fallbackReason } : {}),
       newEvidenceRowCount: Math.max(0, memory.evidenceRows.length - rowCountBefore),
       status: chunks.length > 0 || (memory.summaryNodes ?? []).length > 0 ? "success" : "empty",
-    });
+    } as NonNullable<PulseEvidenceMemory["retrievalTrace"]>[number];
+    memory.retrievalTrace.push(trace);
+    if (step.tool !== "buildEvidencePack") {
+      memory.fallbackRetrieval ??= [];
+      memory.fallbackRetrieval.push(trace);
+    }
     return chunks;
   }
 
@@ -1099,6 +1188,16 @@ export class PulseEvidenceController {
   private memorySummary(memory: PulseEvidenceMemory): PulseEvidenceMemory {
     return {
       ...memory,
+      questionTaskFrame: memory.questionTaskFrame,
+      routePlan: memory.routePlan,
+      selectedLibraryAspects: (memory.selectedLibraryAspects ?? []).slice(0, 20),
+      selectedDocumentAori: (memory.selectedDocumentAori ?? []).slice(0, 8),
+      selectedAssertions: (memory.selectedAssertions ?? []).slice(0, 40),
+      fallbackRetrieval: (memory.fallbackRetrieval ?? []).slice(0, 40),
+      evidenceTables: (memory.evidenceTables ?? []).map((table) => ({ ...table, rows: table.rows.slice(0, 40) })).slice(0, 8),
+      closureChecks: (memory.closureChecks ?? []).slice(0, 20),
+      verifiedGaps: (memory.verifiedGaps ?? []).slice(0, 20),
+      refutedGaps: (memory.refutedGaps ?? []).slice(0, 20),
       retrievalTasks: (memory.retrievalTasks ?? []).slice(0, 20),
       semanticClassificationReviews: (memory.semanticClassificationReviews ?? []).slice(0, 160),
       usageGateRejectedRows: (memory.usageGateRejectedRows ?? []).slice(0, 160),
@@ -1135,12 +1234,14 @@ export class PulseEvidenceController {
     });
     memory.usageGateRejectedRows = rejected;
     memory.finalAnswerInputs = evidenceRows.map((row) => row.rowId);
+    memory.answerInputs = memory.finalAnswerInputs;
     return {
       ...memory,
       evidenceRows,
       citedChunkIds: [...new Set(evidenceRows.map((row) => row.evidenceChunkId))],
       usageGateRejectedRows: rejected,
       finalAnswerInputs: evidenceRows.map((row) => row.rowId),
+      answerInputs: evidenceRows.map((row) => row.rowId),
     };
   }
 
@@ -1158,6 +1259,13 @@ export class PulseEvidenceController {
         ...output.diagnostics,
         questionPlan: memory.questionPlan,
         questionTask: memory.questionTask,
+        questionTaskFrame: memory.questionTaskFrame,
+        routePlan: memory.routePlan,
+        selectedAssertions: memory.selectedAssertions,
+        evidenceTables: memory.evidenceTables,
+        closureChecks: memory.closureChecks,
+        verifiedGaps: memory.verifiedGaps,
+        refutedGaps: memory.refutedGaps,
         retrievalTasks: memory.retrievalTasks,
         semanticClassificationReviews: memory.semanticClassificationReviews,
         usageGateRejectedRows: memory.usageGateRejectedRows,
@@ -1222,6 +1330,17 @@ export class PulseEvidenceController {
       answerModeOverridden: answerMode.overridden,
       questionPlan: memory.questionPlan,
       questionTask: memory.questionTask,
+      questionTaskFrame: memory.questionTaskFrame,
+      routePlan: memory.routePlan,
+      selectedLibraryAspects: memory.selectedLibraryAspects,
+      selectedDocumentAori: memory.selectedDocumentAori,
+      selectedAssertions: memory.selectedAssertions,
+      fallbackRetrieval: memory.fallbackRetrieval,
+      evidenceTables: memory.evidenceTables,
+      closureChecks: memory.closureChecks,
+      verifiedGaps: memory.verifiedGaps,
+      refutedGaps: memory.refutedGaps,
+      answerInputs: memory.answerInputs,
       answerScope: memory.answerScope,
       scopeClosureReport: memory.scopeClosureReport,
       semanticClassificationReviews: memory.semanticClassificationReviews,

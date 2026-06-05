@@ -26,6 +26,8 @@ import {
   relationTypes,
   type AoriGraphEdge,
   type AoriGraphNode,
+  type AoriGraphScope,
+  type AoriGraphViewMode,
   type AoriGraphView,
   type AbstractNode,
   type AspectKind,
@@ -205,9 +207,20 @@ const workspaceViewLabels: Record<WorkspaceViewMode, string> = {
 
 const graphSurfaceLabels: Record<GraphSurfaceMode, string> = {
   legacy: "Legacy",
-  aori_overview: "AORI 概览",
-  aori_detail: "AORI 细节",
-  hybrid: "Hybrid",
+  aori_overview: "AORI",
+  aori_detail: "AORI",
+  hybrid: "AORI",
+};
+
+const aoriScopeLabels: Record<AoriGraphScope, string> = {
+  document: "Document",
+  library: "Library",
+};
+
+const aoriViewModeLabels: Record<AoriGraphViewMode, string> = {
+  layer: "Layer",
+  tree: "Tree",
+  network: "Network",
 };
 
 const aoriNodeTypeLabels: Record<AoriGraphNode["type"], string> = {
@@ -219,6 +232,13 @@ const aoriNodeTypeLabels: Record<AoriGraphNode["type"], string> = {
   self_question: "自问",
   source_chunk: "原文片段",
   warning: "告警",
+  library_center: "知识库中心",
+  entity: "实体",
+  library_aspect: "库级切面",
+  relation_assertion: "关系断言",
+  document: "文档",
+  evidence: "证据",
+  aggregate_relation: "聚合关系",
 };
 
 const evidenceStatusLabels = {
@@ -245,6 +265,12 @@ function aoriModeFromSurface(mode: Exclude<GraphSurfaceMode, "legacy">): AoriGra
   if (mode === "aori_overview") return "overview";
   if (mode === "aori_detail") return "detail";
   return "hybrid";
+}
+
+function layoutFromAoriViewMode(mode: AoriGraphViewMode): LayoutMode {
+  if (mode === "network") return "network";
+  if (mode === "tree") return "tree";
+  return "layered";
 }
 
 function confidenceText(confidence: number | undefined): string | undefined {
@@ -931,7 +957,7 @@ function aoriNodeMeta(record: AoriGraphNode): string {
   ].filter(Boolean).slice(0, 5).join(" · ");
 }
 
-function aoriNodeClass(record: AoriGraphNode, collapsedNodeIds: ReadonlySet<string>): string {
+function aoriNodeClass(record: AoriGraphNode, collapsedNodeIds: ReadonlySet<string>, selectedNodeId?: string): string {
   return [
     "flow-aori",
     `flow-aori-${record.type.replaceAll("_", "-")}`,
@@ -939,6 +965,7 @@ function aoriNodeClass(record: AoriGraphNode, collapsedNodeIds: ReadonlySet<stri
     record.closureStatus ? `flow-aori-closure-${record.closureStatus}` : "",
     record.fallbackOnly ? "flow-aori-fallback-only" : "",
     collapsedNodeIds.has(record.id) ? "flow-aori-collapsed" : "",
+    selectedNodeId === record.id ? "flow-aori-selected" : "",
   ].filter(Boolean).join(" ");
 }
 
@@ -952,13 +979,20 @@ function aoriNodeWidth(record: AoriGraphNode): number {
 function aoriNodeOrder(record: AoriGraphNode, graph: AoriGraphView): string {
   const groupIndex = graph.groups.findIndex((group) => group.nodeIds.includes(record.id));
   const typeRank = {
+    library_center: 0,
     document_center: 0,
+    document: 1,
     aspect: 1,
+    library_aspect: 1,
+    entity: 2,
     aspect_item: 2,
     relation: 3,
+    aggregate_relation: 3,
+    relation_assertion: 4,
     gap: 4,
     self_question: 5,
     source_chunk: 6,
+    evidence: 6,
     warning: 7,
   } satisfies Record<AoriGraphNode["type"], number>;
   return [
@@ -969,15 +1003,89 @@ function aoriNodeOrder(record: AoriGraphNode, graph: AoriGraphView): string {
   ].join(":");
 }
 
-function aoriVisualNodes(graph: AoriGraphView): VisualNode[] {
+function aoriVisibleNodes(graph: AoriGraphView, viewMode: AoriGraphViewMode, selectedNodeId?: string): AoriGraphNode[] {
+  if (viewMode !== "network") return graph.nodes;
   const collapsedNodeIds = new Set(graph.layoutHints.collapsedNodeIds);
-  const positions = new Map<string, { x: number; y: number }>();
-  const center = graph.nodes.find((node) => node.id === graph.layoutHints.centerNodeId) ?? graph.centerNode;
+  return graph.nodes.filter((node) =>
+    node.id === selectedNodeId ||
+    !collapsedNodeIds.has(node.id) ||
+    (node.type !== "source_chunk" && node.type !== "evidence")
+  );
+}
 
-  if (graph.layoutHints.mode === "overview") {
+function aoriVisualNodes(graph: AoriGraphView, requestedViewMode?: AoriGraphViewMode, selectedNodeId?: string): VisualNode[] {
+  const viewMode = requestedViewMode ?? graph.layoutHints.viewMode ?? (graph.layoutHints.mode === "overview" ? "layer" : "layer");
+  const collapsedNodeIds = new Set(graph.layoutHints.collapsedNodeIds);
+  const visibleNodes = aoriVisibleNodes(graph, viewMode, selectedNodeId);
+  const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
+  const visibleEdges = graph.edges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target));
+  const positions = new Map<string, { x: number; y: number }>();
+  const center = visibleNodes.find((node) => node.id === graph.layoutHints.centerNodeId) ?? visibleNodes[0] ?? graph.centerNode;
+
+  if (viewMode === "network") {
+    const degree = new Map<string, number>();
+    for (const edge of visibleEdges) {
+      degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
+      degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
+    }
+    const simulatedNodes: PositionedNode[] = visibleNodes.map((node, index) => {
+      const angle = visibleNodes.length === 1 ? 0 : (index * Math.PI * 2) / visibleNodes.length;
+      const rankRadius = node.id === center.id ? 0 : node.type === "source_chunk" || node.type === "evidence" ? 520 : 320;
+      return {
+        id: node.id,
+        x: 420 + Math.cos(angle) * rankRadius,
+        y: 320 + Math.sin(angle) * rankRadius,
+      };
+    });
+    const byId = new Map(visibleNodes.map((node) => [node.id, node]));
+    const links = visibleEdges.map((edge) => ({
+      source: edge.source,
+      target: edge.target,
+      type: edge.type,
+    }));
+    const simulation = forceSimulation(simulatedNodes)
+      .force("charge", forceManyBody<PositionedNode>().strength((node) => {
+        const record = byId.get(node.id);
+        if (record?.type === "source_chunk" || record?.type === "evidence") return -460;
+        return -920 - ((degree.get(node.id) ?? 0) * 60);
+      }).distanceMax(900))
+      .force("collide", forceCollide<PositionedNode>().radius((node) => {
+        const record = byId.get(node.id);
+        if (!record) return 128;
+        return aoriNodeWidth(record) * 0.58;
+      }).strength(1).iterations(3))
+      .force("link", forceLink<PositionedNode, { source: string; target: string; type: AoriGraphEdge["type"] }>(links)
+        .id((node) => node.id)
+        .distance((link) => link.type === "evidence" || link.type === "evidence_for" ? 210 : link.type === "aggregate_relation" ? 285 : 250)
+        .strength((link) => link.type === "evidence" || link.type === "evidence_for" ? 0.26 : 0.52))
+      .force("center", forceCenter(420, 320))
+      .stop();
+    for (let index = 0; index < 260; index += 1) simulation.tick();
+    for (const node of simulatedNodes) {
+      positions.set(node.id, { x: node.x ?? 0, y: node.y ?? 0 });
+    }
+  } else if (viewMode === "tree") {
+    const layers = new Map<number, AoriGraphNode[]>();
+    for (const node of visibleNodes) {
+      const layer = graph.layoutHints.layers[node.id] ?? 0;
+      const bucket = layers.get(layer) ?? [];
+      bucket.push(node);
+      layers.set(layer, bucket);
+    }
+    [...layers.entries()].forEach(([layerIndex, layerNodes]) => {
+      layerNodes.sort((left, right) => aoriNodeOrder(left, graph).localeCompare(aoriNodeOrder(right, graph), "zh-CN"));
+      const columnGap = layerNodes.some((node) => node.type === "source_chunk") ? 260 : 245;
+      layerNodes.forEach((node, columnIndex) => {
+        positions.set(node.id, {
+          x: 380 + (columnIndex - ((layerNodes.length - 1) / 2)) * columnGap,
+          y: layerIndex * 170,
+        });
+      });
+    });
+  } else if (graph.layoutHints.mode === "overview") {
     positions.set(center.id, { x: 360, y: 280 });
-    const aspects = graph.nodes
-      .filter((node) => node.type === "aspect")
+    const aspects = visibleNodes
+      .filter((node) => node.type === "aspect" || node.type === "library_aspect" || node.type === "entity" || node.type === "aggregate_relation")
       .sort((left, right) => aoriNodeOrder(left, graph).localeCompare(aoriNodeOrder(right, graph), "zh-CN"));
     const radiusX = Math.max(360, Math.min(620, 300 + aspects.length * 16));
     const radiusY = Math.max(210, Math.min(430, 180 + aspects.length * 11));
@@ -990,7 +1098,7 @@ function aoriVisualNodes(graph: AoriGraphView): VisualNode[] {
     });
   } else {
     const layers = new Map<number, AoriGraphNode[]>();
-    for (const node of graph.nodes) {
+    for (const node of visibleNodes) {
       const layer = graph.layoutHints.layers[node.id] ?? 0;
       const bucket = layers.get(layer) ?? [];
       bucket.push(node);
@@ -1008,14 +1116,14 @@ function aoriVisualNodes(graph: AoriGraphView): VisualNode[] {
     });
   }
 
-  return graph.nodes.map((record) => {
+  return visibleNodes.map((record) => {
     const point = positions.get(record.id) ?? { x: 0, y: 0 };
     const meta = aoriNodeMeta(record);
     return {
       id: record.id,
       position: point,
-      sourcePosition: graph.layoutHints.mode === "overview" ? Position.Right : Position.Right,
-      targetPosition: graph.layoutHints.mode === "overview" ? Position.Left : Position.Left,
+      sourcePosition: viewMode === "tree" ? Position.Bottom : Position.Right,
+      targetPosition: viewMode === "tree" ? Position.Top : Position.Left,
       data: {
         aori: record,
         label: (
@@ -1025,7 +1133,7 @@ function aoriVisualNodes(graph: AoriGraphView): VisualNode[] {
           </div>
         ),
       },
-      className: aoriNodeClass(record, collapsedNodeIds),
+      className: aoriNodeClass(record, collapsedNodeIds, selectedNodeId),
       style: {
         width: aoriNodeWidth(record),
         minHeight: record.type === "source_chunk" ? 58 : 72,
@@ -1044,22 +1152,29 @@ function aoriEdgeColor(record: AoriGraphEdge): string {
   return "#56c7b0";
 }
 
-function displayAoriEdges(graph: AoriGraphView): VisualEdge[] {
-  return graph.edges.map((record) => {
+function displayAoriEdges(graph: AoriGraphView, requestedViewMode?: AoriGraphViewMode, selectedNodeId?: string, selectedEdgeId?: string): VisualEdge[] {
+  const viewMode = requestedViewMode ?? graph.layoutHints.viewMode ?? (graph.layoutHints.mode === "overview" ? "layer" : "layer");
+  const visibleNodeIds = new Set(aoriVisibleNodes(graph, viewMode, selectedNodeId).map((node) => node.id));
+  return graph.edges.filter((record) => visibleNodeIds.has(record.source) && visibleNodeIds.has(record.target)).map((record) => {
     const warning = record.type === "warning" || record.evidenceStatus === "unsupported" || record.closureStatus === "open";
+    const selected = selectedEdgeId === record.id;
     const edge: VisualEdge = {
       id: record.id,
       source: record.source,
       target: record.target,
-      type: graph.layoutHints.mode === "overview" ? "default" : "smoothstep",
+      type: viewMode === "network" || graph.layoutHints.mode === "overview" ? "default" : "smoothstep",
       data: { aori: record },
       label: record.domainRelation || record.label,
       animated: warning,
-      className: `flow-aori-edge flow-aori-edge-${record.type.replaceAll("_", "-")}`,
+      className: [
+        "flow-aori-edge",
+        `flow-aori-edge-${record.type.replaceAll("_", "-")}`,
+        selected ? "flow-aori-edge-selected" : "",
+      ].filter(Boolean).join(" "),
       style: {
         stroke: aoriEdgeColor(record),
-        strokeWidth: record.type === "relates" ? 2.8 : record.type === "evidence" ? 1.5 : 2.2,
-        opacity: record.type === "evidence" ? 0.72 : 0.95,
+        strokeWidth: selected ? 4.2 : record.type === "relates" || record.type === "aggregate_relation" ? 2.8 : record.type === "evidence" ? 1.5 : 2.2,
+        opacity: selected ? 1 : record.type === "evidence" ? 0.72 : 0.95,
         ...(warning || record.type === "evidence" ? { strokeDasharray: "5 4" } : {}),
       },
       labelStyle: { fill: "#c7d4e7", fontSize: 12, fontWeight: 700 },
@@ -1113,10 +1228,13 @@ export function GraphWorkspace({
       ? "aori_overview"
       : "legacy",
   );
+  const [aoriScope, setAoriScope] = useState<AoriGraphScope>("document");
+  const [aoriViewMode, setAoriViewMode] = useState<AoriGraphViewMode>("layer");
   const [aoriVersionId, setAoriVersionId] = useState<string | undefined>(() =>
     documents.find((document) => document.latestVersion?.status === "completed" && document.latestVersion.indexStrategy === "aspect_oriented_reflective")?.latestVersion?.id,
   );
   const [aoriGraph, setAoriGraph] = useState<AoriGraphView>();
+  const [aoriGraphMessage, setAoriGraphMessage] = useState("");
   const [layout, setLayout] = useState<LayoutMode>("layered");
   const [focusedNodeId, setFocusedNodeId] = useState<string>();
   const [status, setStatus] = useState<RelationStatus | "">("");
@@ -1150,7 +1268,11 @@ export function GraphWorkspace({
   activeLibraryIdRef.current = libraryId;
   const visibleCurrentPulse = currentPulse?.pulse.libraryId === libraryId ? currentPulse : undefined;
   const isAoriMode = isAoriGraphMode(graphMode);
-  const activeAoriMode = isAoriMode ? aoriModeFromSurface(graphMode) : undefined;
+  const activeAoriMode = isAoriMode
+    ? aoriScope === "document"
+      ? aoriViewMode === "layer" ? "overview" : "detail"
+      : aoriViewMode === "layer" ? "overview" : "detail"
+    : undefined;
   const aoriDocuments = useMemo(
     () => documents.filter((document) =>
       document.libraryId === libraryId &&
@@ -1233,6 +1355,7 @@ export function GraphWorkspace({
 
   const applyAoriGraph = (graph: AoriGraphView) => {
     setAoriGraph(graph);
+    setAoriGraphMessage("");
     setRecords([]);
     setEdgeRecords([]);
     setAspectFilter(undefined);
@@ -1241,14 +1364,14 @@ export function GraphWorkspace({
     setSelectedAggregate(undefined);
     setSelectedAoriNode((current) => current ? graph.nodes.find((node) => node.id === current.id) : undefined);
     setSelectedAoriEdge((current) => current ? graph.edges.find((edge) => edge.id === current.id) : undefined);
-    setNodes(aoriVisualNodes(graph));
-    setEdges(displayAoriEdges(graph));
+    setNodes(aoriVisualNodes(graph, aoriViewMode, selectedAoriNode?.id));
+    setEdges(displayAoriEdges(graph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
   };
 
   const loadAoriGraph = async (mode: AoriGraphMode = activeAoriMode ?? "overview") => {
     const requestLibraryId = libraryId;
     const requestVersionId = aoriVersionId;
-    if (!requestVersionId) {
+    if (aoriScope === "document" && !requestVersionId) {
       setAoriGraph(undefined);
       setNodes([]);
       setEdges([]);
@@ -1257,13 +1380,20 @@ export function GraphWorkspace({
     const requestSeq = graphRequestSeqRef.current + 1;
     graphRequestSeqRef.current = requestSeq;
     try {
-      const graph = await api.aoriGraph(requestVersionId, mode);
+      const graph = aoriScope === "library"
+        ? await api.libraryAoriGraph(requestLibraryId, aoriViewMode)
+        : await api.aoriGraph(requestVersionId!, mode);
       if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return undefined;
       applyAoriGraph(graph);
       return graph;
     } catch (cause) {
       if (activeLibraryIdRef.current !== requestLibraryId || graphRequestSeqRef.current !== requestSeq) return undefined;
-      onError((cause as Error).message);
+      const message = (cause as Error).message;
+      setAoriGraph(undefined);
+      setNodes([]);
+      setEdges([]);
+      setAoriGraphMessage(aoriScope === "library" ? message : "");
+      if (aoriScope !== "library") onError(message);
       return undefined;
     }
   };
@@ -1303,7 +1433,7 @@ export function GraphWorkspace({
       }
       void flowInstance.fitView({ padding: 0.16, minZoom: 0.35, maxZoom: 1.18 });
     });
-  }, [flowInstance, nodes.length, layout, graphMode, aoriGraph?.layoutHints.mode]);
+  }, [flowInstance, nodes.length, layout, graphMode, aoriGraph?.layoutHints.mode, aoriScope, aoriViewMode]);
 
   useEffect(() => {
     if (pulseMode !== "current" || !visibleCurrentPulse || !pulsePlaying) return;
@@ -1332,6 +1462,12 @@ export function GraphWorkspace({
     setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, layout, aspect || undefined, "current", searchFocus));
     setEdges(displayEdges(visibleGraph.edges, layout, "current"));
   }, [isAoriMode, pulsing, visibleCurrentPulse?.pulse.id, pulseStreamHits, records, edgeRecords, layout, aspect, searchFocus]);
+
+  useEffect(() => {
+    if (!isAoriMode || !aoriGraph) return;
+    setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
+    setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+  }, [isAoriMode, aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id]);
 
   useEffect(() => {
     if (viewMode !== "document" || documentTree.length > 0 || documentTreeLoading) return;
@@ -1381,6 +1517,7 @@ export function GraphWorkspace({
     setEdgeRecords([]);
     setAspectFilter(undefined);
     setAoriGraph(undefined);
+    setAoriGraphMessage("");
     setNodes([]);
     setEdges([]);
     void api.pulses(requestLibraryId)
@@ -1412,7 +1549,7 @@ export function GraphWorkspace({
     }
     setAoriGraph(undefined);
     void loadGraph(focusedNodeId, view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1, view, [], undefined);
-  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, visibleCurrentPulse?.pulse.id, isAoriMode, activeAoriMode, aoriVersionId]);
+  }, [libraryId, refreshKey, status, type, aspect, view, focusedNodeId, pulseMode, visibleCurrentPulse?.pulse.id, isAoriMode, activeAoriMode, aoriVersionId, aoriScope, aoriViewMode]);
 
   useEffect(() => {
     if (selected?.nodeType !== "abstract") {
@@ -1467,10 +1604,10 @@ export function GraphWorkspace({
 
   const runPulse = async (event: FormEvent) => {
     event.preventDefault();
-    if (isAoriMode) return;
     if (!pulseQuestion.trim() || pulsing) return;
     const requestLibraryId = libraryId;
     const question = pulseQuestion.trim();
+    const startedInAoriMode = isAoriMode;
     setPulsing(true);
     setCurrentPulse(undefined);
     setPulseMode("normal");
@@ -1488,6 +1625,22 @@ export function GraphWorkspace({
           return;
         }
         if (update.type === "stage") {
+          setPulseStreamMessage(update.message);
+          return;
+        }
+        if (
+          update.type === "library_route_started" ||
+          update.type === "document_selected" ||
+          update.type === "question_task_generated" ||
+          update.type === "aspect_selected" ||
+          update.type === "library_relation_selected" ||
+          update.type === "assertion_selected" ||
+          update.type === "aori_evidence_bound" ||
+          update.type === "fallback_retrieval_started" ||
+          update.type === "evidence_table_built" ||
+          update.type === "closure_checked" ||
+          update.type === "answer_synthesized"
+        ) {
           setPulseStreamMessage(update.message);
           return;
         }
@@ -1531,7 +1684,14 @@ export function GraphWorkspace({
           setPulseStreamHits([]);
           setPulseNavigationEvents([]);
           setPulseDraftAnswer("");
-          applyGraph(response.graph, layout, "current", 0, response);
+          if (startedInAoriMode) {
+            if (aoriGraph) {
+              setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
+              setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+            }
+          } else {
+            applyGraph(response.graph, layout, "current", 0, response);
+          }
           return;
         }
         if (update.type === "error") throw new Error(update.message);
@@ -1568,7 +1728,14 @@ export function GraphWorkspace({
       setPulseMode("current");
       setPulseRevealCount(0);
       setPulsePlaying(true);
-      applyGraph(response.graph, layout, "current", 0, response);
+      if (isAoriMode) {
+        if (aoriGraph) {
+          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
+          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+        }
+      } else {
+        applyGraph(response.graph, layout, "current", 0, response);
+      }
     } catch (cause) {
       onError((cause as Error).message);
     }
@@ -1585,6 +1752,13 @@ export function GraphWorkspace({
       setPulseMode("normal");
       setPulseRevealCount(0);
       setPulsePlaying(false);
+      if (isAoriMode) {
+        if (aoriGraph) {
+          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
+          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+        }
+        return;
+      }
       const graph = await api.graph(requestLibraryId, {
         ...(focusedNodeId ? { centerId: focusedNodeId } : {}),
         includeChunks: view === "detail" && selected?.nodeType === "abstract" && selected.data.level === 1,
@@ -1615,7 +1789,14 @@ export function GraphWorkspace({
         : pulseRevealCount;
       setPulseRevealCount(nextRevealCount);
       setPulsePlaying(false);
-      applyGraph(response.graph, layout, nextMode, nextRevealCount, response);
+      if (isAoriMode) {
+        if (aoriGraph) {
+          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
+          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+        }
+      } else {
+        applyGraph(response.graph, layout, nextMode, nextRevealCount, response);
+      }
     } catch (cause) {
       if (activeLibraryIdRef.current !== requestLibraryId) return;
       onError((cause as Error).message);
@@ -1676,14 +1857,29 @@ export function GraphWorkspace({
     setLayout(nextLayout);
     if (isAoriMode) {
       if (aoriGraph) {
-        setNodes(aoriVisualNodes(aoriGraph));
-        setEdges(displayAoriEdges(aoriGraph));
+        setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
+        setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
       }
       return;
     }
     const visibleGraph = revealPulseGraph(records, edgeRecords, pulseMode, visibleCurrentPulse, pulseRevealCount);
     setNodes(layoutNodes(visibleGraph.nodes, visibleGraph.edges, nextLayout, aspect || undefined, pulseMode, searchFocus));
     setEdges(displayEdges(visibleGraph.edges, nextLayout, pulseMode));
+  };
+
+  const changeAoriScope = (nextScope: AoriGraphScope) => {
+    setSelectedAoriNode(undefined);
+    setSelectedAoriEdge(undefined);
+    setAoriScope(nextScope);
+  };
+
+  const changeAoriViewMode = (nextMode: AoriGraphViewMode) => {
+    setAoriViewMode(nextMode);
+    setLayout(layoutFromAoriViewMode(nextMode));
+    if (aoriGraph) {
+      setNodes(aoriVisualNodes(aoriGraph, nextMode, selectedAoriNode?.id));
+      setEdges(displayAoriEdges(aoriGraph, nextMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+    }
   };
 
   const changePulseMode = (nextMode: PulseLayerMode) => {
@@ -1698,6 +1894,41 @@ export function GraphWorkspace({
   };
 
   const openPulseHit = (hit: PulseResponse["hits"][number]) => {
+    if (isAoriMode && aoriGraph) {
+      if (hit.targetType === "relation") {
+        const edge = aoriGraph.edges.find((record) =>
+          record.id === hit.targetId ||
+          record.assertionIds?.includes(hit.targetId) ||
+          record.domainRelation === hit.label ||
+          record.label === hit.label
+        );
+        if (edge) {
+          setSelectedAoriEdge(edge);
+          setSelectedAoriNode(undefined);
+          setSelected(undefined);
+          setSelectedRelation(undefined);
+          setSelectedAggregate(undefined);
+          return;
+        }
+      }
+      const node = aoriGraph.nodes.find((record) =>
+        record.id === hit.targetId ||
+        record.chunkId === hit.targetId ||
+        record.assertionId === hit.targetId ||
+        record.relationId === hit.targetId ||
+        record.entityId === hit.targetId ||
+        record.documentId === hit.targetId
+      );
+      if (node) {
+        setSelectedAoriNode(node);
+        setSelectedAoriEdge(undefined);
+        setSelected(undefined);
+        setSelectedRelation(undefined);
+        setSelectedAggregate(undefined);
+        pendingFocusNodeIdRef.current = node.id;
+        return;
+      }
+    }
     if (hit.targetType === "relation") {
       const edge = edgeRecords.find((record) => record.relation?.id === hit.targetId || record.aggregate?.relationIds.includes(hit.targetId));
       setSelected(undefined);
@@ -1753,7 +1984,7 @@ export function GraphWorkspace({
             ))}
           </div>
           <div className="graph-depth" aria-label="图谱模式">
-            {(["legacy", "aori_overview", "aori_detail", "hybrid"] as GraphSurfaceMode[]).map((mode) => (
+            {(["legacy", "aori_overview"] as GraphSurfaceMode[]).map((mode) => (
               <button
                 key={mode}
                 className={graphMode === mode ? "selected" : ""}
@@ -1770,13 +2001,12 @@ export function GraphWorkspace({
               <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
             </div>
           )}
-          {aoriDocuments.length > 0 && (
+          {isAoriMode && aoriScope === "document" && aoriDocuments.length > 0 && (
             <select
               className="aori-version-select"
               value={aoriVersionId ?? ""}
               onChange={(event) => {
                 setAoriVersionId(event.target.value || undefined);
-                if (graphMode === "legacy") setGraphMode("aori_overview");
               }}
             >
               {aoriDocuments.map((document) => (
@@ -1786,11 +2016,11 @@ export function GraphWorkspace({
           )}
         </div>
       </div>
-      {!isAoriMode && <div className="pulse-toolbar">
+      <div className="pulse-toolbar">
         <div className="toolbar-group pulse-query">
           <span className="toolbar-label">脉冲</span>
           <form onSubmit={(event) => void runPulse(event)}>
-            <input value={pulseQuestion} onChange={(event) => setPulseQuestion(event.target.value)} placeholder="向图谱发起问题..." />
+            <input value={pulseQuestion} onChange={(event) => setPulseQuestion(event.target.value)} placeholder={isAoriMode ? "向 AORI 发起问题..." : "向图谱发起问题..."} />
             <select value={pulseInputMode} onChange={(event) => setPulseInputMode(event.target.value as PulseInputMode)}>
               <option value="full">全量输入</option>
               <option value="progressive">渐进输入</option>
@@ -1824,7 +2054,7 @@ export function GraphWorkspace({
             清空
           </button>
         </div>
-      </div>}
+      </div>
       <div className="graph-body">
         <div className="canvas">
           <ReactFlow
@@ -1881,12 +2111,23 @@ export function GraphWorkspace({
           >
             <Background color="#28334c" gap={24} />
             <MiniMap nodeColor={miniMapNodeColor} />
-            {!isAoriMode && <Controls className="layout-controls" position="bottom-left" showZoom={false} showFitView={false} showInteractive={false}>
-              <ControlButton className={layout === "layered" ? "layout-active" : ""} onClick={() => changeLayout("layered")} title="分层布局" aria-label="分层布局">层</ControlButton>
-              <ControlButton className={layout === "network" ? "layout-active" : ""} onClick={() => changeLayout("network")} title="网状布局" aria-label="网状布局">网</ControlButton>
-              <ControlButton className={layout === "tree" ? "layout-active" : ""} onClick={() => changeLayout("tree")} title="树形布局" aria-label="树形布局">树</ControlButton>
-            </Controls>}
-            <Controls />
+            <Controls className="graph-controls" position="bottom-left">
+              {isAoriMode ? (
+                <>
+                  <ControlButton className={aoriScope === "document" ? "layout-active" : ""} onClick={() => changeAoriScope("document")} title="Document AORI" aria-label="Document AORI">文</ControlButton>
+                  <ControlButton className={aoriScope === "library" ? "layout-active" : ""} onClick={() => changeAoriScope("library")} title="Library AORI" aria-label="Library AORI">库</ControlButton>
+                  <ControlButton className={aoriViewMode === "layer" ? "layout-active" : ""} onClick={() => changeAoriViewMode("layer")} title={aoriViewModeLabels.layer} aria-label={aoriViewModeLabels.layer}>层</ControlButton>
+                  <ControlButton className={aoriViewMode === "network" ? "layout-active" : ""} onClick={() => changeAoriViewMode("network")} title={aoriViewModeLabels.network} aria-label={aoriViewModeLabels.network}>网</ControlButton>
+                  <ControlButton className={aoriViewMode === "tree" ? "layout-active" : ""} onClick={() => changeAoriViewMode("tree")} title={aoriViewModeLabels.tree} aria-label={aoriViewModeLabels.tree}>树</ControlButton>
+                </>
+              ) : (
+                <>
+                  <ControlButton className={layout === "layered" ? "layout-active" : ""} onClick={() => changeLayout("layered")} title="分层布局" aria-label="分层布局">层</ControlButton>
+                  <ControlButton className={layout === "network" ? "layout-active" : ""} onClick={() => changeLayout("network")} title="网状布局" aria-label="网状布局">网</ControlButton>
+                  <ControlButton className={layout === "tree" ? "layout-active" : ""} onClick={() => changeLayout("tree")} title="树形布局" aria-label="树形布局">树</ControlButton>
+                </>
+              )}
+            </Controls>
           </ReactFlow>
           {!isAoriMode && aspect && records.length === 0 && (
             <div className="graph-empty">
@@ -1896,7 +2137,7 @@ export function GraphWorkspace({
             </div>
           )}
           {isAoriMode && !aoriGraph && (
-            <div className="graph-empty">当前没有可显示的 AORI 图谱。</div>
+            <div className="graph-empty">{aoriGraphMessage || "当前没有可显示的 AORI 图谱。"}</div>
           )}
         </div>
         <aside className="inspector">
@@ -1933,7 +2174,7 @@ export function GraphWorkspace({
               }}
             />
           )}
-          {!isAoriMode && viewMode === "evidence" && (
+          {viewMode === "evidence" && (
             <EvidencePackPanel evidencePack={visibleCurrentPulse?.evidencePack} onOpenChunk={(chunkId) => openPulseHit({
               id: chunkId,
               pulseId: visibleCurrentPulse?.pulse.id ?? "",
@@ -1950,10 +2191,10 @@ export function GraphWorkspace({
               excerpt: null,
             })} />
           )}
-          {!isAoriMode && viewMode === "retrieval" && (
+          {viewMode === "retrieval" && (
             <RetrievalTracePanel evidencePack={visibleCurrentPulse?.evidencePack} />
           )}
-          {!isAoriMode && !visibleCurrentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
+          {!visibleCurrentPulse && (pulsing || pulseStreamHits.length > 0 || pulseDraftAnswer) && (
             <div className="pulse-panel pulse-stream-panel">
               <div className="pulse-panel-heading">
                 <h3>脉冲生成中</h3>
@@ -2017,7 +2258,7 @@ export function GraphWorkspace({
               </div>
             </div>
           )}
-          {!isAoriMode && visibleCurrentPulse && (
+          {visibleCurrentPulse && (
             <div className={`pulse-panel pulse-status-${visibleCurrentPulse.pulse.status}`}>
               <div className="pulse-panel-heading">
                 <h3>脉冲回答</h3>
@@ -2401,6 +2642,14 @@ function EvidencePackPanel({ evidencePack, onOpenChunk }: { evidencePack?: Evide
           <span>Generated by {evidencePack.pipeline.indexProfile} {evidencePack.pipeline.packBuilder}</span>
           <span>{evidencePack.pipeline.model}</span>
           <span>{evidencePack.pipeline.promptVersion}</span>
+        </div>
+      )}
+      {(evidencePack.routePlan || evidencePack.questionTaskFrame || evidencePack.evidenceTables?.length) && (
+        <div className="pipeline-strip">
+          {evidencePack.routePlan && <span>route {evidencePack.routePlan.routeType}</span>}
+          {evidencePack.questionTaskFrame && <span>task {evidencePack.questionTaskFrame.taskIntent.shortName}</span>}
+          {evidencePack.evidenceTables && <span>{evidencePack.evidenceTables.length} tables</span>}
+          {evidencePack.fallbackRetrieval && <span>{evidencePack.fallbackRetrieval.length} fallback steps</span>}
         </div>
       )}
       {evidencePack.reconciliation && (

@@ -113,6 +113,9 @@ export class PulseEngine {
 
   private async createFull(libraryId: string, question: string, eventSink?: PulseEventSink): Promise<PulseResponse> {
     if (!this.model.configured) throw new Error("脉冲问答需要配置模型服务");
+    if (this.db.listAoriDocumentIndexes(libraryId).length > 0) {
+      return this.finishPulse(libraryId, question, "full", new Map(), new Map(), new Map(), new Map(), eventSink);
+    }
     const hits = new Map<string, PendingPulseHit>();
     const chunks = new Map<string, Chunk>();
     const nodes = new Map<string, AbstractNode>();
@@ -269,6 +272,9 @@ export class PulseEngine {
 
   private async createProgressive(libraryId: string, question: string, eventSink?: PulseEventSink): Promise<PulseResponse> {
     if (!this.model.configured) throw new Error("脉冲问答需要配置模型服务");
+    if (this.db.listAoriDocumentIndexes(libraryId).length > 0) {
+      return this.finishPulse(libraryId, question, "progressive", new Map(), new Map(), new Map(), new Map(), eventSink);
+    }
     const hits = new Map<string, PendingPulseHit>();
     const chunks = new Map<string, Chunk>();
     const nodes = new Map<string, AbstractNode>();
@@ -592,7 +598,8 @@ export class PulseEngine {
     }, eventSink);
     await emitPulse(eventSink, { type: "answer", answer: answer.answer, summary: answer.summary });
     await emitPulse(eventSink, { type: "stage", message: "正在保存脉冲结果" });
-    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, orderedHits, answer.evidencePack);
+    const finalHits = orderedHits.length > 0 ? orderedHits : answer.hits;
+    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, finalHits, answer.evidencePack);
     const response = this.db.getPulseResponse(libraryId, pulse.id);
     if (!response) throw new Error("脉冲创建后读取失败");
     return response;

@@ -5,6 +5,7 @@ import type {
   AoriGraphDiagnostics,
   AoriGraphEdge,
   AoriGraphNode,
+  AoriGraphViewMode,
   AoriGraphView,
   AoriGapItem,
   Aspect,
@@ -16,6 +17,7 @@ import type {
   DocumentUnderstanding,
   ExtractionOutput,
   IndexingRationaleTrace,
+  LibraryAoriProfile,
   ReflectiveIndexReport,
 } from "@agent-thinking/contracts";
 
@@ -332,6 +334,13 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
       versionId: input.versionId,
       createdAt: trace.createdAt ?? createdAt,
     })),
+    rationaleDebug: {
+      rationaleRequested: input.rationaleTrace.length > 0,
+      rationaleGenerated: input.rationaleTrace.length > 0,
+      rationaleSaved: input.rationaleTrace.length > 0,
+      rationaleCount: input.rationaleTrace.length,
+      rationaleMissingReason: input.rationaleTrace.length > 0 ? null : "rationaleTrace was not supplied to the AORI index builder",
+    },
   };
 }
 
@@ -563,6 +572,229 @@ export function buildAoriGraphView(index: AoriDocumentIndex, mode: "overview" | 
       collapsedNodeIds: [...collapsedNodeIds],
     },
     diagnostics: buildAoriGraphDiagnostics(index),
+  };
+}
+
+export function buildLibraryAoriGraphView(profile: LibraryAoriProfile, viewMode: AoriGraphViewMode = "layer"): AoriGraphView {
+  const centerNode: AoriGraphNode = {
+    id: `library-aori-${profile.libraryId}`,
+    type: "library_center",
+    label: "Library AORI",
+    summary: profile.summary,
+    evidenceStatus: profile.assertions.length > 0 ? "supported" : "unsupported",
+    closureStatus: profile.assertions.length > 0 ? "partial" : "open",
+    confidence: profile.assertions.length > 0 ? 0.7 : 0.2,
+  };
+  const nodes = new Map<string, AoriGraphNode>([[centerNode.id, centerNode]]);
+  const edges = new Map<string, AoriGraphEdge>();
+  const layers: Record<string, number> = { [centerNode.id]: 0 };
+  const collapsedNodeIds = new Set<string>();
+
+  const addNode = (node: AoriGraphNode, layer: number) => {
+    nodes.set(node.id, node);
+    layers[node.id] = layer;
+  };
+  const addEdge = (edge: AoriGraphEdge) => edges.set(edge.id, edge);
+
+  const documentNodeIds = new Map<string, string>();
+  for (const doc of profile.documentRelations) {
+    const nodeId = `library-document-${doc.documentId}`;
+    documentNodeIds.set(doc.documentId, nodeId);
+    addNode({
+      id: nodeId,
+      type: "document",
+      label: doc.domainRelation || doc.relationType,
+      summary: doc.explanation,
+      documentId: doc.documentId,
+      evidenceStatus: "supported",
+      closureStatus: "partial",
+      confidence: doc.confidence,
+    }, 1);
+    addEdge({
+      id: `library-edge-document-${doc.id}`,
+      source: centerNode.id,
+      target: nodeId,
+      type: doc.relationType.includes("challenge") ? "challenges" : doc.relationType.includes("response") ? "responds_to" : "contains",
+      label: doc.domainRelation || doc.relationType,
+      confidence: doc.confidence,
+    });
+  }
+
+  for (const aspect of profile.aspects) {
+    const nodeId = `library-aspect-${aspect.id}`;
+    addNode({
+      id: nodeId,
+      type: "library_aspect",
+      label: aspect.title,
+      summary: aspect.summary,
+      aspectId: aspect.id,
+      kind: aspect.kind,
+      domainKind: aspect.domainKind,
+      evidenceStatus: aspect.evidenceRefs.length > 0 ? "supported" : "unsupported",
+      closureStatus: "partial",
+      confidence: aspect.confidence,
+    }, viewMode === "network" ? 1 : 2);
+    addEdge({
+      id: `library-edge-aspect-${aspect.id}`,
+      source: centerNode.id,
+      target: nodeId,
+      type: "has_aspect",
+      label: aspect.domainKind || aspect.kind,
+      evidenceStatus: aspect.evidenceRefs.length > 0 ? "supported" : "unsupported",
+      closureStatus: "partial",
+      confidence: aspect.confidence,
+    });
+  }
+
+  for (const entity of profile.entities) {
+    const nodeId = `library-entity-${entity.id}`;
+    addNode({
+      id: nodeId,
+      type: "entity",
+      label: entity.canonicalName,
+      summary: entity.summary,
+      entityId: entity.id,
+      evidenceStatus: entity.evidenceRefs.length > 0 ? "supported" : "unsupported",
+      closureStatus: "partial",
+      confidence: entity.confidence,
+    }, viewMode === "network" ? 1 : 2);
+    addEdge({
+      id: `library-edge-entity-${entity.id}`,
+      source: centerNode.id,
+      target: nodeId,
+      type: "contains",
+      label: entity.entityType,
+      confidence: entity.confidence,
+    });
+  }
+
+  const assertionById = new Map(profile.assertions.map((assertion) => [assertion.id, assertion]));
+  for (const relation of profile.relations) {
+    const sourceNodeId = `library-entity-${relation.sourceId}`;
+    const targetNodeId = `library-entity-${relation.targetId}`;
+    if (nodes.has(sourceNodeId) && nodes.has(targetNodeId)) {
+      addEdge({
+        id: `library-edge-aggregate-${relation.id}`,
+        source: sourceNodeId,
+        target: targetNodeId,
+        type: "aggregate_relation",
+        label: relation.aggregateRelation,
+        domainRelation: relation.aggregateRelation,
+        assertionIds: relation.assertionIds,
+        confidence: relation.confidence,
+        evidenceStatus: "supported",
+        closureStatus: "partial",
+      });
+    }
+    if (viewMode !== "network") {
+      const relationNodeId = `library-aggregate-node-${relation.id}`;
+      addNode({
+        id: relationNodeId,
+        type: "aggregate_relation",
+        label: relation.aggregateRelation,
+        summary: relation.summary,
+        relationId: relation.id,
+        evidenceStatus: "supported",
+        closureStatus: "partial",
+        confidence: relation.confidence,
+      }, 3);
+      addEdge({
+        id: `library-edge-center-aggregate-${relation.id}`,
+        source: centerNode.id,
+        target: relationNodeId,
+        type: "aggregate_relation",
+        label: relation.relationFamily,
+        assertionIds: relation.assertionIds,
+      });
+      for (const assertionId of relation.assertionIds.slice(0, 12)) {
+        const assertion = assertionById.get(assertionId);
+        if (!assertion) continue;
+        const assertionNodeId = `library-assertion-node-${assertion.id}`;
+        addNode({
+          id: assertionNodeId,
+          type: "relation_assertion",
+          label: assertion.domainRelation,
+          summary: assertion.assertionText,
+          assertionId: assertion.id,
+          relationId: relation.id,
+          evidenceStatus: assertion.status === "uncertain" ? "unsupported" : "supported",
+          closureStatus: assertion.status === "uncertain" ? "open" : "partial",
+          confidence: assertion.confidence,
+        }, 4);
+        collapsedNodeIds.add(assertionNodeId);
+        addEdge({
+          id: `library-edge-aggregate-assertion-${assertion.id}`,
+          source: relationNodeId,
+          target: assertionNodeId,
+          type: "asserts_relation",
+          label: assertion.domainRelation,
+          domainRelation: assertion.domainRelation,
+          confidence: assertion.confidence,
+        });
+        const docNodeId = documentNodeIds.get(assertion.documentId);
+        if (docNodeId) {
+          addEdge({
+            id: `library-edge-document-assertion-${assertion.id}`,
+            source: docNodeId,
+            target: assertionNodeId,
+            type: "evidence_for",
+            label: assertion.status,
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    versionId: profile.libraryId,
+    documentId: profile.libraryId,
+    centerNode,
+    groups: profile.aspects.map((aspect) => ({
+      id: `library-group-${aspect.id}`,
+      label: aspect.title,
+      aspectId: aspect.id,
+      kind: aspect.kind,
+      domainKind: aspect.domainKind,
+      nodeIds: [`library-aspect-${aspect.id}`],
+      evidenceStatus: aspect.evidenceRefs.length > 0 ? "supported" : "unsupported",
+      closureStatus: "partial",
+    })),
+    nodes: [...nodes.values()],
+    edges: [...edges.values()],
+    layoutHints: {
+      mode: viewMode === "layer" ? "overview" : "detail",
+      scope: "library",
+      viewMode,
+      centerNodeId: centerNode.id,
+      layers,
+      collapsedNodeIds: [...collapsedNodeIds],
+    },
+    diagnostics: {
+      hasAori: true,
+      aspectCount: profile.aspects.length,
+      itemCount: profile.entities.length,
+      relationCount: profile.relations.length,
+      aspectKindDistribution: Object.fromEntries(profile.aspects.reduce((map, aspect) => {
+        map.set(aspect.kind, (map.get(aspect.kind) ?? 0) + 1);
+        return map;
+      }, new Map<string, number>())),
+      domainKindTopK: topK(profile.aspects.reduce((map, aspect) => {
+        increment(map, aspect.domainKind || "unknown");
+        return map;
+      }, new Map<string, number>())),
+      domainRelationTopK: topK(profile.assertions.reduce((map, assertion) => {
+        increment(map, assertion.domainRelation || assertion.relationFamily);
+        return map;
+      }, new Map<string, number>())),
+      closureDistribution: { partial: profile.assertions.length },
+      unsupportedItemCount: profile.assertions.filter((assertion) => assertion.status === "uncertain").length,
+      fallbackOnlyItemCount: 0,
+      isolatedItemCount: profile.entities.filter((entity) =>
+        !profile.relations.some((relation) => relation.sourceId === entity.id || relation.targetId === entity.id),
+      ).length,
+      legacyProjectionOtherRatio: 0,
+      warnings: [],
+    },
   };
 }
 

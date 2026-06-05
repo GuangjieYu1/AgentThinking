@@ -105,6 +105,80 @@ describe("ingestion pipeline", () => {
     db.close();
   });
 
+  it("records full-document AORI rationale when requested without truncation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-aori-full-rationale-"));
+    temporaryDirectories.push(dir);
+    const config = getConfig({ dataDir: dir, filesDir: join(dir, "files"), ocrCacheDir: join(dir, "ocr"), provider: "fake" });
+    const db = new AgentDatabase(dir);
+    const library = db.createLibrary("AORI Full Rationale");
+    await mkdir(join(dir, "files"), { recursive: true });
+    const filePath = join(dir, "files", "short.md");
+    await writeFile(filePath, "# Short\nA 和 B 是朋友。", "utf8");
+    const version = db.createDocumentVersion(library.id, "short.md", "text/markdown", "short", filePath, {
+      indexStrategy: "aspect_oriented_reflective",
+      recordIndexingRationale: true,
+    }).version;
+    const queue = new IngestionQueue(db, new VectorStore(db), new RecordingModelProvider(), config);
+
+    await enqueueAndComplete(queue, db.createJob(library.id, version.id, {
+      indexStrategy: "aspect_oriented_reflective",
+      recordIndexingRationale: true,
+    }).id);
+
+    const aori = db.getAoriDocumentIndex(version.id);
+    expect(aori.available).toBe(true);
+    if (!aori.available) throw new Error(aori.message);
+    expect(aori.rationaleTrace).toHaveLength(1);
+    expect(aori.rationaleTrace[0]).toMatchObject({
+      decisionType: "context_selection",
+      preservedRanges: ["full_document"],
+      omittedRanges: [],
+      risk: "low",
+    });
+    expect(aori.rationaleDebug).toMatchObject({
+      rationaleRequested: true,
+      rationaleGenerated: true,
+      rationaleSaved: true,
+      rationaleCount: 1,
+      rationaleMissingReason: null,
+    });
+    db.close();
+  });
+
+  it("explains missing AORI rationale when it was not requested", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-aori-no-rationale-"));
+    temporaryDirectories.push(dir);
+    const config = getConfig({ dataDir: dir, filesDir: join(dir, "files"), ocrCacheDir: join(dir, "ocr"), provider: "fake" });
+    const db = new AgentDatabase(dir);
+    const library = db.createLibrary("AORI No Rationale");
+    await mkdir(join(dir, "files"), { recursive: true });
+    const filePath = join(dir, "files", "short.md");
+    await writeFile(filePath, "# Short\nA 和 B 是朋友。", "utf8");
+    const version = db.createDocumentVersion(library.id, "short.md", "text/markdown", "short-no-rationale", filePath, {
+      indexStrategy: "aspect_oriented_reflective",
+      recordIndexingRationale: false,
+    }).version;
+    const queue = new IngestionQueue(db, new VectorStore(db), new RecordingModelProvider(), config);
+
+    await enqueueAndComplete(queue, db.createJob(library.id, version.id, {
+      indexStrategy: "aspect_oriented_reflective",
+      recordIndexingRationale: false,
+    }).id);
+
+    const aori = db.getAoriDocumentIndex(version.id);
+    expect(aori.available).toBe(true);
+    if (!aori.available) throw new Error(aori.message);
+    expect(aori.rationaleTrace).toHaveLength(0);
+    expect(aori.rationaleDebug).toMatchObject({
+      rationaleRequested: false,
+      rationaleGenerated: false,
+      rationaleSaved: false,
+      rationaleCount: 0,
+      rationaleMissingReason: "用户未勾选生成索引理由",
+    });
+    db.close();
+  });
+
   it("uses large AORI context groups and records truncation rationale for over-budget documents", async () => {
     const dir = await mkdtemp(join(tmpdir(), "agent-thinking-aori-truncated-"));
     temporaryDirectories.push(dir);

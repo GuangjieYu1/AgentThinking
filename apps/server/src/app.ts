@@ -46,7 +46,8 @@ import { AnalysisPublisher } from "./services/analysis.js";
 import { LibraryEventBus } from "./services/library-events.js";
 import { MappingAuditService } from "./services/mapping-audit.js";
 import { PulseEngine } from "./services/pulse.js";
-import { buildAoriGraphDiagnostics, buildAoriGraphView } from "./services/aori.js";
+import { buildAoriGraphDiagnostics, buildAoriGraphView, buildLibraryAoriGraphView } from "./services/aori.js";
+import { LibraryAoriService } from "./services/library-aori.js";
 
 export interface AppServices {
   config: AppConfig;
@@ -271,6 +272,27 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/documents", async (request) => {
     requireLibrary(db, request.params.libraryId, request.user);
     return db.listDocuments(request.params.libraryId);
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/aori", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    return db.getLibraryAoriProfile(request.params.libraryId);
+  });
+  app.get<{ Params: { libraryId: string }; Querystring: { view?: string } }>("/api/libraries/:libraryId/aori/graph", async (request, reply) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    const profile = db.getLibraryAoriProfile(request.params.libraryId);
+    if (!profile.available) return reply.status(404).send({ error: profile.message });
+    const viewMode = request.query.view === "tree" || request.query.view === "network" ? request.query.view : "layer";
+    return buildLibraryAoriGraphView(profile, viewMode);
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/aori/merge-plans", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    return db.listLibraryMergePlans(request.params.libraryId);
+  });
+  app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/aori/merge", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    const service = new LibraryAoriService(db);
+    for (const index of db.listAoriDocumentIndexes(request.params.libraryId)) service.mergeDocument(index);
+    return db.getLibraryAoriProfile(request.params.libraryId);
   });
   app.post<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/import", async (request, reply) => {
     const libraryId = request.params.libraryId;

@@ -792,6 +792,11 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .flow-aori-closure-open { box-shadow: 0 0 0 1px #e7ba63, 0 4px 20px #e7ba6338 !important; }
 .flow-aori-closure-closed { box-shadow: 0 0 0 1px #37a78355, 0 3px 18px #0004 !important; }
 .flow-aori-collapsed { opacity: .72; }
+.flow-aori-selected {
+  animation: pulseReveal .28s ease-out;
+  box-shadow: 0 0 0 3px #f8d26a, 0 0 32px #f8d26a7a !important;
+  filter: brightness(1.18);
+}
 .flow-aori-label { justify-items: start; text-align: left; }
 .flow-aori-label span {
   display: -webkit-box;
@@ -801,6 +806,9 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 }
 .flow-aori-label small { color: #9fb0c8; font-size: 11px; line-height: 1.35; }
 .flow-aori-edge path { filter: drop-shadow(0 0 3px #0007); }
+.react-flow__edge.flow-aori-edge-selected path {
+  filter: drop-shadow(0 0 7px #f8d26a);
+}
 .flow-context { opacity: .46; }
 .flow-aspect-match { box-shadow: 0 0 0 1px #65ddbf, 0 4px 22px #40c29f42 !important; }
 .flow-search-match {
@@ -858,15 +866,15 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 }
 .react-flow__handle { background: #61d2b6; width: 9px; height: 9px; }
 .react-flow__controls button { background: #182337; fill: #d1dded; border-color: #26334a; }
-.react-flow__controls.layout-controls { bottom: 112px; }
-.react-flow__controls.layout-controls button {
+.react-flow__controls.graph-controls button {
   color: #94a5bf;
   font-size: 12px;
   font-weight: 700;
 }
-.react-flow__controls.layout-controls button.layout-active {
+.react-flow__controls.graph-controls button.layout-active {
   background: #1b393a;
   color: #82e4ca;
+  fill: #82e4ca;
 }
 .modal-backdrop {
   position: fixed;

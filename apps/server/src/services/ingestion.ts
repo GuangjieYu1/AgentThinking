@@ -17,6 +17,7 @@ import { isWordMediaType } from "../domain/files.js";
 import { parseMarkdownStructure } from "../domain/source-structure.js";
 import type { GraphRulesResult } from "./graphRules.js";
 import { aoriIndexToExtraction, buildAoriDocumentIndex, type AoriDraftGroup } from "./aori.js";
+import { LibraryAoriService } from "./library-aori.js";
 import { LibraryEventBus } from "./library-events.js";
 import type { ModelProvider } from "./models.js";
 import { parseDocument } from "./parser.js";
@@ -200,15 +201,17 @@ function buildAoriContextPlan(chunks: Chunk[], config: AppConfig, recordIndexing
 
   const truncationGroups = groups.filter((group) => group.truncated);
   const rationaleTrace: AoriIndexingRationale[] = recordIndexingRationale
-    ? truncationGroups.map((group) => ({
+    ? groups.map((group) => ({
       stage: "global_reading",
-      decisionType: "context_truncation",
-      summary: `Document estimate ${group.inputTokenEstimate} tokens exceeded AORI global read budget ${budget}; preserved ${group.preservedRanges.join("; ")} for this large-context read.`,
+      decisionType: group.truncated ? "context_truncation" : "context_selection",
+      summary: group.truncated
+        ? `Document estimate ${group.inputTokenEstimate} tokens exceeded AORI global read budget ${budget}; preserved ${group.preservedRanges.join("; ")} for this large-context read.`
+        : "全文未超过模型预算，使用完整文档作为 AORI 全局阅读输入。",
       inputTokenEstimate: group.inputTokenEstimate,
       usedTokenEstimate: group.usedTokenEstimate,
-      omittedRanges: group.omittedRanges,
-      preservedRanges: group.preservedRanges,
-      risk: group.risk,
+      omittedRanges: group.truncated ? group.omittedRanges : [],
+      preservedRanges: group.truncated ? group.preservedRanges : ["full_document"],
+      risk: group.truncated ? group.risk : "low",
     }))
     : [];
   const highestRisk: ReflectiveIndexReport["completenessRisk"] = truncationGroups.some((group) => group.risk === "high")
@@ -498,6 +501,7 @@ export class IngestionQueue extends EventEmitter {
           reflectiveReport: aoriContextPlan.reflectiveReport,
         });
         this.db.saveAoriDocumentIndex(aoriIndex);
+        new LibraryAoriService(this.db).mergeDocument(aoriIndex);
         const compatibleExtraction = aoriIndexToExtraction(aoriIndex);
         if (compatibleExtraction.nodes.length > 0) this.db.saveExtraction(source.libraryId, compatibleExtraction, source.version.id);
       } else {

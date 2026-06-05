@@ -18,6 +18,8 @@ import {
   verifyPulseAnswer,
 } from "../src/services/pulse-evidence-controller.js";
 import { VectorStore } from "../src/services/vector-store.js";
+import { buildAoriDocumentIndex } from "../src/services/aori.js";
+import { LibraryAoriService } from "../src/services/library-aori.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -278,6 +280,69 @@ class TwentyOneItemPulseModel extends FakeModelProvider {
   }
 }
 
+class AoriFirstPulseModel extends FakeModelProvider {
+  async analyzePulseQuestion(): Promise<PulseQuestionPlan> {
+    return {
+      questionType: "entity_relation",
+      requiresExhaustiveEvidence: false,
+      requiresStructuredEvidence: true,
+      requiresNumericalReconciliation: false,
+      requiresSourceQuotes: true,
+      requiresTimelineCompleteness: false,
+      requiresEntityCoverage: true,
+      allowedPartialAnswer: true,
+      answerMustExposeGaps: true,
+      evidenceTargets: ["A", "B", "关系"],
+      keyEntities: ["A", "B"],
+      expectedEvidenceTypes: ["entity_relation", "quote"],
+      riskLevel: "medium",
+      reasoning: "关系问题需要 AORI relation assertion 和原文证据。",
+    };
+  }
+
+  async planPulseEvidence(): Promise<PulseEvidencePlan> {
+    return {
+      objective: "Use AORI evidence first.",
+      steps: [],
+      stopCondition: "AORI rows are enough.",
+      expectedEvidenceShape: "AORI evidence rows.",
+      maxIterations: 1,
+    };
+  }
+
+  async extractPulseEvidenceRows(input: { chunks: Array<{ id: string; text: string }> }): Promise<PulseEvidenceRow[]> {
+    return input.chunks.map((chunk) => ({
+      rowId: `aori-${chunk.id}`,
+      evidenceType: "entity_relation",
+      claimText: chunk.text,
+      evidenceChunkId: chunk.id,
+      evidenceQuote: chunk.text,
+      role: "direct_fact",
+      authority: "documentary_record",
+      usage: "answer_core",
+      classificationRationale: "AORI-first test row.",
+      confidence: 0.9,
+    }));
+  }
+
+  async judgePulseEvidenceSufficiency(input: { memory: unknown }): Promise<PulseEvidenceStatus> {
+    const memory = input.memory as { evidenceRows?: PulseEvidenceRow[] };
+    return {
+      sufficient: (memory.evidenceRows ?? []).length > 0,
+      status: (memory.evidenceRows ?? []).length > 0 ? "sufficient" : "partial_answer_only",
+      gaps: [],
+      reasoning: "AORI rows are source-bound.",
+    };
+  }
+
+  async synthesizePulseAnswer(): Promise<PulseAnswerOutput> {
+    return {
+      answer: "A 和 B 的关系有原文证据支持。",
+      summary: "AORI-first",
+    };
+  }
+}
+
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -378,6 +443,89 @@ describe("PulseEvidenceController", () => {
     expect(model.judgeCalls).toBe(2);
     expect(result.diagnostics?.retrievalSteps?.some((step) => step.query === "606.42607")).toBe(true);
     expect(result.evidenceRows?.some((row) => row.evidenceChunkId === chunks[0]!.id && row.evidenceQuote)).toBe(true);
+    db.close();
+  });
+
+  it("starts Pulse evidence assembly from AORI before fallback retrieval", async () => {
+    const db = await database();
+    const library = db.createLibrary("Pulse AORI first");
+    const version = db.createDocumentVersion(library.id, "chapter.md", "text/markdown", "aori-pulse", "chapter.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "人物关系", pageNumber: null, startChar: 0, endChar: 12, text: "A 和 B 是朋友。" },
+    ]);
+    const index = buildAoriDocumentIndex({
+      libraryId: library.id,
+      documentId: version.documentId,
+      documentName: "chapter.md",
+      versionId: version.id,
+      chunks,
+      drafts: [{
+        groupId: "aori-group",
+        draft: {
+          understanding: {
+            summary: "A 和 B 的关系。",
+            centralQuestion: "A 和 B 是什么关系？",
+            evidenceChunkIds: [chunks[0]!.id],
+            evidenceStatus: "supported",
+            closureStatus: "partial",
+            classificationRationale: "source-bound",
+            confidence: 0.8,
+          },
+          aspects: [{
+            kind: "entity",
+            domainKind: "人物关系",
+            title: "人物关系",
+            summary: "A 和 B 是朋友。",
+            centralQuestion: "A 和 B 是什么关系？",
+            classificationRationale: "source-bound",
+            confidence: 0.8,
+            items: [
+              { key: "a", title: "A", summary: "人物 A", evidenceChunkIds: [chunks[0]!.id], evidenceStatus: "supported", closureStatus: "partial", confidence: 0.8 },
+              { key: "b", title: "B", summary: "人物 B", evidenceChunkIds: [chunks[0]!.id], evidenceStatus: "supported", closureStatus: "partial", confidence: 0.8 },
+            ],
+            relations: [{
+              sourceKey: "a",
+              targetKey: "b",
+              domainRelation: "朋友",
+              relationTextInSource: "朋友",
+              normalizedRelation: "A 是 B 的朋友",
+              baseRelation: "related_to",
+              reason: "原文说明 A 和 B 是朋友。",
+              confidence: 0.9,
+              evidenceChunkIds: [chunks[0]!.id],
+              evidenceStatus: "supported",
+              closureStatus: "partial",
+            }],
+            gaps: [],
+          }],
+          selfQuestions: [],
+          reflectiveReport: { summary: "ok", completenessRisk: "none", warnings: [], truncationCount: 0 },
+        },
+      }],
+      rationaleTrace: [],
+      reflectiveReport: { summary: "ok", completenessRisk: "none", warnings: [], truncationCount: 0 },
+    });
+    db.saveAoriDocumentIndex(index);
+    new LibraryAoriService(db).mergeDocument(index);
+
+    const result = await new PulseEvidenceController(db, new VectorStore(db), new AoriFirstPulseModel()).answer(
+      library.id,
+      "A 和 B 是什么关系？",
+      "full",
+      { hits: [], chunks: [], nodes: [], relations: [] },
+    );
+
+    expect(result.evidencePack.retrievalTrace[0]).toMatchObject({
+      tool: "buildEvidencePack",
+      purpose: "AORI Evidence Assembly",
+      status: "success",
+    });
+    expect(result.evidencePack.routePlan?.selectedAssertions).toHaveLength(1);
+    expect(result.evidencePack.questionTaskFrame?.taskIntent.shortName).toBe("entity_relation");
+    expect(result.evidencePack.evidenceTables?.[0]?.sourceAssertionIds).toHaveLength(1);
+    expect(result.evidencePack.fallbackRetrieval ?? []).toHaveLength(0);
     db.close();
   });
 

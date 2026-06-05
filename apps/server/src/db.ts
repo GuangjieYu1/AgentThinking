@@ -41,6 +41,15 @@ import type {
   IngestJob,
   JobStage,
   Library,
+  LibraryAoriProfile,
+  LibraryAoriResponse,
+  LibraryAspect,
+  LibraryEntity,
+  LibraryMergePlan,
+  LibraryRelation,
+  LibraryRelationAssertion,
+  LibraryRelationAssertionStatus,
+  LibraryRelationLexiconEntry,
   LibrarySettings,
   MappingAudit,
   MappingAuditFinding,
@@ -790,6 +799,116 @@ export class AgentDatabase {
         risk TEXT NOT NULL CHECK (risk IN ('low','medium','high')),
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS library_aori_profiles (
+        library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS library_entities (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        canonical_name TEXT NOT NULL,
+        aliases_json TEXT NOT NULL DEFAULT '[]',
+        entity_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        first_seen_document_id TEXT NOT NULL,
+        evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+        confidence REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS library_aspects (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        domain_kind TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        related_document_aspect_ids_json TEXT NOT NULL DEFAULT '[]',
+        parent_aspect_id TEXT,
+        evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+        confidence REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS library_relation_lexicon (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        domain_relation TEXT NOT NULL,
+        relation_family TEXT NOT NULL,
+        normalized_meaning TEXT NOT NULL,
+        examples_json TEXT NOT NULL DEFAULT '[]',
+        confidence REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS library_relation_assertions (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        source_entity_id TEXT,
+        target_entity_id TEXT,
+        source_aspect_id TEXT,
+        target_aspect_id TEXT,
+        domain_relation TEXT NOT NULL,
+        relation_family TEXT NOT NULL,
+        assertion_text TEXT NOT NULL,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        document_aspect_id TEXT,
+        document_item_id TEXT,
+        document_relation_id TEXT,
+        time_scope TEXT,
+        chapter_scope TEXT,
+        procedure_stage TEXT,
+        evidence_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+        quote TEXT,
+        confidence REAL NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active','superseded','contradicted','uncertain')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS library_relations (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        aggregate_relation TEXT NOT NULL,
+        relation_family TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        assertion_ids_json TEXT NOT NULL DEFAULT '[]',
+        confidence REAL NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(library_id, source_id, target_id, relation_family)
+      );
+      CREATE TABLE IF NOT EXISTS library_document_relations (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        relation_type TEXT NOT NULL,
+        domain_relation TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS library_merge_plans (
+        id TEXT PRIMARY KEY,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        document_relation_json TEXT NOT NULL,
+        entity_alignments_json TEXT NOT NULL DEFAULT '[]',
+        aspect_alignments_json TEXT NOT NULL DEFAULT '[]',
+        relation_alignments_json TEXT NOT NULL DEFAULT '[]',
+        assertions_to_add_json TEXT NOT NULL DEFAULT '[]',
+        aggregate_updates_json TEXT NOT NULL DEFAULT '[]',
+        unresolved_questions_json TEXT NOT NULL DEFAULT '[]',
+        applied INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS ingest_jobs (
         id TEXT PRIMARY KEY,
         library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
@@ -810,6 +929,12 @@ export class AgentDatabase {
       CREATE INDEX IF NOT EXISTS idx_aori_aspects_version ON aori_aspects(version_id);
       CREATE INDEX IF NOT EXISTS idx_aori_items_version ON aori_aspect_items(version_id);
       CREATE INDEX IF NOT EXISTS idx_aori_relations_version ON aori_aspect_relations(version_id);
+      CREATE INDEX IF NOT EXISTS idx_library_entities_library ON library_entities(library_id);
+      CREATE INDEX IF NOT EXISTS idx_library_aspects_library ON library_aspects(library_id);
+      CREATE INDEX IF NOT EXISTS idx_library_assertions_library ON library_relation_assertions(library_id);
+      CREATE INDEX IF NOT EXISTS idx_library_assertions_version ON library_relation_assertions(version_id);
+      CREATE INDEX IF NOT EXISTS idx_library_relations_library ON library_relations(library_id);
+      CREATE INDEX IF NOT EXISTS idx_library_merge_plans_library ON library_merge_plans(library_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS source_metadata (
         version_id TEXT PRIMARY KEY REFERENCES document_versions(id) ON DELETE CASCADE,
         title TEXT,
@@ -2576,6 +2701,22 @@ export class AgentDatabase {
         risk: String(entry.risk) as IndexingRationaleTrace["risk"],
         createdAt: String(entry.created_at),
       }));
+    const qualityReportRow = row(
+      this.sql.prepare("SELECT quality_report_json FROM index_builds WHERE version_id = ? AND profile = 'v2' ORDER BY started_at DESC LIMIT 1"),
+      versionId,
+    );
+    const qualityReport = typeof qualityReportRow?.quality_report_json === "string"
+      ? parseJsonValue<{ aoriRationaleTrace?: unknown[] }>(qualityReportRow.quality_report_json, {})
+      : {};
+    const requested = source.version.recordIndexingRationale;
+    const generatedCount = Array.isArray(qualityReport.aoriRationaleTrace) ? qualityReport.aoriRationaleTrace.length : rationaleTrace.length;
+    const rationaleMissingReason = rationaleTrace.length > 0
+      ? null
+      : !requested
+        ? "用户未勾选生成索引理由"
+        : generatedCount > 0
+          ? "rationaleTrace 已生成但未保存到 aori_indexing_rationale"
+          : "已请求生成索引理由，但 rationaleTrace 未生成；请检查 AORI 导入阶段日志";
 
     return {
       available: true,
@@ -2601,6 +2742,13 @@ export class AgentDatabase {
         truncationCount: 0,
       }),
       rationaleTrace,
+      rationaleDebug: {
+        rationaleRequested: requested,
+        rationaleGenerated: generatedCount > 0,
+        rationaleSaved: rationaleTrace.length > 0,
+        rationaleCount: rationaleTrace.length,
+        rationaleMissingReason,
+      },
     };
   }
 
@@ -2615,8 +2763,341 @@ export class AgentDatabase {
     });
   }
 
+  upsertLibraryAoriProfile(libraryId: string, summary: string): void {
+    const timestamp = now();
+    const existing = row(this.sql.prepare("SELECT library_id FROM library_aori_profiles WHERE library_id = ?"), libraryId);
+    if (existing) {
+      this.sql.prepare("UPDATE library_aori_profiles SET summary = ?, updated_at = ? WHERE library_id = ?")
+        .run(summary, timestamp, libraryId);
+      return;
+    }
+    this.sql.prepare(`
+      INSERT INTO library_aori_profiles (library_id, summary, created_at, updated_at)
+      VALUES (?, ?, ?, ?)
+    `).run(libraryId, summary, timestamp, timestamp);
+  }
+
+  saveLibraryMergePlan(plan: LibraryMergePlan): void {
+    this.sql.prepare(`
+      INSERT OR REPLACE INTO library_merge_plans
+        (id, library_id, document_id, version_id, document_relation_json, entity_alignments_json,
+          aspect_alignments_json, relation_alignments_json, assertions_to_add_json,
+          aggregate_updates_json, unresolved_questions_json, applied, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      plan.id,
+      plan.libraryId,
+      plan.documentId,
+      plan.versionId,
+      JSON.stringify(plan.documentRelationToLibrary),
+      JSON.stringify(plan.entityAlignments),
+      JSON.stringify(plan.aspectAlignments),
+      JSON.stringify(plan.relationAlignments),
+      JSON.stringify(plan.assertionsToAdd),
+      JSON.stringify(plan.aggregateUpdates),
+      JSON.stringify(plan.unresolvedQuestions),
+      plan.applied ? 1 : 0,
+      plan.createdAt,
+      plan.updatedAt,
+    );
+  }
+
+  listLibraryMergePlans(libraryId: string): LibraryMergePlan[] {
+    return rows(
+      this.sql.prepare("SELECT * FROM library_merge_plans WHERE library_id = ? ORDER BY created_at DESC"),
+      libraryId,
+    ).map((entry): LibraryMergePlan => ({
+      id: String(entry.id),
+      libraryId: String(entry.library_id),
+      documentId: String(entry.document_id),
+      versionId: String(entry.version_id),
+      documentRelationToLibrary: parseJsonValue(entry.document_relation_json, {
+        relationType: "unknown",
+        domainRelation: "unknown",
+        explanation: "",
+        confidence: 0,
+      }),
+      entityAlignments: parseJsonValue(entry.entity_alignments_json, []),
+      aspectAlignments: parseJsonValue(entry.aspect_alignments_json, []),
+      relationAlignments: parseJsonValue(entry.relation_alignments_json, []),
+      assertionsToAdd: parseJsonValue(entry.assertions_to_add_json, []),
+      aggregateUpdates: parseJsonValue(entry.aggregate_updates_json, []),
+      unresolvedQuestions: parseTextList(entry.unresolved_questions_json),
+      applied: sqliteBoolean(entry.applied),
+      createdAt: String(entry.created_at),
+      updatedAt: String(entry.updated_at),
+    }));
+  }
+
+  upsertLibraryEntity(entity: LibraryEntity): void {
+    this.sql.prepare(`
+      INSERT OR REPLACE INTO library_entities
+        (id, library_id, canonical_name, aliases_json, entity_type, summary, first_seen_document_id,
+          evidence_refs_json, confidence, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      entity.id,
+      entity.libraryId,
+      entity.canonicalName,
+      JSON.stringify(entity.aliases),
+      entity.entityType,
+      entity.summary,
+      entity.firstSeenDocumentId,
+      JSON.stringify(entity.evidenceRefs),
+      entity.confidence,
+      entity.createdAt,
+      entity.updatedAt,
+    );
+  }
+
+  upsertLibraryAspect(aspect: LibraryAspect): void {
+    this.sql.prepare(`
+      INSERT OR REPLACE INTO library_aspects
+        (id, library_id, title, kind, domain_kind, summary, related_document_aspect_ids_json,
+          parent_aspect_id, evidence_refs_json, confidence, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      aspect.id,
+      aspect.libraryId,
+      aspect.title,
+      aspect.kind,
+      aspect.domainKind,
+      aspect.summary,
+      JSON.stringify(aspect.relatedDocumentAspectIds),
+      aspect.parentAspectId ?? null,
+      JSON.stringify(aspect.evidenceRefs),
+      aspect.confidence,
+      aspect.createdAt,
+      aspect.updatedAt,
+    );
+  }
+
+  upsertLibraryRelationLexiconEntry(entry: LibraryRelationLexiconEntry): void {
+    this.sql.prepare(`
+      INSERT OR REPLACE INTO library_relation_lexicon
+        (id, library_id, domain_relation, relation_family, normalized_meaning, examples_json,
+          confidence, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      entry.id,
+      entry.libraryId,
+      entry.domainRelation,
+      entry.relationFamily,
+      entry.normalizedMeaning,
+      JSON.stringify(entry.examples),
+      entry.confidence,
+      entry.createdAt,
+      entry.updatedAt,
+    );
+  }
+
+  upsertLibraryRelationAssertion(assertion: LibraryRelationAssertion): void {
+    this.sql.prepare(`
+      INSERT OR REPLACE INTO library_relation_assertions
+        (id, library_id, source_entity_id, target_entity_id, source_aspect_id, target_aspect_id,
+          domain_relation, relation_family, assertion_text, document_id, version_id, document_aspect_id,
+          document_item_id, document_relation_id, time_scope, chapter_scope, procedure_stage,
+          evidence_chunk_ids_json, quote, confidence, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      assertion.id,
+      assertion.libraryId,
+      assertion.sourceEntityId ?? null,
+      assertion.targetEntityId ?? null,
+      assertion.sourceAspectId ?? null,
+      assertion.targetAspectId ?? null,
+      assertion.domainRelation,
+      assertion.relationFamily,
+      assertion.assertionText,
+      assertion.documentId,
+      assertion.versionId,
+      assertion.documentAspectId ?? null,
+      assertion.documentItemId ?? null,
+      assertion.documentRelationId ?? null,
+      assertion.timeScope ?? null,
+      assertion.chapterScope ?? null,
+      assertion.procedureStage ?? null,
+      JSON.stringify(assertion.evidenceChunkIds),
+      assertion.quote ?? null,
+      assertion.confidence,
+      assertion.status,
+      assertion.createdAt,
+      assertion.updatedAt,
+    );
+  }
+
+  upsertLibraryRelation(relation: LibraryRelation): void {
+    this.sql.prepare(`
+      INSERT OR REPLACE INTO library_relations
+        (id, library_id, source_id, target_id, aggregate_relation, relation_family, summary,
+          assertion_ids_json, confidence, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      relation.id,
+      relation.libraryId,
+      relation.sourceId,
+      relation.targetId,
+      relation.aggregateRelation,
+      relation.relationFamily,
+      relation.summary,
+      JSON.stringify(relation.assertionIds),
+      relation.confidence,
+      relation.createdAt,
+      relation.updatedAt,
+    );
+  }
+
+  saveLibraryDocumentRelation(input: {
+    id?: string;
+    libraryId: string;
+    documentId: string;
+    versionId: string;
+    relationType: string;
+    domainRelation: string;
+    explanation: string;
+    confidence: number;
+    createdAt?: string;
+  }): void {
+    this.sql.prepare(`
+      INSERT OR REPLACE INTO library_document_relations
+        (id, library_id, document_id, version_id, relation_type, domain_relation, explanation, confidence, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.id ?? `library-document-relation-${input.versionId}`,
+      input.libraryId,
+      input.documentId,
+      input.versionId,
+      input.relationType,
+      input.domainRelation,
+      input.explanation,
+      input.confidence,
+      input.createdAt ?? now(),
+    );
+  }
+
+  getLibraryAoriProfile(libraryId: string): LibraryAoriResponse {
+    const profile = row(this.sql.prepare("SELECT * FROM library_aori_profiles WHERE library_id = ?"), libraryId);
+    if (!profile) {
+      return {
+        available: false,
+        libraryId,
+        message: "当前知识库尚未生成 Library AORI，请先运行 Library Merge。",
+      };
+    }
+    const entities = rows(this.sql.prepare("SELECT * FROM library_entities WHERE library_id = ? ORDER BY canonical_name"), libraryId)
+      .map((entry): LibraryEntity => ({
+        id: String(entry.id),
+        libraryId: String(entry.library_id),
+        canonicalName: String(entry.canonical_name),
+        aliases: parseTextList(entry.aliases_json),
+        entityType: String(entry.entity_type),
+        summary: String(entry.summary),
+        firstSeenDocumentId: String(entry.first_seen_document_id),
+        evidenceRefs: parseJsonValue(entry.evidence_refs_json, []),
+        confidence: Number(entry.confidence),
+        createdAt: String(entry.created_at),
+        updatedAt: String(entry.updated_at),
+      }));
+    const aspects = rows(this.sql.prepare("SELECT * FROM library_aspects WHERE library_id = ? ORDER BY title"), libraryId)
+      .map((entry): LibraryAspect => ({
+        id: String(entry.id),
+        libraryId: String(entry.library_id),
+        title: String(entry.title),
+        kind: aspectKinds.includes(entry.kind as AspectKind) ? entry.kind as AspectKind : "other",
+        domainKind: String(entry.domain_kind),
+        summary: String(entry.summary),
+        relatedDocumentAspectIds: parseTextList(entry.related_document_aspect_ids_json),
+        parentAspectId: entry.parent_aspect_id === null || entry.parent_aspect_id === undefined ? null : String(entry.parent_aspect_id),
+        evidenceRefs: parseJsonValue(entry.evidence_refs_json, []),
+        confidence: Number(entry.confidence),
+        createdAt: String(entry.created_at),
+        updatedAt: String(entry.updated_at),
+      }));
+    const relationLexicon = rows(this.sql.prepare("SELECT * FROM library_relation_lexicon WHERE library_id = ? ORDER BY relation_family, domain_relation"), libraryId)
+      .map((entry): LibraryRelationLexiconEntry => ({
+        id: String(entry.id),
+        libraryId: String(entry.library_id),
+        domainRelation: String(entry.domain_relation),
+        relationFamily: String(entry.relation_family),
+        normalizedMeaning: String(entry.normalized_meaning),
+        examples: parseJsonValue(entry.examples_json, []),
+        confidence: Number(entry.confidence),
+        createdAt: String(entry.created_at),
+        updatedAt: String(entry.updated_at),
+      }));
+    const assertions = rows(this.sql.prepare("SELECT * FROM library_relation_assertions WHERE library_id = ? ORDER BY created_at"), libraryId)
+      .map((entry): LibraryRelationAssertion => ({
+        id: String(entry.id),
+        libraryId: String(entry.library_id),
+        sourceEntityId: entry.source_entity_id === null || entry.source_entity_id === undefined ? null : String(entry.source_entity_id),
+        targetEntityId: entry.target_entity_id === null || entry.target_entity_id === undefined ? null : String(entry.target_entity_id),
+        sourceAspectId: entry.source_aspect_id === null || entry.source_aspect_id === undefined ? null : String(entry.source_aspect_id),
+        targetAspectId: entry.target_aspect_id === null || entry.target_aspect_id === undefined ? null : String(entry.target_aspect_id),
+        domainRelation: String(entry.domain_relation),
+        relationFamily: String(entry.relation_family),
+        assertionText: String(entry.assertion_text),
+        documentId: String(entry.document_id),
+        versionId: String(entry.version_id),
+        documentAspectId: entry.document_aspect_id === null || entry.document_aspect_id === undefined ? null : String(entry.document_aspect_id),
+        documentItemId: entry.document_item_id === null || entry.document_item_id === undefined ? null : String(entry.document_item_id),
+        documentRelationId: entry.document_relation_id === null || entry.document_relation_id === undefined ? null : String(entry.document_relation_id),
+        timeScope: entry.time_scope === null || entry.time_scope === undefined ? null : String(entry.time_scope),
+        chapterScope: entry.chapter_scope === null || entry.chapter_scope === undefined ? null : String(entry.chapter_scope),
+        procedureStage: entry.procedure_stage === null || entry.procedure_stage === undefined ? null : String(entry.procedure_stage),
+        evidenceChunkIds: parseTextList(entry.evidence_chunk_ids_json),
+        quote: entry.quote === null || entry.quote === undefined ? null : String(entry.quote),
+        confidence: Number(entry.confidence),
+        status: String(entry.status) as LibraryRelationAssertionStatus,
+        createdAt: String(entry.created_at),
+        updatedAt: String(entry.updated_at),
+      }));
+    const relations = rows(this.sql.prepare("SELECT * FROM library_relations WHERE library_id = ? ORDER BY aggregate_relation"), libraryId)
+      .map((entry): LibraryRelation => ({
+        id: String(entry.id),
+        libraryId: String(entry.library_id),
+        sourceId: String(entry.source_id),
+        targetId: String(entry.target_id),
+        aggregateRelation: String(entry.aggregate_relation),
+        relationFamily: String(entry.relation_family),
+        summary: String(entry.summary),
+        assertionIds: parseTextList(entry.assertion_ids_json),
+        confidence: Number(entry.confidence),
+        createdAt: String(entry.created_at),
+        updatedAt: String(entry.updated_at),
+      }));
+    const documentRelations = rows(this.sql.prepare("SELECT * FROM library_document_relations WHERE library_id = ? ORDER BY created_at"), libraryId)
+      .map((entry) => ({
+        id: String(entry.id),
+        libraryId: String(entry.library_id),
+        documentId: String(entry.document_id),
+        versionId: String(entry.version_id),
+        relationType: String(entry.relation_type),
+        domainRelation: String(entry.domain_relation),
+        explanation: String(entry.explanation),
+        confidence: Number(entry.confidence),
+        createdAt: String(entry.created_at),
+      }));
+    return {
+      available: true,
+      libraryId,
+      summary: String(profile.summary),
+      entities,
+      aspects,
+      relationLexicon,
+      assertions,
+      relations,
+      documentRelations,
+      mergePlans: this.listLibraryMergePlans(libraryId),
+      createdAt: String(profile.created_at),
+      updatedAt: String(profile.updated_at),
+    };
+  }
+
   private clearGeneratedForVersion(versionId: string): void {
     this.clearAoriForVersion(versionId);
+    this.sql.prepare("DELETE FROM library_relation_assertions WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM library_document_relations WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM library_merge_plans WHERE version_id = ?").run(versionId);
     this.sql.prepare("DELETE FROM summary_embeddings WHERE summary_id IN (SELECT id FROM summary_tree_nodes WHERE version_id = ?)").run(versionId);
     this.sql.prepare("DELETE FROM summary_tree_nodes WHERE version_id = ?").run(versionId);
     this.sql.prepare("DELETE FROM parent_child_chunks WHERE child_chunk_id IN (SELECT id FROM chunks WHERE version_id = ?)").run(versionId);

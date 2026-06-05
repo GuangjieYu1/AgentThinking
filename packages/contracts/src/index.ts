@@ -202,8 +202,27 @@ export const aoriIndexingStages = [
   "relation_extraction",
   "closure_check",
 ] as const;
-export const aoriContextDecisionTypes = ["context_truncation"] as const;
+export const aoriContextDecisionTypes = [
+  "context_selection",
+  "context_truncation",
+  "rationale_not_generated",
+  "rationale_save_failed",
+] as const;
 export const aoriRiskLevels = ["low", "medium", "high"] as const;
+export const aoriGraphScopes = ["document", "library"] as const;
+export const aoriGraphViewModes = ["layer", "tree", "network"] as const;
+export const libraryEntityAlignmentDecisions = ["same", "new", "ambiguous"] as const;
+export const libraryAspectAlignmentDecisions = ["map_to_existing", "new_aspect", "subaspect", "ambiguous"] as const;
+export const libraryRelationAlignmentDecisions = ["map_to_existing", "new_relation", "abstract_under_family", "ambiguous"] as const;
+export const libraryRelationAssertionStatuses = ["active", "superseded", "contradicted", "uncertain"] as const;
+export const evidenceTableTypes = [
+  "AmountFactTable",
+  "EventFactTable",
+  "ArgumentFactTable",
+  "TimelineFactTable",
+  "EntityRelationTable",
+  "CrossDocumentComparisonTable",
+] as const;
 export const graphRuleDecisions = ["kept", "downgraded", "excluded_from_graph", "needs_review"] as const;
 export const graphRuleActions = [
   "relation_type_validated",
@@ -281,6 +300,13 @@ export type GraphRuleCategory = (typeof graphRuleCategories)[number];
 export type AoriIndexingStage = (typeof aoriIndexingStages)[number];
 export type AoriContextDecisionType = (typeof aoriContextDecisionTypes)[number];
 export type AoriRiskLevel = (typeof aoriRiskLevels)[number];
+export type AoriGraphScope = (typeof aoriGraphScopes)[number];
+export type AoriGraphViewMode = (typeof aoriGraphViewModes)[number];
+export type LibraryEntityAlignmentDecision = (typeof libraryEntityAlignmentDecisions)[number];
+export type LibraryAspectAlignmentDecision = (typeof libraryAspectAlignmentDecisions)[number];
+export type LibraryRelationAlignmentDecision = (typeof libraryRelationAlignmentDecisions)[number];
+export type LibraryRelationAssertionStatus = (typeof libraryRelationAssertionStatuses)[number];
+export type EvidenceTableType = (typeof evidenceTableTypes)[number];
 export type GraphRuleDecision = (typeof graphRuleDecisions)[number];
 export type LegacyGraphRuleDecision = GraphRuleDecision | "dropped";
 export type GraphRuleAction = (typeof graphRuleActions)[number];
@@ -524,6 +550,24 @@ export interface IndexingRationaleTrace extends AoriIndexingRationale {
   createdAt?: string | undefined;
 }
 
+export interface AoriRationaleDebug {
+  rationaleRequested: boolean;
+  rationaleGenerated: boolean;
+  rationaleSaved: boolean;
+  rationaleCount: number;
+  rationaleMissingReason: string | null;
+}
+
+export interface SourceRef {
+  documentId?: string | undefined;
+  versionId?: string | undefined;
+  chunkId?: string | undefined;
+  quote?: string | undefined;
+  headingPath?: string | string[] | null | undefined;
+  pageNumber?: number | null | undefined;
+  reason?: string | undefined;
+}
+
 export interface DocumentUnderstanding {
   versionId: string;
   summary: string;
@@ -649,6 +693,7 @@ export interface AoriDocumentIndex {
   selfQuestions: SelfQuestion[];
   reflectiveReport: ReflectiveIndexReport;
   rationaleTrace: IndexingRationaleTrace[];
+  rationaleDebug: AoriRationaleDebug;
 }
 
 export interface AoriUnavailable {
@@ -659,14 +704,220 @@ export interface AoriUnavailable {
 
 export type AoriDocumentResponse = AoriDocumentIndex | AoriUnavailable;
 
+export interface LibraryEntity {
+  id: string;
+  libraryId: string;
+  canonicalName: string;
+  aliases: string[];
+  entityType: string;
+  summary: string;
+  firstSeenDocumentId: string;
+  evidenceRefs: SourceRef[];
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LibraryAspect {
+  id: string;
+  libraryId: string;
+  title: string;
+  kind: AspectKind;
+  domainKind: string;
+  summary: string;
+  relatedDocumentAspectIds: string[];
+  parentAspectId?: string | null | undefined;
+  evidenceRefs: SourceRef[];
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LibraryRelationLexiconEntry {
+  id: string;
+  libraryId: string;
+  domainRelation: string;
+  relationFamily: string;
+  normalizedMeaning: string;
+  examples: SourceRef[];
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LibraryRelationAssertion {
+  id: string;
+  libraryId: string;
+  sourceEntityId?: string | null | undefined;
+  targetEntityId?: string | null | undefined;
+  sourceAspectId?: string | null | undefined;
+  targetAspectId?: string | null | undefined;
+  domainRelation: string;
+  relationFamily: string;
+  assertionText: string;
+  documentId: string;
+  versionId: string;
+  documentAspectId?: string | null | undefined;
+  documentItemId?: string | null | undefined;
+  documentRelationId?: string | null | undefined;
+  timeScope?: string | null | undefined;
+  chapterScope?: string | null | undefined;
+  procedureStage?: string | null | undefined;
+  evidenceChunkIds: string[];
+  quote?: string | null | undefined;
+  confidence: number;
+  status: LibraryRelationAssertionStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LibraryRelation {
+  id: string;
+  libraryId: string;
+  sourceId: string;
+  targetId: string;
+  aggregateRelation: string;
+  relationFamily: string;
+  summary: string;
+  assertionIds: string[];
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EntityAlignment {
+  documentEntityName: string;
+  libraryEntityId?: string | null | undefined;
+  decision: LibraryEntityAlignmentDecision;
+  reason: string;
+  evidenceChunkIds: string[];
+  confidence: number;
+}
+
+export interface AspectAlignment {
+  documentAspectId: string;
+  libraryAspectId?: string | null | undefined;
+  decision: LibraryAspectAlignmentDecision;
+  reason: string;
+  confidence: number;
+}
+
+export interface RelationAlignment {
+  documentRelation: string;
+  libraryRelationId?: string | null | undefined;
+  decision: LibraryRelationAlignmentDecision;
+  relationFamily?: string | undefined;
+  reason: string;
+  confidence: number;
+}
+
+export interface RelationAssertionDraft {
+  sourceEntityId?: string | null | undefined;
+  targetEntityId?: string | null | undefined;
+  sourceAspectId?: string | null | undefined;
+  targetAspectId?: string | null | undefined;
+  domainRelation: string;
+  relationFamily: string;
+  assertionText: string;
+  documentAspectId?: string | null | undefined;
+  documentItemId?: string | null | undefined;
+  documentRelationId?: string | null | undefined;
+  evidenceChunkIds: string[];
+  quote?: string | null | undefined;
+  confidence: number;
+}
+
+export interface AggregateUpdate {
+  sourceId: string;
+  targetId: string;
+  aggregateRelation: string;
+  relationFamily: string;
+  assertionIds: string[];
+  summary: string;
+  confidence: number;
+}
+
+export interface LibraryMergePlan {
+  id: string;
+  libraryId: string;
+  documentId: string;
+  versionId: string;
+  documentRelationToLibrary: {
+    relationType: string;
+    domainRelation: string;
+    explanation: string;
+    confidence: number;
+  };
+  entityAlignments: EntityAlignment[];
+  aspectAlignments: AspectAlignment[];
+  relationAlignments: RelationAlignment[];
+  assertionsToAdd: RelationAssertionDraft[];
+  aggregateUpdates: AggregateUpdate[];
+  unresolvedQuestions: string[];
+  applied: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LibraryAoriProfile {
+  available: true;
+  libraryId: string;
+  summary: string;
+  entities: LibraryEntity[];
+  aspects: LibraryAspect[];
+  relationLexicon: LibraryRelationLexiconEntry[];
+  assertions: LibraryRelationAssertion[];
+  relations: LibraryRelation[];
+  documentRelations: Array<{
+    id: string;
+    libraryId: string;
+    documentId: string;
+    versionId: string;
+    relationType: string;
+    domainRelation: string;
+    explanation: string;
+    confidence: number;
+    createdAt: string;
+  }>;
+  mergePlans: LibraryMergePlan[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LibraryAoriUnavailable {
+  available: false;
+  libraryId: string;
+  message: string;
+}
+
+export type LibraryAoriResponse = LibraryAoriProfile | LibraryAoriUnavailable;
+
 export interface AoriGraphNode {
   id: string;
-  type: "document_center" | "aspect" | "aspect_item" | "relation" | "gap" | "self_question" | "source_chunk" | "warning";
+  type:
+    | "document_center"
+    | "aspect"
+    | "aspect_item"
+    | "relation"
+    | "gap"
+    | "self_question"
+    | "source_chunk"
+    | "warning"
+    | "library_center"
+    | "entity"
+    | "library_aspect"
+    | "relation_assertion"
+    | "document"
+    | "evidence"
+    | "aggregate_relation";
   label: string;
   summary?: string | undefined;
   aspectId?: string | undefined;
   itemId?: string | undefined;
   relationId?: string | undefined;
+  assertionId?: string | undefined;
+  entityId?: string | undefined;
+  documentId?: string | undefined;
   chunkId?: string | undefined;
   kind?: AspectKind | undefined;
   domainKind?: string | undefined;
@@ -680,10 +931,26 @@ export interface AoriGraphEdge {
   id: string;
   source: string;
   target: string;
-  type: "contains" | "relates" | "evidence" | "has_gap" | "asks" | "warning";
+  type:
+    | "contains"
+    | "relates"
+    | "evidence"
+    | "has_gap"
+    | "asks"
+    | "warning"
+    | "has_aspect"
+    | "contains_item"
+    | "asserts_relation"
+    | "evidence_for"
+    | "same_as"
+    | "updates"
+    | "challenges"
+    | "responds_to"
+    | "aggregate_relation";
   label: string;
   baseRelation?: RelationType | undefined;
   domainRelation?: string | undefined;
+  assertionIds?: string[] | undefined;
   evidenceStatus?: EvidenceStatus | undefined;
   closureStatus?: ClosureStatus | undefined;
   confidence?: number | undefined;
@@ -702,6 +969,8 @@ export interface AoriGraphGroup {
 
 export interface AoriLayoutHints {
   mode: "overview" | "detail" | "hybrid";
+  scope?: AoriGraphScope | undefined;
+  viewMode?: AoriGraphViewMode | undefined;
   centerNodeId: string;
   layers: Record<string, number>;
   collapsedNodeIds: string[];
@@ -1077,6 +1346,22 @@ export type PulseStreamEvent =
   | { type: "start"; mode: PulseInputMode; question: string }
   | { type: "stage"; message: string }
   | {
+    type:
+      | "library_route_started"
+      | "document_selected"
+      | "question_task_generated"
+      | "aspect_selected"
+      | "library_relation_selected"
+      | "assertion_selected"
+      | "aori_evidence_bound"
+      | "fallback_retrieval_started"
+      | "evidence_table_built"
+      | "closure_checked"
+      | "answer_synthesized";
+    message: string;
+    payload?: unknown;
+  }
+  | {
     type: "candidates";
     stepIndex: number;
     fromNodeIds: string[];
@@ -1264,6 +1549,68 @@ export interface QuestionTask {
   confidence: number;
 }
 
+export interface QuestionTaskFrame {
+  userQuestion: string;
+  taskIntent: {
+    shortName: string;
+    naturalLanguageGoal: string;
+    whyThisIsTheGoal: string;
+  };
+  answerContract: {
+    expectedForm: string;
+    mustInclude: string[];
+    mustExclude: string[];
+    uncertaintyPolicy: string;
+  };
+  scopeContract: {
+    targetSubjects: string[];
+    targetObjects: string[];
+    includedAspects: string[];
+    excludedAspects: string[];
+    boundaryQuestions: string[];
+  };
+  evidenceContract: {
+    requiredEvidenceKinds: string[];
+    requiredAuthorityKinds: string[];
+    sourceBindingRequired: boolean;
+    quoteRequired: boolean;
+  };
+  operationPlan: Array<{
+    name: string;
+    purpose: string;
+    inputNeeded: string[];
+    outputExpected: string;
+  }>;
+  riskAssessment: {
+    ambiguity: string[];
+    likelyFailureModes: string[];
+    verificationNeeded: string[];
+  };
+  confidence: number;
+  legacyTaskType?: QuestionTaskType | undefined;
+}
+
+export interface RoutePlan {
+  routeType: string;
+  selectedDocuments: Array<{
+    documentId: string;
+    versionId: string;
+    role: string;
+    reason: string;
+  }>;
+  excludedDocuments: Array<{
+    documentId: string;
+    reason: string;
+  }>;
+  selectedLibraryAspects: string[];
+  selectedLibraryEntities: string[];
+  selectedLibraryRelations: string[];
+  selectedAssertions: string[];
+  crossDocumentOperations: string[];
+  ambiguity: string[];
+  confidence: number;
+}
+
 export interface RetrievalTask {
   id: string;
   purpose: RetrievalTaskPurpose;
@@ -1388,6 +1735,17 @@ export interface EvidencePack {
   answerModeOverridden?: boolean | undefined;
   questionPlan?: PulseQuestionPlan | undefined;
   questionTask?: QuestionTask | undefined;
+  questionTaskFrame?: QuestionTaskFrame | undefined;
+  routePlan?: RoutePlan | undefined;
+  selectedLibraryAspects?: LibraryAspect[] | undefined;
+  selectedDocumentAori?: AoriDocumentIndex[] | undefined;
+  selectedAssertions?: LibraryRelationAssertion[] | undefined;
+  fallbackRetrieval?: RetrievalTrace[] | undefined;
+  evidenceTables?: EvidenceTable[] | undefined;
+  closureChecks?: Array<{ id: string; status: ClosureStatus; summary: string; gapIds: string[] }> | undefined;
+  verifiedGaps?: PulseEvidenceGap[] | undefined;
+  refutedGaps?: PulseEvidenceGap[] | undefined;
+  answerInputs?: string[] | undefined;
   answerScope?: AnswerScope | undefined;
   scopeClosureReport?: ScopeClosureReport | undefined;
   semanticClassificationReviews?: SemanticClassificationReview[] | undefined;
@@ -1407,6 +1765,18 @@ export interface EvidencePack {
   gaps: PulseEvidenceGap[];
   retrievalTrace: RetrievalTrace[];
   reconciliation?: PulseEvidenceReconciliation | undefined;
+}
+
+export interface EvidenceTable {
+  id: string;
+  type: EvidenceTableType;
+  title: string;
+  rows: PulseEvidenceRow[];
+  sourceAssertionIds?: string[] | undefined;
+  sourceAspectIds?: string[] | undefined;
+  sourceDocumentIds?: string[] | undefined;
+  closureStatus: ClosureStatus;
+  gaps: PulseEvidenceGap[];
 }
 
 export interface PulseEvidenceGap {
@@ -1449,6 +1819,17 @@ export interface PulseEvidenceMemory {
   question: string;
   questionPlan: PulseQuestionPlan;
   questionTask?: QuestionTask | undefined;
+  questionTaskFrame?: QuestionTaskFrame | undefined;
+  routePlan?: RoutePlan | undefined;
+  selectedLibraryAspects?: LibraryAspect[] | undefined;
+  selectedDocumentAori?: AoriDocumentIndex[] | undefined;
+  selectedAssertions?: LibraryRelationAssertion[] | undefined;
+  fallbackRetrieval?: RetrievalTrace[] | undefined;
+  evidenceTables?: EvidenceTable[] | undefined;
+  closureChecks?: Array<{ id: string; status: ClosureStatus; summary: string; gapIds: string[] }> | undefined;
+  verifiedGaps?: PulseEvidenceGap[] | undefined;
+  refutedGaps?: PulseEvidenceGap[] | undefined;
+  answerInputs?: string[] | undefined;
   retrievalTasks?: RetrievalTask[] | undefined;
   semanticClassificationReviews?: SemanticClassificationReview[] | undefined;
   usageGateRejectedRows?: Array<{ rowId: string; reason: string }> | undefined;
@@ -1492,6 +1873,13 @@ export interface PulseAnswerOutput {
   diagnostics?: {
     questionPlan?: PulseQuestionPlan | undefined;
     questionTask?: QuestionTask | undefined;
+    questionTaskFrame?: QuestionTaskFrame | undefined;
+    routePlan?: RoutePlan | undefined;
+    selectedAssertions?: LibraryRelationAssertion[] | undefined;
+    evidenceTables?: EvidenceTable[] | undefined;
+    closureChecks?: Array<{ id: string; status: ClosureStatus; summary: string; gapIds: string[] }> | undefined;
+    verifiedGaps?: PulseEvidenceGap[] | undefined;
+    refutedGaps?: PulseEvidenceGap[] | undefined;
     retrievalTasks?: RetrievalTask[] | undefined;
     semanticClassificationReviews?: SemanticClassificationReview[] | undefined;
     usageGateRejectedRows?: Array<{ rowId: string; reason: string }> | undefined;

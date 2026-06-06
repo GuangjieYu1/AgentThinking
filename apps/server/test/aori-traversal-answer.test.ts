@@ -219,7 +219,7 @@ describe("AORI traversal answering", () => {
     });
     const events: string[] = [];
 
-    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel()).create(
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel(), { aoriAnswerMode: "traversal" }).create(
       library.id,
       "How many people paid Huang in 2005? list all people",
       "full",
@@ -293,7 +293,7 @@ describe("AORI traversal answering", () => {
       }],
     });
 
-    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel()).create(
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel(), { aoriAnswerMode: "traversal" }).create(
       library.id,
       "Was the defense argument accepted and how did the court respond?",
       "full",
@@ -350,7 +350,7 @@ describe("AORI traversal answering", () => {
       }],
     });
 
-    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel()).create(
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel(), { aoriAnswerMode: "traversal" }).create(
       library.id,
       "timeline 2005 events",
       "full",
@@ -417,7 +417,7 @@ describe("AORI traversal answering", () => {
     const model = new TraversalTestModel();
     const events: string[] = [];
 
-    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), model).create(library.id, "黄胜受贿总额是多少？", "full", (event) => {
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), model, { aoriAnswerMode: "traversal" }).create(library.id, "黄胜受贿总额是多少？", "full", (event) => {
       events.push(event.type);
     });
 
@@ -479,7 +479,7 @@ describe("AORI traversal answering", () => {
     const model = new TraversalTestModel();
     const events: string[] = [];
 
-    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), model).create(library.id, "杨某丙给了什么？", "progressive", (event) => {
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), model, { aoriAnswerMode: "traversal" }).create(library.id, "杨某丙给了什么？", "progressive", (event) => {
       events.push(event.type);
     });
 
@@ -488,6 +488,160 @@ describe("AORI traversal answering", () => {
     expect(pulse.evidencePack?.chunkEvidencePack?.selectedChunks.map((chunk) => chunk.chunkId)).toEqual([chunks[0]!.id]);
     expect(pulse.pulse.answer).toContain("杨某丙");
     expect(events).toEqual(expect.arrayContaining(["dfs_node_entered", "dfs_candidate_selected", "dfs_chunk_found", "dfs_backtrack"]));
+    db.close();
+  });
+
+  it("uses demand mode by default and does not convert missing yearly amount evidence into zero", async () => {
+    const db = await database();
+    const library = db.createLibrary("Demand Year Amount AORI");
+    const version = db.createDocumentVersion(library.id, "year-amount.md", "text/markdown", "hash", "year-amount.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "cross-year", pageNumber: null, startChar: 0, endChar: 20, text: "source: SourceA; amount: 10 wan; time: 2006-2008; evidence: cross-year payment." },
+      { ordinal: 1, headingPath: "other-year", pageNumber: null, startChar: 21, endChar: 45, text: "source: SourceB; amount: 20 wan; time: 2010; evidence: 2010 payment." },
+    ]);
+    saveAoriIndex(db, {
+      libraryId: library.id,
+      documentName: "year-amount.md",
+      versionId: version.id,
+      documentId: version.documentId,
+      chunks,
+      centralQuestion: "2007年黄胜受贿多少？",
+      aspects: [{
+        kind: "finding",
+        domainKind: "bribery_facts",
+        title: "黄胜受贿事实",
+        summary: "Two item fixture with one cross-year amount.",
+        centralQuestion: "How much belongs to 2007?",
+        classificationRationale: "test",
+        confidence: 0.8,
+        items: [
+          { key: "cross", title: "SourceA cross-year payment", summary: "SourceA payment spans 2006-2008.", evidenceChunkIds: [chunks[0]!.id], evidenceStatus: "supported", closureStatus: "partial", classificationRationale: "test", confidence: 0.8 },
+          { key: "other", title: "SourceB 2010 payment", summary: "SourceB payment occurred in 2010.", evidenceChunkIds: [chunks[1]!.id], evidenceStatus: "supported", closureStatus: "partial", classificationRationale: "test", confidence: 0.8 },
+        ],
+        relations: [],
+        gaps: [],
+      }],
+    });
+
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new FakeModelProvider()).create(
+      library.id,
+      "2007年黄胜受贿多少？",
+    );
+
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
+    expect(pulse.pulse.answer).toContain("2007_confirmed_amount: null");
+    expect(pulse.pulse.answer).not.toContain('"total":0');
+    const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
+    expect(diagnostics.answerPipeline).toBe("aori_demand");
+    const operationResult = diagnostics.demandOperationResult as { status: string; operationResults: Array<{ outputName: string; result: unknown; uncertainRecordIds: unknown[] }> };
+    expect(operationResult.status).toBe("partial");
+    expect(operationResult.operationResults.find((operation) => operation.outputName === "2007_records")?.uncertainRecordIds).toHaveLength(1);
+    expect(operationResult.operationResults.find((operation) => operation.outputName === "2007_confirmed_amount")?.result).toBeNull();
+    db.close();
+  });
+
+  it("demand mode covers all aspect items for count and list questions", async () => {
+    const db = await database();
+    const library = db.createLibrary("Demand Count AORI");
+    const version = db.createDocumentVersion(library.id, "count.md", "text/markdown", "hash", "count.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "fact-1", pageNumber: null, startChar: 0, endChar: 20, text: "source: SourceA; person: Alice; evidence: Alice paid Huang." },
+      { ordinal: 1, headingPath: "fact-2", pageNumber: null, startChar: 21, endChar: 45, text: "source: SourceB; person: Bob; evidence: Bob paid Huang." },
+      { ordinal: 2, headingPath: "fact-3", pageNumber: null, startChar: 46, endChar: 70, text: "source: SourceC; person: Charlie; evidence: Charlie paid Huang." },
+      { ordinal: 3, headingPath: "fact-4", pageNumber: null, startChar: 71, endChar: 95, text: "source: SourceD; person: Dana; evidence: Dana paid Huang." },
+      { ordinal: 4, headingPath: "fact-5", pageNumber: null, startChar: 96, endChar: 120, text: "source: SourceE; person: Eve; evidence: Eve paid Huang." },
+    ]);
+    saveAoriIndex(db, {
+      libraryId: library.id,
+      documentName: "count.md",
+      versionId: version.id,
+      documentId: version.documentId,
+      chunks,
+      centralQuestion: "总共多少人行贿？",
+      aspects: [{
+        kind: "finding",
+        domainKind: "bribery_facts",
+        title: "全部行贿事实",
+        summary: "Five item fixture for demand count coverage.",
+        centralQuestion: "Who paid Huang?",
+        classificationRationale: "test",
+        confidence: 0.8,
+        items: chunks.map((chunk, index) => ({
+          key: `fact-${index + 1}`,
+          title: `Payment fact ${index + 1}`,
+          summary: `Payment fact ${index + 1}`,
+          evidenceChunkIds: [chunk.id],
+          evidenceStatus: "supported" as const,
+          closureStatus: "partial" as const,
+          classificationRationale: "test",
+          confidence: 0.8,
+        })),
+        relations: [],
+        gaps: [],
+      }],
+    });
+
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new FakeModelProvider()).create(
+      library.id,
+      "总共多少人行贿？列出所有人或单位的名字",
+    );
+
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
+    expect(pulse.pulse.answer).toContain('"count":5');
+    expect(pulse.pulse.answer).toContain("SourceA");
+    expect(pulse.pulse.answer).toContain("SourceE");
+    expect(pulse.pulse.answer).not.toContain("16 chunks");
+    expect(pulse.pulse.answer).not.toContain("16个片段");
+    const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
+    expect((diagnostics.evidenceRecords as unknown[])).toHaveLength(5);
+    db.close();
+  });
+
+  it("demand mode narrows to the relevant item for single fact questions", async () => {
+    const db = await database();
+    const library = db.createLibrary("Demand Single AORI");
+    const version = db.createDocumentVersion(library.id, "single.md", "text/markdown", "hash", "single.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "yang", pageNumber: null, startChar: 0, endChar: 20, text: "source: 杨某丙; gift: 人民币3万元和购物卡; evidence: 杨某丙送给黄胜财物。" },
+      { ordinal: 1, headingPath: "other", pageNumber: null, startChar: 21, endChar: 45, text: "source: 其他人; gift: 手表; evidence: 其他事实。" },
+    ]);
+    saveAoriIndex(db, {
+      libraryId: library.id,
+      documentName: "single.md",
+      versionId: version.id,
+      documentId: version.documentId,
+      chunks,
+      centralQuestion: "杨某丙给了什么？",
+      aspects: [{
+        kind: "finding",
+        domainKind: "bribery_facts",
+        title: "财物事实",
+        summary: "Two item fixture for single item demand lookup.",
+        centralQuestion: "What was given?",
+        classificationRationale: "test",
+        confidence: 0.8,
+        items: [
+          { key: "yang", title: "杨某丙财物", summary: "杨某丙给了购物卡和人民币。", evidenceChunkIds: [chunks[0]!.id], evidenceStatus: "supported", closureStatus: "partial", classificationRationale: "test", confidence: 0.8 },
+          { key: "other", title: "其他人财物", summary: "其他人给了手表。", evidenceChunkIds: [chunks[1]!.id], evidenceStatus: "supported", closureStatus: "partial", classificationRationale: "test", confidence: 0.8 },
+        ],
+        relations: [],
+        gaps: [],
+      }],
+    });
+
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new FakeModelProvider()).create(library.id, "杨某丙给了什么？");
+
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
+    expect(pulse.pulse.answer).toContain("人民币3万元和购物卡");
+    expect(pulse.pulse.answer).not.toContain("手表");
+    const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
+    expect((diagnostics.evidenceRecords as unknown[])).toHaveLength(1);
     db.close();
   });
 });

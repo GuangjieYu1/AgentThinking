@@ -103,6 +103,38 @@ function model(): ModelProvider {
       observation: "ok",
       rationale: "ok",
     }),
+    planDemandAnswer: async ({ question }) => ({
+      answerGoal: question,
+      targetScope: { reason: "test" },
+      requiredRecords: [{
+        recordName: "test_records",
+        source: "aspect_items",
+        fields: [{ name: "answer_value", description: "test", required: true }],
+        coverage: "some",
+      }],
+      operations: [{
+        type: "direct_answer",
+        inputRecord: "test_records",
+        outputName: "answer",
+        reason: "test",
+      }],
+      answerPolicy: {
+        mustCiteSourceChunks: true,
+        allowPartialAnswer: true,
+        exposeUncertainty: true,
+        whatCountsAsInsufficient: "test",
+      },
+      reason: "test",
+      confidence: 0.5,
+    }),
+    extractDemandEvidenceRecord: async (input) => ({
+      recordId: `record-${input.sourceItem.id}`,
+      recordName: input.recordSpec.recordName,
+      sourceItemId: input.sourceItem.id,
+      fields: {},
+      evidenceChunkIds: input.chunks.map((chunk) => chunk.id),
+    }),
+    synthesizeDemandAnswer: async () => ({ answer: "ok", summary: "ok" }),
     routeAoriSkill: async () => ({
       skill: "normal_traversal",
       targetAspects: [],

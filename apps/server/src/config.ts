@@ -46,7 +46,7 @@ export interface AppConfig {
   aoriMinTruncatedContextTokens: number;
   aoriEvidenceBindingMinContextTokens: number;
   aoriAllowSmallContextOnlyForQuoteLookup: boolean;
-  aoriAnswerMode: "traversal" | "legacy" | "strict_evidence_table";
+  aoriAnswerMode: "demand" | "traversal" | "legacy" | "strict_evidence_table";
   recordIndexingRationale: boolean;
 }
 
@@ -121,7 +121,9 @@ export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
         ? "legacy"
         : process.env.AORI_ANSWER_MODE === "strict_evidence_table"
           ? "strict_evidence_table"
-          : "traversal"),
+          : process.env.AORI_ANSWER_MODE === "traversal"
+            ? "traversal"
+            : "demand"),
     recordIndexingRationale: overrides.recordIndexingRationale ??
       (process.env.RECORD_INDEXING_RATIONALE === "true" || process.env.AORI_RECORD_INDEXING_RATIONALE === "true"),
   };

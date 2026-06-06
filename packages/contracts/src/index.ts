@@ -1102,6 +1102,140 @@ export interface FacetCountAnswerInput {
   result: FacetCountResult;
 }
 
+export interface DemandAnswerPlan {
+  answerGoal: string;
+  targetScope: {
+    documentIds?: string[] | undefined;
+    aspectIds?: string[] | undefined;
+    nodeIds?: string[] | undefined;
+    reason: string;
+  };
+  requiredRecords: Array<{
+    recordName: string;
+    source: "aspect_items" | "relations" | "chunks" | "document_summary";
+    aspectId?: string | undefined;
+    fields: Array<{
+      name: string;
+      description: string;
+      required: boolean;
+    }>;
+    coverage: "single" | "some" | "all";
+  }>;
+  operations: Array<{
+    type:
+      | "filter"
+      | "count"
+      | "sum"
+      | "list"
+      | "group_by"
+      | "compare"
+      | "timeline"
+      | "explain"
+      | "direct_answer";
+    inputRecord: string;
+    field?: string | undefined;
+    condition?: string | undefined;
+    outputName: string;
+    reason: string;
+  }>;
+  answerPolicy: {
+    mustCiteSourceChunks: boolean;
+    allowPartialAnswer: boolean;
+    exposeUncertainty: boolean;
+    whatCountsAsInsufficient: string;
+  };
+  reason: string;
+  confidence: number;
+}
+
+export interface DemandAnswerPlanInput {
+  question: string;
+  globalSummary: string;
+  documentCards: AoriTraversalMap["documentCards"];
+  aspects: Array<{
+    aspectId: string;
+    title: string;
+    kind: string;
+    domainKind: string;
+    summary: string;
+    itemCount: number;
+  }>;
+  relationLexicon?: Array<{
+    domainRelation: string;
+    summary?: string | undefined;
+  }> | undefined;
+}
+
+export interface EvidenceRecordField {
+  value: unknown;
+  confidence: number;
+  evidenceChunkIds: string[];
+  quote?: string | undefined;
+  uncertainty?: string | undefined;
+}
+
+export interface EvidenceRecord {
+  recordId: string;
+  recordName: string;
+  sourceNodeId?: string | undefined;
+  sourceAspectId?: string | undefined;
+  sourceItemId?: string | undefined;
+  fields: Record<string, EvidenceRecordField>;
+  evidenceChunkIds: string[];
+}
+
+export interface DemandEvidenceRecordExtractionInput {
+  question: string;
+  recordSpec: DemandAnswerPlan["requiredRecords"][number];
+  sourceItem: {
+    id: string;
+    title: string;
+    summary: string;
+  };
+  chunks: Array<{
+    id: string;
+    text: string;
+  }>;
+}
+
+export interface DemandOperationResult {
+  operationResults: Array<{
+    outputName: string;
+    type: string;
+    result: unknown;
+    includedRecordIds: string[];
+    excludedRecordIds: Array<{
+      recordId: string;
+      reason: string;
+    }>;
+    uncertainRecordIds: Array<{
+      recordId: string;
+      reason: string;
+    }>;
+    warnings: string[];
+  }>;
+  answerFacts: Array<{
+    text: string;
+    recordIds: string[];
+    evidenceChunkIds: string[];
+  }>;
+  status: "complete" | "partial" | "insufficient";
+  warnings: string[];
+}
+
+export interface DemandOperationExecutionInput {
+  question: string;
+  plan: DemandAnswerPlan;
+  records: EvidenceRecord[];
+}
+
+export interface DemandAnswerSynthesisInput {
+  question: string;
+  plan: DemandAnswerPlan;
+  records: EvidenceRecord[];
+  operationResult: DemandOperationResult;
+}
+
 export interface BfsExpansionInput {
   question: string;
   globalSummary: string;
@@ -1729,7 +1863,12 @@ export type PulseStreamEvent =
       | "facet_operation_planned"
       | "facet_filter_applied"
       | "facet_dedupe_finished"
-      | "skill_answer_synthesized";
+      | "skill_answer_synthesized"
+      | "demand_plan_generated"
+      | "demand_records_started"
+      | "demand_record_extracted"
+      | "demand_operations_finished"
+      | "demand_answer_synthesized";
     message: string;
     payload?: unknown;
   }
@@ -1816,7 +1955,11 @@ export type PulseEvidenceTool =
   | "planFacetCountOperation"
   | "applyFacetCountFilters"
   | "dedupeFacetCountRows"
-  | "synthesizeFacetCountAnswer";
+  | "synthesizeFacetCountAnswer"
+  | "planDemandAnswer"
+  | "extractDemandEvidenceRecords"
+  | "executeDemandOperations"
+  | "synthesizeDemandAnswer";
 
 export type PulseEvidenceType = "fact" | "amount" | "date" | "entity_relation" | "claim" | "quote" | "timeline_event" | "table_value" | "other";
 
@@ -2103,7 +2246,7 @@ export interface EvidencePack {
   evidencePackSchemaVersion?: 1 | 2 | undefined;
   pipeline?: {
     indexProfile: ActiveIndexProfile;
-    packBuilder: "legacy" | "v2" | "aori_traversal" | "aori_skill";
+    packBuilder: "legacy" | "v2" | "aori_traversal" | "aori_skill" | "aori_demand";
     model: string;
     promptVersion: string;
   } | undefined;
@@ -2270,10 +2413,13 @@ export interface PulseAnswerOutput {
     retrievalSteps?: PulseEvidenceStep[] | undefined;
     citedChunkIds?: string[] | undefined;
     warnings?: string[] | undefined;
-    answerPipeline?: "aori_skill" | "aori_traversal" | undefined;
+    answerPipeline?: "aori_demand" | "aori_skill" | "aori_traversal" | undefined;
     selectedSkill?: AoriSkillName | undefined;
     skillRoute?: AoriSkillRoute | undefined;
     targetAspects?: AoriSkillRoute["targetAspects"] | undefined;
+    demandPlan?: DemandAnswerPlan | undefined;
+    evidenceRecords?: EvidenceRecord[] | undefined;
+    demandOperationResult?: DemandOperationResult | undefined;
     facetFactTable?: FacetFactTable | undefined;
     facetOperation?: unknown;
     facetResult?: unknown;
@@ -2733,6 +2879,10 @@ export const pulseEvidenceToolValues = [
   "getDocumentOutline",
   "getChunkEvidenceAround",
   "getGraphContext",
+  "planDemandAnswer",
+  "extractDemandEvidenceRecords",
+  "executeDemandOperations",
+  "synthesizeDemandAnswer",
 ] as const;
 
 export const pulseEvidenceStepSchema = z.object({

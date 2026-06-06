@@ -9,6 +9,12 @@ import type {
   AoriRiskLevel,
   ChunkAnswerSummary,
   ChunkSummaryInput,
+  DemandAnswerPlan,
+  DemandAnswerPlanInput,
+  DemandAnswerSynthesisInput,
+  DemandEvidenceRecordExtractionInput,
+  EvidenceRecord,
+  EvidenceRecordField,
   AspectKind,
   Chunk,
   Citation,
@@ -26,6 +32,7 @@ import type {
   FacetFactRowExtractionInput,
   FacetTimeFilterInput,
   FacetTimeFilterResult,
+  DemandOperationResult,
   GraphRuleStage,
   MappingAudit,
   MappingAuditResult,
@@ -653,6 +660,150 @@ function cleanFacetCountResult(value: unknown, input: FacetCountDedupeInput): Fa
   };
 }
 
+const demandRecordSources = ["aspect_items", "relations", "chunks", "document_summary"] as const;
+const demandRecordCoverage = ["single", "some", "all"] as const;
+const demandOperationTypes = ["filter", "count", "sum", "list", "group_by", "compare", "timeline", "explain", "direct_answer"] as const;
+
+function cleanDemandAnswerPlan(value: unknown, input: DemandAnswerPlanInput): DemandAnswerPlan {
+  const source = normalizedUnknownObject(value);
+  const targetScope = normalizedUnknownObject(source.targetScope);
+  const allowedAspectIds = new Set(input.aspects.map((aspect) => aspect.aspectId));
+  const scopeAspectIds = normalizedStringArray(targetScope.aspectIds).filter((id) => allowedAspectIds.has(id));
+  const largestAspect = input.aspects
+    .filter((aspect) => aspect.itemCount > 0)
+    .sort((left, right) => right.itemCount - left.itemCount)[0];
+  const requiredRecords = (Array.isArray(source.requiredRecords) ? source.requiredRecords : [])
+    .slice(0, 8)
+    .flatMap((entry, index): DemandAnswerPlan["requiredRecords"] => {
+      const record = normalizedUnknownObject(entry);
+      const fields = (Array.isArray(record.fields) ? record.fields : [])
+        .slice(0, 16)
+        .flatMap((fieldEntry, fieldIndex): DemandAnswerPlan["requiredRecords"][number]["fields"] => {
+          const field = normalizedUnknownObject(fieldEntry);
+          const name = typeof field.name === "string" && field.name.trim() ? field.name.trim() : `field_${fieldIndex + 1}`;
+          return [{
+            name: truncateText(name, 120),
+            description: normalizedText(field.description, name, 500),
+            required: typeof field.required === "boolean" ? field.required : true,
+          }];
+        });
+      const sourceType = demandRecordSources.includes(record.source as DemandAnswerPlan["requiredRecords"][number]["source"])
+        ? record.source as DemandAnswerPlan["requiredRecords"][number]["source"]
+        : "aspect_items";
+      const aspectId = typeof record.aspectId === "string" && allowedAspectIds.has(record.aspectId)
+        ? record.aspectId
+        : scopeAspectIds[0] ?? largestAspect?.aspectId;
+      return [{
+        recordName: normalizedText(record.recordName, `record_${index + 1}`, 120),
+        source: sourceType,
+        ...(aspectId && sourceType === "aspect_items" ? { aspectId } : {}),
+        fields: fields.length > 0 ? fields : [
+          { name: "evidence", description: "Source-grounded evidence needed to answer the question.", required: true },
+        ],
+        coverage: demandRecordCoverage.includes(record.coverage as DemandAnswerPlan["requiredRecords"][number]["coverage"])
+          ? record.coverage as DemandAnswerPlan["requiredRecords"][number]["coverage"]
+          : "all",
+      }];
+    });
+  const fallbackRecord: DemandAnswerPlan["requiredRecords"][number] = {
+    recordName: "source_evidence",
+    source: "aspect_items",
+    ...(scopeAspectIds[0] ?? largestAspect?.aspectId ? { aspectId: scopeAspectIds[0] ?? largestAspect?.aspectId } : {}),
+    fields: [
+      { name: "answer_value", description: "The source-bound answer value for this question.", required: true },
+      { name: "evidence", description: "Short source quote supporting the answer value.", required: true },
+    ],
+    coverage: "some",
+  };
+  const finalRecords = requiredRecords.length > 0 ? requiredRecords : [fallbackRecord];
+  const availableRecordNames = new Set(finalRecords.map((record) => record.recordName));
+  const operations = (Array.isArray(source.operations) ? source.operations : [])
+    .slice(0, 12)
+    .flatMap((entry, index): DemandAnswerPlan["operations"] => {
+      const operation = normalizedUnknownObject(entry);
+      const type = demandOperationTypes.includes(operation.type as DemandAnswerPlan["operations"][number]["type"])
+        ? operation.type as DemandAnswerPlan["operations"][number]["type"]
+        : "direct_answer";
+      const inputRecord = typeof operation.inputRecord === "string" && availableRecordNames.has(operation.inputRecord)
+        ? operation.inputRecord
+        : finalRecords[0]?.recordName ?? "source_evidence";
+      const outputName = normalizedText(operation.outputName, `operation_${index + 1}`, 120);
+      availableRecordNames.add(outputName);
+      return [{
+        type,
+        inputRecord,
+        ...(typeof operation.field === "string" && operation.field.trim() ? { field: truncateText(operation.field.trim(), 120) } : {}),
+        ...(typeof operation.condition === "string" && operation.condition.trim() ? { condition: truncateText(operation.condition.trim(), 500) } : {}),
+        outputName,
+        reason: normalizedText(operation.reason, "Demand plan operation generated for this question.", 800),
+      }];
+    });
+  const answerPolicy = normalizedUnknownObject(source.answerPolicy);
+  return {
+    answerGoal: normalizedText(source.answerGoal, input.question, 600),
+    targetScope: {
+      ...(normalizedStringArray(targetScope.documentIds).length > 0 ? { documentIds: normalizedStringArray(targetScope.documentIds) } : {}),
+      ...(scopeAspectIds.length > 0 ? { aspectIds: scopeAspectIds } : largestAspect ? { aspectIds: [largestAspect.aspectId] } : {}),
+      ...(normalizedStringArray(targetScope.nodeIds).length > 0 ? { nodeIds: normalizedStringArray(targetScope.nodeIds) } : {}),
+      reason: normalizedText(targetScope.reason, "Demand planner selected the source scope from the AORI map.", 800),
+    },
+    requiredRecords: finalRecords,
+    operations: operations.length > 0 ? operations : [{
+      type: "direct_answer",
+      inputRecord: finalRecords[0]?.recordName ?? "source_evidence",
+      outputName: "answer",
+      reason: "No explicit operation returned; use source-bound direct answer.",
+    }],
+    answerPolicy: {
+      mustCiteSourceChunks: typeof answerPolicy.mustCiteSourceChunks === "boolean" ? answerPolicy.mustCiteSourceChunks : true,
+      allowPartialAnswer: typeof answerPolicy.allowPartialAnswer === "boolean" ? answerPolicy.allowPartialAnswer : true,
+      exposeUncertainty: typeof answerPolicy.exposeUncertainty === "boolean" ? answerPolicy.exposeUncertainty : true,
+      whatCountsAsInsufficient: normalizedText(
+        answerPolicy.whatCountsAsInsufficient,
+        "No source-bound evidence records or no required field values were extracted.",
+        800,
+      ),
+    },
+    reason: normalizedText(source.reason, "Demand planner generated records and operations for this question.", 1200),
+    confidence: safeConfidence(source.confidence),
+  };
+}
+
+function cleanEvidenceRecord(value: unknown, input: DemandEvidenceRecordExtractionInput): EvidenceRecord {
+  const source = normalizedUnknownObject(value);
+  const allowedChunkIds = new Set(input.chunks.map((chunk) => chunk.id));
+  const fallbackQuote = input.chunks[0]?.text.slice(0, 220) ?? "";
+  const rawFields = normalizedUnknownObject(source.fields);
+  const fields: Record<string, EvidenceRecordField> = {};
+  for (const fieldSpec of input.recordSpec.fields) {
+    const rawField = normalizedUnknownObject(rawFields[fieldSpec.name]);
+    const evidenceChunkIds = normalizedStringArray(rawField.evidenceChunkIds).filter((chunkId) => allowedChunkIds.has(chunkId));
+    const quote = typeof rawField.quote === "string" && rawField.quote.trim()
+      ? truncateText(rawField.quote.trim(), 500)
+      : truncateText(fallbackQuote, 500);
+    fields[fieldSpec.name] = {
+      value: Object.hasOwn(rawField, "value") ? rawField.value : null,
+      confidence: safeConfidence(rawField.confidence),
+      evidenceChunkIds: evidenceChunkIds.length > 0 ? evidenceChunkIds : input.chunks.flatMap((chunk) => chunk.id).slice(0, 1),
+      ...(quote ? { quote } : {}),
+      ...(typeof rawField.uncertainty === "string" && rawField.uncertainty.trim()
+        ? { uncertainty: truncateText(rawField.uncertainty.trim(), 500) }
+        : {}),
+    };
+  }
+  const evidenceChunkIds = uniqueStrings([
+    ...normalizedStringArray(source.evidenceChunkIds).filter((chunkId) => allowedChunkIds.has(chunkId)),
+    ...Object.values(fields).flatMap((field) => field.evidenceChunkIds),
+  ]);
+  return {
+    recordId: normalizedText(source.recordId, `demand-record-${input.recordSpec.recordName}-${input.sourceItem.id}`, 180),
+    recordName: input.recordSpec.recordName,
+    sourceItemId: input.sourceItem.id,
+    fields,
+    evidenceChunkIds: evidenceChunkIds.length > 0 ? evidenceChunkIds : input.chunks.map((chunk) => chunk.id),
+  };
+}
+
 function cleanPulseEvidenceRows(rowsValue: unknown, allowedChunkIds: Set<string>): PulseEvidenceRow[] {
   const rows = Array.isArray(rowsValue) ? rowsValue : (rowsValue && typeof rowsValue === "object" && Array.isArray((rowsValue as { rows?: unknown }).rows) ? (rowsValue as { rows: unknown[] }).rows : []);
   return rows.flatMap((entry, index): PulseEvidenceRow[] => {
@@ -1060,6 +1211,9 @@ export interface ModelProvider {
   }): Promise<PulseAnswerOutput>;
   answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput>;
   selectPulseNavigation(question: string, step: string, candidates: PulseNavigationCandidate[]): Promise<PulseNavigationDecision>;
+  planDemandAnswer(input: DemandAnswerPlanInput): Promise<DemandAnswerPlan>;
+  extractDemandEvidenceRecord(input: DemandEvidenceRecordExtractionInput): Promise<EvidenceRecord>;
+  synthesizeDemandAnswer(input: DemandAnswerSynthesisInput): Promise<PulseAnswerOutput>;
   routeAoriSkill(input: AoriSkillRouterInput): Promise<AoriSkillRoute>;
   extractFacetFactRow(input: FacetFactRowExtractionInput): Promise<FacetFactRow>;
   planFacetCountOperation(input: FacetCountOperationPlanInput): Promise<FacetCountOperation>;
@@ -1476,6 +1630,219 @@ export class FakeModelProvider implements ModelProvider {
       rationale: selected.length > 0
         ? `选择 ${selected.map((candidate) => candidate.label).join("、")}，因为它们与问题词或候选分数更接近。`
         : "没有足够候选可继续展开。",
+    };
+  }
+
+  async planDemandAnswer(input: DemandAnswerPlanInput): Promise<DemandAnswerPlan> {
+    const question = input.question.normalize("NFKC").toLowerCase();
+    const target = input.aspects
+      .filter((aspect) => aspect.itemCount > 0)
+      .sort((left, right) => right.itemCount - left.itemCount)[0];
+    const recordName = "answer_records";
+    const year = question.match(/\b(19|20)\d{2}\b/u)?.[0];
+    const hasAmount = /amount|money|sum|total|\u91d1\u989d|\u94b1|\u603b\u989d|\u52a0\u8d77\u6765|\u53d7\u8d3f\u591a\u5c11/.test(question);
+    const hasCount = /how many|count|list|\u591a\u5c11\u4eba|\u51e0\u4eba|\u603b\u5171|\u5217\u51fa|\u540d\u5b57|\u540d\u5355/.test(question);
+    const hasTimeline = /timeline|\u65f6\u95f4\u7ebf|\u6309\u65f6\u95f4|\u54ea\u4e9b\u4e8b/.test(question);
+    const hasArgument = /argument|defense|court|response|\u8fa9\u62a4|\u6cd5\u9662|\u91c7\u7eb3|\u56de\u5e94|\u4e0a\u8bc9/.test(question);
+    const coverage: DemandAnswerPlan["requiredRecords"][number]["coverage"] = hasCount || hasAmount || hasTimeline ? "all" : "single";
+    const fields = hasAmount
+      ? [
+        { name: "source_name", description: "Source person or organization for the value.", required: true },
+        { name: "amount", description: "Amount in source text, preferably RMB-normalized.", required: true },
+        { name: "time_range", description: "Time or period for the amount.", required: Boolean(year) },
+        { name: "evidence", description: "Source quote supporting this value.", required: true },
+      ]
+      : hasCount
+        ? [
+          { name: "source_name", description: "Person or organization to count/list.", required: true },
+          { name: "person_names", description: "Natural person names when present.", required: false },
+          { name: "organization_names", description: "Organization names when present.", required: false },
+          { name: "evidence", description: "Source quote supporting the source.", required: true },
+        ]
+        : hasTimeline
+          ? [
+            { name: "event", description: "Timeline event.", required: true },
+            { name: "time_range", description: "Event time or period.", required: true },
+            { name: "source_name", description: "Event source/entity.", required: false },
+            { name: "evidence", description: "Source quote supporting the event.", required: true },
+          ]
+          : hasArgument
+            ? [
+              { name: "argument", description: "Argument or defense opinion.", required: true },
+              { name: "response", description: "Court or authority response.", required: true },
+              { name: "finding", description: "Finding connected to the response.", required: false },
+              { name: "status", description: "Accepted/rejected/partial status.", required: false },
+              { name: "evidence", description: "Source quote supporting the pair.", required: true },
+            ]
+            : [
+              { name: "answer_value", description: "Direct answer value.", required: true },
+              { name: "gift", description: "Gift/payment/property if the question asks what was given.", required: false },
+              { name: "source_name", description: "Relevant source/entity.", required: false },
+              { name: "evidence", description: "Source quote supporting the answer.", required: true },
+            ];
+    const operations: DemandAnswerPlan["operations"] = [];
+    if (year) {
+      operations.push({
+        type: "filter",
+        inputRecord: recordName,
+        field: "time_range",
+        condition: `time_range overlaps ${year}`,
+        outputName: `${year}_records`,
+        reason: "The question asks about a specific year, so records must be filtered before answering.",
+      });
+    }
+    if (hasAmount) {
+      operations.push({
+        type: "sum",
+        inputRecord: year ? `${year}_records` : recordName,
+        field: "amount",
+        outputName: year ? `${year}_confirmed_amount` : "confirmed_total_amount",
+        reason: "Amounts must be summed by program arithmetic from extracted records.",
+      });
+    } else if (hasCount) {
+      operations.push({
+        type: "list",
+        inputRecord: recordName,
+        field: "source_name",
+        outputName: "source_list",
+        reason: "The answer needs the complete source list before counting.",
+      }, {
+        type: "count",
+        inputRecord: "source_list",
+        field: "source_name",
+        outputName: "source_count",
+        reason: "Count distinct source names after extraction and dedupe.",
+      });
+    } else if (hasTimeline) {
+      operations.push({
+        type: "timeline",
+        inputRecord: year ? `${year}_records` : recordName,
+        field: "time_range",
+        outputName: "timeline",
+        reason: "The question asks for events in chronological order.",
+      });
+    } else if (hasArgument) {
+      operations.push({
+        type: "explain",
+        inputRecord: recordName,
+        outputName: "argument_response",
+        reason: "The answer should align arguments with responses and findings.",
+      });
+    } else {
+      operations.push({
+        type: "direct_answer",
+        inputRecord: recordName,
+        outputName: "answer",
+        reason: "The question can be answered from one or a few source-bound records.",
+      });
+    }
+    return {
+      answerGoal: input.question,
+      targetScope: {
+        ...(target ? { aspectIds: [target.aspectId] } : {}),
+        reason: "Fake provider demand planner selected the largest source-bound AORI aspect for this question.",
+      },
+      requiredRecords: [{
+        recordName,
+        source: "aspect_items",
+        ...(target ? { aspectId: target.aspectId } : {}),
+        fields,
+        coverage,
+      }],
+      operations,
+      answerPolicy: {
+        mustCiteSourceChunks: true,
+        allowPartialAnswer: true,
+        exposeUncertainty: true,
+        whatCountsAsInsufficient: "No source-bound records or no required field values were extracted.",
+      },
+      reason: "Fake provider generated a demand plan for local tests.",
+      confidence: 0.72,
+    };
+  }
+
+  async extractDemandEvidenceRecord(input: DemandEvidenceRecordExtractionInput): Promise<EvidenceRecord> {
+    const text = input.chunks.map((chunk) => chunk.text).join("\n\n");
+    const quote = text.replace(/\s+/g, " ").trim().slice(0, 220);
+    const chunkIds = input.chunks.map((chunk) => chunk.id);
+    const readLabel = (labels: string[]): string | undefined => {
+      for (const label of labels) {
+        const match = text.match(new RegExp(`${label}\\s*[:=]\\s*([^;\\n]+)`, "i"));
+        if (match?.[1]?.trim()) return match[1].trim();
+      }
+      return undefined;
+    };
+    const listValue = (labels: string[]): string[] => {
+      const raw = readLabel(labels);
+      if (!raw) return [];
+      return raw.split(/[\u3001\uff0c,;；\s]+/u).map((entry) => entry.trim()).filter(Boolean);
+    };
+    const fieldValue = (field: string): unknown => {
+      const normalized = field.normalize("NFKC").toLowerCase();
+      if (/source|来源|人或单位/.test(normalized)) return readLabel(["source", "source_name", "person", "unit"]) ?? input.sourceItem.title;
+      if (/person|自然人|人名/.test(normalized)) return listValue(["person", "people", "person_names", "persons"]);
+      if (/organization|org|单位|组织/.test(normalized)) return listValue(["organization", "org", "organization_names", "unit"]);
+      if (/time|date|year|时间|年份/.test(normalized)) return readLabel(["time", "time_range", "date"]) ?? text.match(/\b(19|20)\d{2}\b/u)?.[0] ?? null;
+      if (/amount|money|金额|钱|总额/.test(normalized)) return readLabel(["amount", "money"]) ?? text.match(/\d+(?:\.\d+)?\s*(?:yuan|rmb|cny|wan|万|元)/iu)?.[0] ?? null;
+      if (/gift|property|财物|给了/.test(normalized)) return readLabel(["gift", "property", "thing"]) ?? null;
+      if (/event|事件/.test(normalized)) return readLabel(["event"]) ?? input.sourceItem.summary;
+      if (/argument|defense|辩护|意见/.test(normalized)) return readLabel(["argument", "defense"]) ?? null;
+      if (/response|court|回应|法院/.test(normalized)) return readLabel(["response", "court_response"]) ?? null;
+      if (/finding|认定/.test(normalized)) return readLabel(["finding"]) ?? null;
+      if (/status|采纳/.test(normalized)) return readLabel(["status"]) ?? null;
+      if (/evidence|quote|证据/.test(normalized)) return quote || null;
+      return readLabel([field]) ?? null;
+    };
+    const fields = Object.fromEntries(input.recordSpec.fields.map((fieldSpec) => {
+      const value = fieldValue(fieldSpec.name);
+      return [fieldSpec.name, {
+        value,
+        confidence: value === null || value === undefined || (Array.isArray(value) && value.length === 0) ? 0.25 : 0.78,
+        evidenceChunkIds: chunkIds,
+        ...(quote ? { quote } : {}),
+        ...(value === null || value === undefined ? { uncertainty: `Field ${fieldSpec.name} was not explicit in the source chunks.` } : {}),
+      } satisfies EvidenceRecordField];
+    }));
+    return {
+      recordId: `demand-record-${input.recordSpec.recordName}-${input.sourceItem.id}`,
+      recordName: input.recordSpec.recordName,
+      sourceItemId: input.sourceItem.id,
+      fields,
+      evidenceChunkIds: chunkIds,
+    };
+  }
+
+  async synthesizeDemandAnswer(input: DemandAnswerSynthesisInput): Promise<PulseAnswerOutput> {
+    const operationLines = input.operationResult.operationResults.map((operation) => {
+      const included = operation.includedRecordIds.length;
+      const excluded = operation.excludedRecordIds.length;
+      const uncertain = operation.uncertainRecordIds.length;
+      return `${operation.outputName}: ${JSON.stringify(operation.result)} (included=${included}, excluded=${excluded}, uncertain=${uncertain})`;
+    });
+    const facts = input.operationResult.answerFacts.map((fact) => `- ${fact.text} [${fact.evidenceChunkIds.join(", ")}]`);
+    const insufficient = input.operationResult.status === "insufficient";
+    return {
+      answer: [
+        `Answer goal: ${input.plan.answerGoal}`,
+        insufficient
+          ? `Evidence is insufficient: ${input.operationResult.warnings.join("; ") || input.plan.answerPolicy.whatCountsAsInsufficient}`
+          : `Status: ${input.operationResult.status}`,
+        "Operations:",
+        ...operationLines,
+        "Answer facts:",
+        ...(facts.length > 0 ? facts : ["- No source-bound answer facts were produced."]),
+        input.operationResult.warnings.length > 0 ? `Warnings: ${input.operationResult.warnings.join("; ")}` : "Warnings: none",
+      ].join("\n"),
+      summary: `Demand answer ${input.operationResult.status} with ${input.records.length} record(s) and ${input.operationResult.operationResults.length} operation(s).`,
+      diagnostics: {
+        answerPipeline: "aori_demand",
+        demandPlan: input.plan,
+        evidenceRecords: input.records,
+        demandOperationResult: input.operationResult,
+        sourceChunkIds: uniqueStrings(input.records.flatMap((record) => record.evidenceChunkIds)),
+        fallbackTraversalUsed: false,
+        skillRouteFallback: this.name === "fake",
+      },
     };
   }
 
@@ -2746,6 +3113,112 @@ export class OpenAICompatibleProvider implements ModelProvider {
       };
     }
     return { ...parsed, selectedIds };
+  }
+
+  async planDemandAnswer(input: DemandAnswerPlanInput): Promise<DemandAnswerPlan> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.03,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are the AORI Demand Answer Planner. Generate a temporary answer plan for this single user question. " +
+            "Do not choose a fixed skill name. Use the AORI map only as navigation. " +
+            "Decide which source-bound records, fields, coverage, and operations are needed. " +
+            "AORI summaries and document cards are navigation hints, never final evidence. " +
+            "Prefer full aspect item coverage for exhaustive count/list/sum questions, and narrow coverage for single fact lookup. " +
+            "Operations may consume either a requiredRecords recordName or a previous operation outputName. " +
+            'Return JSON only matching: {"answerGoal":"...","targetScope":{"documentIds":[],"aspectIds":[],"nodeIds":[],"reason":"..."},"requiredRecords":[{"recordName":"...","source":"aspect_items|relations|chunks|document_summary","aspectId":"...","fields":[{"name":"...","description":"...","required":true}],"coverage":"single|some|all"}],"operations":[{"type":"filter|count|sum|list|group_by|compare|timeline|explain|direct_answer","inputRecord":"...","field":"...","condition":"...","outputName":"...","reason":"..."}],"answerPolicy":{"mustCiteSourceChunks":true,"allowPartialAnswer":true,"exposeUncertainty":true,"whatCountsAsInsufficient":"..."},"reason":"...","confidence":0.8}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 2200,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanDemandAnswerPlan(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input);
+  }
+
+  async extractDemandEvidenceRecord(input: DemandEvidenceRecordExtractionInput): Promise<EvidenceRecord> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.02,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Extract exactly one EvidenceRecord for the AORI Demand Answer Engine. " +
+            "Use only the supplied chunks as factual evidence. The sourceItem title and summary are navigation context only. " +
+            "Every requested field must be present in fields. Every field must include value, confidence, evidenceChunkIds, and quote. " +
+            "If a field is not supported by the supplied chunks, set value to null, use low confidence, attach any relevant chunk id when available, and add uncertainty. " +
+            "Do not infer facts from AORI summaries. Do not fabricate missing amount, person, organization, or time values. " +
+            'Return JSON only: {"recordId":"...","recordName":"...","sourceItemId":"...","fields":{"field_name":{"value":null,"confidence":0.2,"evidenceChunkIds":["chunk-id"],"quote":"short exact source quote","uncertainty":"..."}},"evidenceChunkIds":["chunk-id"]}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 2200,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanEvidenceRecord(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input);
+  }
+
+  async synthesizeDemandAnswer(input: DemandAnswerSynthesisInput): Promise<PulseAnswerOutput> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.04,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Write the final answer for the AORI Demand Answer Engine. " +
+            "Use only EvidenceRecord fields and DemandOperationResult. Do not use AORI summaries as evidence. " +
+            "State the answer scope/policy. State included, excluded, and uncertain records. " +
+            "If evidence is insufficient, say it is insufficient. Never convert empty records or missing numeric fields into 0. " +
+            "Cite chunk ids and source quotes from EvidenceRecord fields when making factual claims. " +
+            'Return JSON only: {"answer":"...","summary":"...","diagnostics":{"warnings":[]}}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 2400,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const answer = pulseAnswerSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+    return {
+      ...answer,
+      diagnostics: {
+        ...answer.diagnostics,
+        answerPipeline: "aori_demand",
+        demandPlan: input.plan,
+        evidenceRecords: input.records,
+        demandOperationResult: input.operationResult,
+        sourceChunkIds: uniqueStrings(input.records.flatMap((record) => record.evidenceChunkIds)),
+        fallbackTraversalUsed: false,
+      },
+    };
   }
 
   async routeAoriSkill(input: AoriSkillRouterInput): Promise<AoriSkillRoute> {

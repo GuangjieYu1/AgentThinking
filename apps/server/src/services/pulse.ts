@@ -8,6 +8,7 @@ import type {
   Relation,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
+import { AoriDemandAnswerEngine } from "./aori-demand-answer.js";
 import { AoriTraversalAnswerEngine } from "./aori-traversal-answer.js";
 import type { ModelProvider } from "./models.js";
 import { PulseEvidenceController } from "./pulse-evidence-controller.js";
@@ -96,7 +97,7 @@ export class PulseEngine {
     private readonly db: AgentDatabase,
     private readonly vectors: VectorStore,
     private readonly model: ModelProvider,
-    private readonly options: { aoriAnswerMode?: "traversal" | "legacy" | "strict_evidence_table" } = {},
+    private readonly options: { aoriAnswerMode?: "demand" | "traversal" | "legacy" | "strict_evidence_table" } = {},
   ) {}
 
   async create(
@@ -106,8 +107,12 @@ export class PulseEngine {
     eventSink?: PulseEventSink,
   ): Promise<PulseResponse> {
     await emitPulse(eventSink, { type: "start", mode, question });
-    if ((this.options.aoriAnswerMode ?? "traversal") === "traversal" && this.db.listAoriDocumentIndexes(libraryId).length > 0) {
-      const result = await new AoriTraversalAnswerEngine(this.db, this.model).answer({
+    const aoriAnswerMode = this.options.aoriAnswerMode ?? "demand";
+    if (aoriAnswerMode !== "legacy" && this.db.listAoriDocumentIndexes(libraryId).length > 0) {
+      const engine = aoriAnswerMode === "traversal" || aoriAnswerMode === "strict_evidence_table"
+        ? new AoriTraversalAnswerEngine(this.db, this.model)
+        : new AoriDemandAnswerEngine(this.db, this.model);
+      const result = await engine.answer({
         libraryId,
         question,
         mode,

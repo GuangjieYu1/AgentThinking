@@ -730,25 +730,63 @@ function buildDemandChunkEvidencePack(question: string, records: EvidenceRecord[
   };
 }
 
-function buildHits(records: EvidenceRecord[], chunks: Chunk[]): PendingPulseHit[] {
-  const chunksById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
-  return allRecordChunkIds(records).flatMap((chunkId, index): PendingPulseHit[] => {
+function recordLabel(record: EvidenceRecord): string {
+  return record.sourceItemId ?? record.sourceNodeId ?? record.recordName;
+}
+
+function buildHitsForRecord(
+  record: EvidenceRecord,
+  chunksById: Map<string, Chunk>,
+  startStepIndex: number,
+): PendingPulseHit[] {
+  const hits: PendingPulseHit[] = [];
+  if (record.sourceNodeId) {
+    hits.push({
+      targetType: "node",
+      targetId: record.sourceNodeId,
+      score: record.evidenceChunkIds.length > 0 ? 0.74 : 0.42,
+      reason: "Demand answer source record",
+      pathRole: "direct",
+      stepIndex: startStepIndex + hits.length,
+      observation: `Demand extraction selected ${record.recordName} from this AORI node.`,
+      rationale: "The demand plan selected this source item for EvidenceRecord extraction before raw chunk verification.",
+      label: recordLabel(record),
+      excerpt: fieldQuote(record) ?? null,
+    });
+  }
+  for (const chunkId of uniqueStrings(record.evidenceChunkIds)) {
     const chunk = chunksById.get(chunkId);
-    if (!chunk) return [];
-    const record = records.find((candidate) => candidate.evidenceChunkIds.includes(chunkId));
-    return [{
+    if (!chunk) continue;
+    hits.push({
       targetType: "chunk",
       targetId: chunkId,
       score: 0.78,
       reason: "Demand answer evidence chunk",
       pathRole: "direct",
-      stepIndex: index + 1,
-      observation: `Demand extraction produced ${record?.recordName ?? "a record"} from this source chunk.`,
+      stepIndex: startStepIndex + hits.length,
+      observation: `Demand extraction produced ${record.recordName} from this source chunk.`,
       rationale: "The chunk was selected through AORI aspect/item coverage, then fields were extracted from raw source text.",
       label: chunkLabel(chunk),
-      excerpt: fieldQuote(record!, chunkId) ?? chunk.text.slice(0, 220),
-    }];
-  });
+      excerpt: fieldQuote(record, chunkId) ?? chunk.text.slice(0, 220),
+    });
+  }
+  return hits;
+}
+
+function buildHits(records: EvidenceRecord[], chunks: Chunk[]): PendingPulseHit[] {
+  const chunksById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+  const hits: PendingPulseHit[] = [];
+  const seen = new Set<string>();
+  for (const record of records) {
+    const recordHits = buildHitsForRecord(record, chunksById, hits.length + 1);
+    for (const hit of recordHits) {
+      const key = `${hit.targetType}:${hit.targetId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      hits.push({ ...hit, stepIndex: hits.length + 1 });
+    }
+  }
+  return hits;
 }
 
 function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[], operationResult: DemandOperationResult): RetrievalTrace[] {
@@ -868,6 +906,7 @@ export class AoriDemandAnswerEngine {
       planFallback: this.model.name === "fake",
     });
     const records: EvidenceRecord[] = [];
+    let emittedHitCount = 0;
     await emitDemand(input.eventSink, "demand_records_started", "Extracting demand evidence records.", {
       requiredRecordCount: plan.requiredRecords.length,
     });
@@ -896,7 +935,25 @@ export class AoriDemandAnswerEngine {
         records.push(normalized);
         await emitDemand(input.eventSink, "demand_record_extracted", `Extracted ${recordSpec.recordName}.`, {
           record: normalized,
+          recordSpec,
+          sourceItem: {
+            id: sourceItem.id,
+            title: sourceItem.title,
+            summary: sourceItem.summary,
+            ...(sourceItem.sourceNodeId ? { sourceNodeId: sourceItem.sourceNodeId } : {}),
+            ...(sourceItem.sourceAspectId ? { sourceAspectId: sourceItem.sourceAspectId } : {}),
+            ...(sourceItem.sourceItemId ? { sourceItemId: sourceItem.sourceItemId } : {}),
+            chunkIds: sourceItem.chunkIds,
+          },
+          chunks: chunks.map((chunk) => ({
+            id: chunk.id,
+            label: chunkLabel(chunk),
+            excerpt: truncateText(chunk.text, 220),
+          })),
         });
+        const hits = buildHitsForRecord(normalized, chunksById, emittedHitCount + 1);
+        emittedHitCount += hits.length;
+        for (const hit of hits) await emitPulse(input.eventSink, { type: "hit", hit });
       }
     }
     const operationResult = await executeDemandOperations({

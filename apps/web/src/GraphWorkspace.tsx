@@ -32,9 +32,12 @@ import {
   type AbstractNode,
   type AspectKind,
   type Citation,
+  type DemandAnswerPlan,
+  type DemandOperationResult,
   type Document,
   type DocumentTreeNode,
   type EvidencePack,
+  type EvidenceRecord,
   type GraphEdge,
   type GraphNode,
   type GraphRuleStage,
@@ -69,8 +72,27 @@ interface RuleGovernanceFeed {
 type PulseHitRecord = PulseResponse["hits"][number];
 type PulseStreamHitRecord = PulseStreamHit;
 type PulseNavigationEvent = Extract<PulseStreamEvent, { type: "candidates" | "decision" | "backtrack" }>;
+type PulseProcessEvent = Exclude<Extract<PulseStreamEvent, { message: string }>, { type: "error" }>;
 type PulseDecorated = { pulseActive?: boolean; pulseReverse?: boolean; pulseTransitKey?: string };
 type PulseVisualHit = Pick<PulseHitRecord, "targetType" | "targetId">;
+type PulseDisplayHit = Pick<PulseStreamHitRecord, "targetType" | "targetId" | "score" | "pathRole">;
+type PulseHitListRecord = Pick<PulseStreamHitRecord, "label" | "reason" | "rationale" | "observation" | "excerpt" | "pathRole" | "score">;
+type DemandRecordEventPayload = {
+  record?: EvidenceRecord;
+  recordSpec?: DemandAnswerPlan["requiredRecords"][number];
+  sourceItem?: {
+    id: string;
+    title: string;
+    summary: string;
+    sourceNodeId?: string;
+    sourceAspectId?: string;
+    sourceItemId?: string;
+    chunkIds?: string[];
+  };
+  chunks?: Array<{ id: string; label: string; excerpt: string }>;
+};
+type DemandPlanEventPayload = { plan?: DemandAnswerPlan };
+type DemandOperationEventPayload = { operationResult?: DemandOperationResult };
 type SearchFocus = { matchIds: ReadonlySet<string>; activeId?: string };
 type PulsePlaybackStep =
   | { kind: "hit"; hit: PulseHitRecord }
@@ -516,6 +538,165 @@ function pulseHitKey(hit: Pick<PulseHitRecord, "targetType" | "targetId">): stri
   return `${hit.targetType}:${hit.targetId}`;
 }
 
+function isPulseProcessEvent(event: PulseStreamEvent): event is PulseProcessEvent {
+  return event.type !== "error" && "message" in event && typeof event.message === "string";
+}
+
+function pulseProcessTitle(type: PulseProcessEvent["type"]): string {
+  switch (type) {
+    case "stage": return "阶段";
+    case "demand_plan_generated": return "生成 Demand Plan";
+    case "demand_records_started": return "开始抽取 Evidence Records";
+    case "demand_record_extracted": return "抽取 Evidence Record";
+    case "demand_operations_finished": return "执行 Operations";
+    case "demand_answer_synthesized": return "合成答案";
+    case "skill_route_generated": return "选择回答路径";
+    case "skill_execution_started": return "执行回答路径";
+    case "facet_table_build_started": return "构建事实表";
+    case "facet_row_extracted": return "抽取事实行";
+    case "facet_table_build_finished": return "完成事实表";
+    case "facet_operation_planned": return "规划操作";
+    case "facet_filter_applied": return "应用过滤";
+    case "facet_dedupe_finished": return "完成去重";
+    case "skill_answer_synthesized": return "合成回答";
+    case "aori_traversal_started": return "启动 AORI 遍历";
+    case "bfs_layer_started": return "扫描 BFS 层";
+    case "bfs_node_decision": return "判断节点";
+    case "bfs_node_expanded": return "展开节点";
+    case "bfs_chunk_collected": return "收集证据";
+    case "bfs_layer_finished": return "完成 BFS 层";
+    case "dfs_node_entered": return "进入节点";
+    case "dfs_candidate_selected": return "选择候选";
+    case "dfs_chunk_found": return "找到证据";
+    case "dfs_backtrack": return "回退";
+    case "chunk_summary_started": return "读取片段";
+    case "chunk_summary_finished": return "完成片段摘要";
+    case "final_answer_started": return "开始最终回答";
+    case "final_answer_finished": return "完成最终回答";
+    default: return type.replaceAll("_", " ");
+  }
+}
+
+function compactText(value: string, max = 140): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 1)).trimEnd()}...` : normalized;
+}
+
+function valuePreview(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "未抽到";
+  if (Array.isArray(value)) return value.map(valuePreview).filter(Boolean).join("、");
+  if (typeof value === "object") return compactText(JSON.stringify(value), 120);
+  return compactText(String(value), 120);
+}
+
+function payloadOf<T>(event: PulseProcessEvent): T | undefined {
+  return "payload" in event && event.payload && typeof event.payload === "object"
+    ? event.payload as T
+    : undefined;
+}
+
+function DemandPlanDetails({ event }: { event: PulseProcessEvent }): ReactNode {
+  const plan = payloadOf<DemandPlanEventPayload>(event)?.plan;
+  if (!plan) return null;
+  return (
+    <div className="pulse-process-detail">
+      <small>回答目标：{compactText(plan.answerGoal, 150)}</small>
+      <small>相关范围：{compactText(plan.targetScope.reason, 150)}</small>
+      <small>需要材料：{plan.requiredRecords.map((record) => `${record.recordName}(${record.coverage})`).join(" / ")}</small>
+      <small>需要字段：{plan.requiredRecords.flatMap((record) => record.fields.map((field) => field.name)).slice(0, 8).join("、")}</small>
+      <small>相关判断：{compactText(plan.reason, 180)}</small>
+    </div>
+  );
+}
+
+function DemandRecordDetails({ event }: { event: PulseProcessEvent }): ReactNode {
+  const payload = payloadOf<DemandRecordEventPayload>(event);
+  const record = payload?.record;
+  if (!record) return null;
+  const fields = Object.entries(record.fields).slice(0, 6);
+  const chunks = payload?.chunks ?? [];
+  return (
+    <div className="pulse-process-detail">
+      <small>看到来源：{payload?.sourceItem?.title ?? record.sourceItemId ?? record.sourceNodeId ?? record.recordName}</small>
+      {payload?.recordSpec && <small>认为相关：需要抽取 {payload.recordSpec.fields.map((field) => field.name).join("、")}；覆盖要求 {payload.recordSpec.coverage}</small>}
+      {fields.map(([name, field]) => (
+        <small key={name}>
+          {name}：{valuePreview(field.value)}
+          {typeof field.confidence === "number" ? ` · 置信 ${field.confidence.toFixed(2)}` : ""}
+          {field.quote ? ` · 引文「${compactText(field.quote, 120)}」` : ""}
+          {field.uncertainty ? ` · 不确定：${compactText(field.uncertainty, 90)}` : ""}
+        </small>
+      ))}
+      {chunks.slice(0, 3).map((chunk) => (
+        <small key={chunk.id}>原文片段：{chunk.label} · {compactText(chunk.excerpt, 130)}</small>
+      ))}
+    </div>
+  );
+}
+
+function DemandOperationDetails({ event }: { event: PulseProcessEvent }): ReactNode {
+  const operationResult = payloadOf<DemandOperationEventPayload>(event)?.operationResult;
+  if (!operationResult) return null;
+  return (
+    <div className="pulse-process-detail">
+      <small>处理状态：{operationResult.status}</small>
+      {operationResult.operationResults.slice(0, 4).map((operation) => (
+        <small key={operation.outputName}>
+          {operation.outputName}：included {operation.includedRecordIds.length}
+          {" · "}excluded {operation.excludedRecordIds.length}
+          {" · "}uncertain {operation.uncertainRecordIds.length}
+          {operation.warnings.length ? ` · ${operation.warnings.slice(0, 2).join("；")}` : ""}
+        </small>
+      ))}
+      {operationResult.answerFacts.slice(0, 3).map((fact, index) => (
+        <small key={`${fact.text}-${index}`}>可回答事实：{compactText(fact.text, 150)}</small>
+      ))}
+      {operationResult.warnings.slice(0, 3).map((warning, index) => (
+        <small key={`${warning}-${index}`}>警告：{compactText(warning, 130)}</small>
+      ))}
+    </div>
+  );
+}
+
+function PulseProcessDetails({ event }: { event: PulseProcessEvent }): ReactNode {
+  if (event.type === "demand_plan_generated") return <DemandPlanDetails event={event} />;
+  if (event.type === "demand_record_extracted") return <DemandRecordDetails event={event} />;
+  if (event.type === "demand_operations_finished") return <DemandOperationDetails event={event} />;
+  return null;
+}
+
+function PulseProcessLog({ events, limit = 8 }: { events: PulseProcessEvent[]; limit?: number }): ReactNode {
+  if (events.length === 0) return null;
+  return (
+    <div className="pulse-navigation-log pulse-process-log">
+      <strong>思考过程</strong>
+      {events.slice(-limit).map((event, index) => (
+        <div
+          className={`pulse-navigation-event pulse-process-${event.type.replaceAll("_", "-")}`}
+          key={`${event.type}-${index}-${event.message}`}
+        >
+          <span>{pulseProcessTitle(event.type)}</span>
+          <small>{event.message}</small>
+          <PulseProcessDetails event={event} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PulseHitContent({ hit }: { hit: PulseHitListRecord }): ReactNode {
+  return (
+    <>
+      <strong>{hit.label}</strong>
+      <span>相关理由：{pulseHitReason(hit)}</span>
+      {hit.observation && <small>看到的信息：{compactText(hit.observation, 140)}</small>}
+      {hit.rationale && hit.rationale !== pulseHitReason(hit) && <small>判断依据：{compactText(hit.rationale, 150)}</small>}
+      {hit.excerpt && <small>证据摘录：{compactText(hit.excerpt, 150)}</small>}
+      <small>{hit.pathRole} · {hit.score.toFixed(2)}</small>
+    </>
+  );
+}
+
 function graphNodePulseKey(record: GraphNode): string {
   return `${record.nodeType === "abstract" ? "node" : "chunk"}:${record.id}`;
 }
@@ -957,7 +1138,44 @@ function aoriNodeMeta(record: AoriGraphNode): string {
   ].filter(Boolean).slice(0, 5).join(" · ");
 }
 
-function aoriNodeClass(record: AoriGraphNode, collapsedNodeIds: ReadonlySet<string>, selectedNodeId?: string): string {
+function uniquePulseKeys(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value)))];
+}
+
+function aoriNodePulseKeys(record: AoriGraphNode): string[] {
+  return uniquePulseKeys([
+    `node:${record.id}`,
+    record.itemId ? `node:item:${record.itemId}` : undefined,
+    record.chunkId ? `chunk:${record.chunkId}` : undefined,
+    record.relationId ? `node:relation:${record.relationId}` : undefined,
+    record.assertionId ? `relation:${record.assertionId}` : undefined,
+    record.documentId ? `node:document:${record.documentId}` : undefined,
+  ]);
+}
+
+function aoriEdgePulseKeys(record: AoriGraphEdge): string[] {
+  return uniquePulseKeys([
+    `relation:${record.id}`,
+    ...((record.assertionIds ?? []).map((id) => `relation:${id}`)),
+  ]);
+}
+
+function pulseHitForKeys(keys: string[], hitByKey: ReadonlyMap<string, PulseDisplayHit>): PulseDisplayHit | undefined {
+  for (const key of keys) {
+    const hit = hitByKey.get(key);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+function aoriNodeClass(
+  record: AoriGraphNode,
+  collapsedNodeIds: ReadonlySet<string>,
+  selectedNodeId?: string,
+  pulseHit?: PulseDisplayHit,
+  activePulseKey?: string,
+): string {
+  const pulseKeys = aoriNodePulseKeys(record);
   return [
     "flow-aori",
     `flow-aori-${record.type.replaceAll("_", "-")}`,
@@ -966,6 +1184,8 @@ function aoriNodeClass(record: AoriGraphNode, collapsedNodeIds: ReadonlySet<stri
     record.fallbackOnly ? "flow-aori-fallback-only" : "",
     collapsedNodeIds.has(record.id) ? "flow-aori-collapsed" : "",
     selectedNodeId === record.id ? "flow-aori-selected" : "",
+    pulseHit ? `flow-pulse-${pulseHit.pathRole}` : "",
+    activePulseKey && pulseKeys.includes(activePulseKey) ? "flow-pulse-active" : "",
   ].filter(Boolean).join(" ");
 }
 
@@ -1013,12 +1233,19 @@ function aoriVisibleNodes(graph: AoriGraphView, viewMode: AoriGraphViewMode, sel
   );
 }
 
-function aoriVisualNodes(graph: AoriGraphView, requestedViewMode?: AoriGraphViewMode, selectedNodeId?: string): VisualNode[] {
+function aoriVisualNodes(
+  graph: AoriGraphView,
+  requestedViewMode?: AoriGraphViewMode,
+  selectedNodeId?: string,
+  pulseHits: PulseDisplayHit[] = [],
+): VisualNode[] {
   const viewMode = requestedViewMode ?? graph.layoutHints.viewMode ?? (graph.layoutHints.mode === "overview" ? "layer" : "layer");
   const collapsedNodeIds = new Set(graph.layoutHints.collapsedNodeIds);
   const visibleNodes = aoriVisibleNodes(graph, viewMode, selectedNodeId);
   const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
   const visibleEdges = graph.edges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target));
+  const hitByKey = new Map(pulseHits.map((hit) => [pulseHitKey(hit), hit]));
+  const activeKey = pulseHits.at(-1) ? pulseHitKey(pulseHits.at(-1)!) : "";
   const positions = new Map<string, { x: number; y: number }>();
   const center = visibleNodes.find((node) => node.id === graph.layoutHints.centerNodeId) ?? visibleNodes[0] ?? graph.centerNode;
 
@@ -1119,6 +1346,7 @@ function aoriVisualNodes(graph: AoriGraphView, requestedViewMode?: AoriGraphView
   return visibleNodes.map((record) => {
     const point = positions.get(record.id) ?? { x: 0, y: 0 };
     const meta = aoriNodeMeta(record);
+    const pulseHit = pulseHitForKeys(aoriNodePulseKeys(record), hitByKey);
     return {
       id: record.id,
       position: point,
@@ -1133,7 +1361,7 @@ function aoriVisualNodes(graph: AoriGraphView, requestedViewMode?: AoriGraphView
           </div>
         ),
       },
-      className: aoriNodeClass(record, collapsedNodeIds, selectedNodeId),
+      className: aoriNodeClass(record, collapsedNodeIds, selectedNodeId, pulseHit, activeKey),
       style: {
         width: aoriNodeWidth(record),
         minHeight: record.type === "source_chunk" ? 58 : 72,
@@ -1152,17 +1380,45 @@ function aoriEdgeColor(record: AoriGraphEdge): string {
   return "#56c7b0";
 }
 
-function displayAoriEdges(graph: AoriGraphView, requestedViewMode?: AoriGraphViewMode, selectedNodeId?: string, selectedEdgeId?: string): VisualEdge[] {
+function pulseRoleColor(role: PulseDisplayHit["pathRole"]): string {
+  if (role === "direct") return "#f8d26a";
+  if (role === "bridge") return "#c6a2ff";
+  return "#7db8ff";
+}
+
+function displayAoriEdges(
+  graph: AoriGraphView,
+  requestedViewMode?: AoriGraphViewMode,
+  selectedNodeId?: string,
+  selectedEdgeId?: string,
+  pulseHits: PulseDisplayHit[] = [],
+): VisualEdge[] {
   const viewMode = requestedViewMode ?? graph.layoutHints.viewMode ?? (graph.layoutHints.mode === "overview" ? "layer" : "layer");
   const visibleNodeIds = new Set(aoriVisibleNodes(graph, viewMode, selectedNodeId).map((node) => node.id));
+  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
+  const hitByKey = new Map(pulseHits.map((hit) => [pulseHitKey(hit), hit]));
+  const activeHit = pulseHits.at(-1);
+  const activeKey = activeHit ? pulseHitKey(activeHit) : "";
+  const nodeHasHit = (nodeId: string) => {
+    const node = nodeById.get(nodeId);
+    return node ? Boolean(pulseHitForKeys(aoriNodePulseKeys(node), hitByKey)) : hitByKey.has(`node:${nodeId}`);
+  };
   return graph.edges.filter((record) => visibleNodeIds.has(record.source) && visibleNodeIds.has(record.target)).map((record) => {
     const warning = record.type === "warning" || record.evidenceStatus === "unsupported" || record.closureStatus === "open";
     const selected = selectedEdgeId === record.id;
+    const edgeHit = pulseHitForKeys(aoriEdgePulseKeys(record), hitByKey);
+    const endpointHit = !edgeHit && nodeHasHit(record.source) && nodeHasHit(record.target);
+    const targetChunkId = nodeById.get(record.target)?.chunkId;
+    const active = Boolean(edgeHit && aoriEdgePulseKeys(record).includes(activeKey)) ||
+      (endpointHit && (activeKey === `node:${record.source}` || activeKey === `node:${record.target}` || activeKey === `chunk:${targetChunkId ?? ""}`));
+    const pulseColor = edgeHit ? pulseRoleColor(edgeHit.pathRole) : endpointHit ? pulseRoleColor("expanded") : undefined;
     const edge: VisualEdge = {
       id: record.id,
       source: record.source,
       target: record.target,
-      type: viewMode === "network" || graph.layoutHints.mode === "overview" ? "default" : "smoothstep",
+      type: active
+        ? viewMode === "network" || graph.layoutHints.mode === "overview" ? "pulseBezier" : "pulseSmoothStep"
+        : viewMode === "network" || graph.layoutHints.mode === "overview" ? "default" : "smoothstep",
       data: { aori: record },
       label: record.domainRelation || record.label,
       animated: warning,
@@ -1170,12 +1426,14 @@ function displayAoriEdges(graph: AoriGraphView, requestedViewMode?: AoriGraphVie
         "flow-aori-edge",
         `flow-aori-edge-${record.type.replaceAll("_", "-")}`,
         selected ? "flow-aori-edge-selected" : "",
+        active ? "flow-pulse-active-edge" : "",
       ].filter(Boolean).join(" "),
       style: {
-        stroke: aoriEdgeColor(record),
-        strokeWidth: selected ? 4.2 : record.type === "relates" || record.type === "aggregate_relation" ? 2.8 : record.type === "evidence" ? 1.5 : 2.2,
+        stroke: pulseColor ?? aoriEdgeColor(record),
+        strokeWidth: active ? 4.8 : edgeHit || endpointHit ? 3.3 : selected ? 4.2 : record.type === "relates" || record.type === "aggregate_relation" ? 2.8 : record.type === "evidence" ? 1.5 : 2.2,
         opacity: selected ? 1 : record.type === "evidence" ? 0.72 : 0.95,
         ...(warning || record.type === "evidence" ? { strokeDasharray: "5 4" } : {}),
+        ...(active ? { filter: "drop-shadow(0 0 7px #f8d26a)" } : {}),
       },
       labelStyle: { fill: "#c7d4e7", fontSize: 12, fontWeight: 700 },
     };
@@ -1256,6 +1514,7 @@ export function GraphWorkspace({
   const [pulseStreamMessage, setPulseStreamMessage] = useState("");
   const [pulseStreamHits, setPulseStreamHits] = useState<PulseStreamHitRecord[]>([]);
   const [pulseNavigationEvents, setPulseNavigationEvents] = useState<PulseNavigationEvent[]>([]);
+  const [pulseProcessEvents, setPulseProcessEvents] = useState<PulseProcessEvent[]>([]);
   const [pulseDraftAnswer, setPulseDraftAnswer] = useState("");
   const [documentTree, setDocumentTree] = useState<DocumentTreeNode[]>([]);
   const [documentTreeLoading, setDocumentTreeLoading] = useState(false);
@@ -1299,6 +1558,14 @@ export function GraphWorkspace({
   const revealedPulseTargets = useMemo(
     () => new Set(currentPulsePlaybackSteps.slice(0, pulseRevealCount).flatMap((step) => step.kind === "hit" ? [pulseHitKey(step.hit)] : [])),
     [currentPulsePlaybackSteps, pulseRevealCount],
+  );
+  const currentAoriPulseHits = useMemo(
+    () => currentPulsePlaybackSteps.slice(0, pulseRevealCount).flatMap((step) => step.kind === "hit" ? [step.hit] : []),
+    [currentPulsePlaybackSteps, pulseRevealCount],
+  );
+  const aoriPulseHits = useMemo<PulseDisplayHit[]>(
+    () => visibleCurrentPulse && pulseMode === "current" ? currentAoriPulseHits : pulsing ? pulseStreamHits : [],
+    [currentAoriPulseHits, pulseMode, pulseStreamHits, pulsing, visibleCurrentPulse],
   );
   const searchFocus = useMemo(() => searchFocusFrom(results, activeSearchChunkId), [results, activeSearchChunkId]);
 
@@ -1465,9 +1732,9 @@ export function GraphWorkspace({
 
   useEffect(() => {
     if (!isAoriMode || !aoriGraph) return;
-    setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
-    setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
-  }, [isAoriMode, aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id]);
+    setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id, aoriPulseHits));
+    setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id, aoriPulseHits));
+  }, [isAoriMode, aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id, aoriPulseHits]);
 
   useEffect(() => {
     if (viewMode !== "document" || documentTree.length > 0 || documentTreeLoading) return;
@@ -1500,6 +1767,7 @@ export function GraphWorkspace({
     setPulseStreamMessage("");
     setPulseStreamHits([]);
     setPulseNavigationEvents([]);
+    setPulseProcessEvents([]);
     setPulseDraftAnswer("");
     setViewMode("graph");
     setDocumentTree([]);
@@ -1616,6 +1884,7 @@ export function GraphWorkspace({
     setPulseStreamMessage("正在启动脉冲...");
     setPulseStreamHits([]);
     setPulseNavigationEvents([]);
+    setPulseProcessEvents([]);
     setPulseDraftAnswer("");
     try {
       await api.streamPulse(requestLibraryId, question, pulseInputMode, (update) => {
@@ -1624,38 +1893,9 @@ export function GraphWorkspace({
           setPulseStreamMessage(update.mode === "progressive" ? "正在渐进式点亮图谱..." : "正在全量召回图谱...");
           return;
         }
-        if (update.type === "stage") {
+        if (isPulseProcessEvent(update)) {
           setPulseStreamMessage(update.message);
-          return;
-        }
-        if (
-          update.type === "library_route_started" ||
-          update.type === "document_selected" ||
-          update.type === "question_task_generated" ||
-          update.type === "aspect_selected" ||
-          update.type === "library_relation_selected" ||
-          update.type === "assertion_selected" ||
-          update.type === "aori_evidence_bound" ||
-          update.type === "fallback_retrieval_started" ||
-          update.type === "evidence_table_built" ||
-          update.type === "closure_checked" ||
-          update.type === "answer_synthesized" ||
-          update.type === "aori_traversal_started" ||
-          update.type === "bfs_layer_started" ||
-          update.type === "bfs_node_decision" ||
-          update.type === "bfs_node_expanded" ||
-          update.type === "bfs_chunk_collected" ||
-          update.type === "bfs_layer_finished" ||
-          update.type === "dfs_node_entered" ||
-          update.type === "dfs_candidate_selected" ||
-          update.type === "dfs_chunk_found" ||
-          update.type === "dfs_backtrack" ||
-          update.type === "chunk_summary_started" ||
-          update.type === "chunk_summary_finished" ||
-          update.type === "final_answer_started" ||
-          update.type === "final_answer_finished"
-        ) {
-          setPulseStreamMessage(update.message);
+          setPulseProcessEvents((events) => [...events, update].slice(-32));
           return;
         }
         if (update.type === "hit") {
@@ -1725,6 +1965,7 @@ export function GraphWorkspace({
       setPulseStreamMessage("");
       setPulseStreamHits([]);
       setPulseNavigationEvents([]);
+      setPulseProcessEvents([]);
       setPulseDraftAnswer("");
       return;
     }
@@ -1736,6 +1977,7 @@ export function GraphWorkspace({
       setPulseStreamMessage("");
       setPulseStreamHits([]);
       setPulseNavigationEvents([]);
+      setPulseProcessEvents([]);
       setPulseDraftAnswer("");
       setPulseQuestion(response.pulse.question);
       setPulseInputMode(response.pulse.inputMode);
@@ -1766,6 +2008,7 @@ export function GraphWorkspace({
       setPulseMode("normal");
       setPulseRevealCount(0);
       setPulsePlaying(false);
+      setPulseProcessEvents([]);
       if (isAoriMode) {
         if (aoriGraph) {
           setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
@@ -2219,6 +2462,7 @@ export function GraphWorkspace({
                 <span className="pulse-live-dot" />
                 <span>{pulseStreamMessage || "正在等待首个脉冲事件..."}</span>
               </div>
+              <PulseProcessLog events={pulseProcessEvents} />
               {pulseNavigationEvents.length > 0 && (
                 <div className="pulse-navigation-log">
                   <strong>模型导航过程</strong>
@@ -2264,9 +2508,7 @@ export function GraphWorkspace({
               <div className="pulse-hits pulse-stream-hits">
                 {pulseStreamHits.slice(-10).reverse().map((hit) => (
                   <button type="button" key={pulseHitKey(hit)} disabled>
-                    <strong>{hit.label}</strong>
-                    <span>{pulseHitReason(hit)}</span>
-                    <small>{hit.pathRole} · {hit.score.toFixed(2)}</small>
+                    <PulseHitContent hit={hit} />
                   </button>
                 ))}
               </div>
@@ -2284,6 +2526,7 @@ export function GraphWorkspace({
               <p className="pulse-question">{visibleCurrentPulse.pulse.question}</p>
               <p>{visibleCurrentPulse.pulse.answer}</p>
               <small>{visibleCurrentPulse.pulse.summary}</small>
+              <PulseProcessLog events={pulseProcessEvents} limit={10} />
               {pulseMode === "current" && (
                 <div className="pulse-playback">
                   <span>
@@ -2348,9 +2591,7 @@ export function GraphWorkspace({
                     key={hit.id}
                     onClick={() => openPulseHit(hit)}
                   >
-                    <strong>{hit.label}</strong>
-                    <span>{pulseHitReason(hit)}</span>
-                    <small>{hit.pathRole} · {hit.score.toFixed(2)}</small>
+                    <PulseHitContent hit={hit} />
                   </button>
                 ))}
               </div>

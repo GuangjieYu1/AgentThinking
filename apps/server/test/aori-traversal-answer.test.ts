@@ -585,12 +585,26 @@ describe("AORI traversal answering", () => {
       }],
     });
 
+    const streamTargets: string[] = [];
+    const recordPayloads: unknown[] = [];
     const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new FakeModelProvider()).create(
       library.id,
       "总共多少人行贿？列出所有人或单位的名字",
+      "full",
+      (event) => {
+        if (event.type === "hit") streamTargets.push(`${event.hit.targetType}:${event.hit.targetId}`);
+        if (event.type === "demand_record_extracted") recordPayloads.push(event.payload);
+      },
     );
 
     expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
+    expect(streamTargets.some((target) => target.startsWith("node:item:"))).toBe(true);
+    expect(recordPayloads).toHaveLength(5);
+    expect(recordPayloads[0]).toMatchObject({
+      sourceItem: { title: "Payment fact 1" },
+      chunks: [{ label: "fact-1" }],
+    });
+    expect(pulse.hits.filter((hit) => hit.targetType === "node")).toHaveLength(5);
     expect(pulse.pulse.answer).toContain('"count":5');
     expect(pulse.pulse.answer).toContain("SourceA");
     expect(pulse.pulse.answer).toContain("SourceE");

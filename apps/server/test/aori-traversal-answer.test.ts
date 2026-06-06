@@ -41,6 +41,18 @@ class TraversalTestModel extends FakeModelProvider {
     throw new Error("legacy progressive navigation should not run when AORI traversal is available");
   }
 
+  override async routeAoriSkill() {
+    return {
+      skill: "normal_traversal" as const,
+      targetAspects: [],
+      requiredFields: [],
+      operationPlan: "test traversal fallback",
+      confidence: 0.9,
+      reason: "Traversal test fixture forces normal traversal.",
+      ambiguity: [],
+    };
+  }
+
   override async decideAoriBfsExpansion(input: BfsExpansionInput): Promise<BfsExpansionDecision> {
     this.bfsInputs.push(input);
     return {
@@ -100,6 +112,24 @@ class TraversalTestModel extends FakeModelProvider {
   }
 }
 
+class SkillCountTestModel extends FakeModelProvider {
+  override async decideAoriBfsExpansion(): Promise<never> {
+    throw new Error("BFS traversal should not run for facet_count");
+  }
+
+  override async chooseAoriDfsNext(): Promise<never> {
+    throw new Error("DFS traversal should not run for facet_count");
+  }
+
+  override async summarizeChunkForQuestion(): Promise<never> {
+    throw new Error("Chunk summary traversal synthesis should not run for facet_count");
+  }
+
+  override async synthesizeAnswerFromChunks(): Promise<never> {
+    throw new Error("Traversal final synthesis should not run for facet_count");
+  }
+}
+
 function saveAoriIndex(db: AgentDatabase, input: {
   libraryId: string;
   documentName: string;
@@ -144,6 +174,198 @@ afterEach(async () => {
 });
 
 describe("AORI traversal answering", () => {
+  it("routes count questions to facet_count without traversal chunk limits", async () => {
+    const db = await database();
+    const library = db.createLibrary("Skill Count AORI");
+    const version = db.createDocumentVersion(library.id, "skill-count.md", "text/markdown", "hash", "skill-count.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "fact-1", pageNumber: null, startChar: 0, endChar: 20, text: "source: SourceA; person: Alice; time: 2005; evidence: Alice paid Huang." },
+      { ordinal: 1, headingPath: "fact-2", pageNumber: null, startChar: 21, endChar: 45, text: "source: SourceB; person: Bob; time: 2005; evidence: Bob paid Huang." },
+      { ordinal: 2, headingPath: "fact-3", pageNumber: null, startChar: 46, endChar: 70, text: "source: SourceC; person: Charlie; time: 2010; evidence: Charlie paid Huang." },
+      { ordinal: 3, headingPath: "fact-4", pageNumber: null, startChar: 71, endChar: 95, text: "source: SourceD; person: Dana; time: 2004-2006; evidence: Dana paid Huang." },
+      { ordinal: 4, headingPath: "fact-5", pageNumber: null, startChar: 96, endChar: 120, text: "source: SourceE; person: Eve; evidence: Eve paid Huang but time is unclear." },
+    ]);
+    saveAoriIndex(db, {
+      libraryId: library.id,
+      documentName: "skill-count.md",
+      versionId: version.id,
+      documentId: version.documentId,
+      chunks,
+      summary: "AORI map summary is not final evidence.",
+      centralQuestion: "How many people paid Huang in 2005?",
+      aspects: [{
+        kind: "finding",
+        domainKind: "bribery_facts",
+        title: "Huang bribery fact series",
+        summary: "Five item fixture for count routing.",
+        centralQuestion: "Who paid Huang and when?",
+        classificationRationale: "test",
+        confidence: 0.8,
+        items: chunks.map((chunk, index) => ({
+          key: `item-${index + 1}`,
+          title: `Source ${index + 1}`,
+          summary: `Source item ${index + 1}`,
+          evidenceChunkIds: [chunk.id],
+          evidenceStatus: "supported" as const,
+          closureStatus: "partial" as const,
+          classificationRationale: "test",
+          confidence: 0.8,
+        })),
+        relations: [],
+        gaps: [],
+      }],
+    });
+    const events: string[] = [];
+
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel()).create(
+      library.id,
+      "How many people paid Huang in 2005? list all people",
+      "full",
+      (event) => {
+        events.push(event.type);
+      },
+    );
+
+    expect(pulse.pulse.answer).toContain("Result count: 3");
+    expect(pulse.pulse.answer).toContain("Alice");
+    expect(pulse.pulse.answer).toContain("Bob");
+    expect(pulse.pulse.answer).toContain("Dana");
+    expect(pulse.pulse.answer).not.toContain("Charlie");
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_skill");
+    expect(pulse.evidencePack?.chunkEvidencePack).toBeUndefined();
+    const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
+    expect(diagnostics.answerPipeline).toBe("aori_skill");
+    expect(diagnostics.selectedSkill).toBe("facet_count");
+    expect(diagnostics.skillRouteFallback).toBe(true);
+    expect((diagnostics.facetFactTable as { rows: unknown[] }).rows).toHaveLength(5);
+    expect(events).toEqual(expect.arrayContaining([
+      "skill_route_generated",
+      "skill_execution_started",
+      "facet_table_build_started",
+      "facet_row_extracted",
+      "facet_dedupe_finished",
+      "skill_answer_synthesized",
+    ]));
+    expect(events).not.toContain("bfs_node_decision");
+    db.close();
+  });
+
+  it("routes argument questions to argument_response without traversal", async () => {
+    const db = await database();
+    const library = db.createLibrary("Argument Skill AORI");
+    const version = db.createDocumentVersion(library.id, "argument.md", "text/markdown", "hash", "argument.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "argument-1", pageNumber: null, startChar: 0, endChar: 20, text: "argument: payment was a loan; response: court rejected the defense; finding: payment was a bribe; status: not_accepted; evidence: court explains why." },
+      { ordinal: 1, headingPath: "argument-2", pageNumber: null, startChar: 21, endChar: 45, text: "argument: amount was overstated; response: court accepted part of it; finding: amount reduced; status: partially_accepted; evidence: court recalculated." },
+    ]);
+    saveAoriIndex(db, {
+      libraryId: library.id,
+      documentName: "argument.md",
+      versionId: version.id,
+      documentId: version.documentId,
+      chunks,
+      summary: "Argument fixture.",
+      centralQuestion: "Was the defense argument accepted?",
+      aspects: [{
+        kind: "argument",
+        domainKind: "defense_response",
+        title: "Defense arguments and court responses",
+        summary: "Two argument-response items.",
+        centralQuestion: "How did the court respond?",
+        classificationRationale: "test",
+        confidence: 0.8,
+        items: chunks.map((chunk, index) => ({
+          key: `argument-${index + 1}`,
+          title: `Argument ${index + 1}`,
+          summary: `Argument item ${index + 1}`,
+          evidenceChunkIds: [chunk.id],
+          evidenceStatus: "supported" as const,
+          closureStatus: "partial" as const,
+          classificationRationale: "test",
+          confidence: 0.8,
+        })),
+        relations: [],
+        gaps: [],
+      }],
+    });
+
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel()).create(
+      library.id,
+      "Was the defense argument accepted and how did the court respond?",
+      "full",
+    );
+
+    expect(pulse.pulse.answer).toContain("payment was a loan");
+    expect(pulse.pulse.answer).toContain("court rejected the defense");
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_skill");
+    const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
+    expect(diagnostics.selectedSkill).toBe("argument_response");
+    expect((diagnostics.argumentResult as { pairs: unknown[] }).pairs).toHaveLength(2);
+    db.close();
+  });
+
+  it("routes timeline questions to timeline and filters by year", async () => {
+    const db = await database();
+    const library = db.createLibrary("Timeline Skill AORI");
+    const version = db.createDocumentVersion(library.id, "timeline.md", "text/markdown", "hash", "timeline.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "event-1", pageNumber: null, startChar: 0, endChar: 20, text: "source: SourceA; event: Alice paid Huang; time: 2005; evidence: Alice payment." },
+      { ordinal: 1, headingPath: "event-2", pageNumber: null, startChar: 21, endChar: 45, text: "source: SourceB; event: Bob paid Huang; time: 2004-2006; evidence: Bob payment range." },
+      { ordinal: 2, headingPath: "event-3", pageNumber: null, startChar: 46, endChar: 70, text: "source: SourceC; event: Charlie paid Huang; time: 2010; evidence: Charlie payment." },
+    ]);
+    saveAoriIndex(db, {
+      libraryId: library.id,
+      documentName: "timeline.md",
+      versionId: version.id,
+      documentId: version.documentId,
+      chunks,
+      summary: "Timeline fixture.",
+      centralQuestion: "Timeline of payments.",
+      aspects: [{
+        kind: "timeline",
+        domainKind: "payment_timeline",
+        title: "Payment timeline",
+        summary: "Three timeline items.",
+        centralQuestion: "When did payments happen?",
+        classificationRationale: "test",
+        confidence: 0.8,
+        items: chunks.map((chunk, index) => ({
+          key: `event-${index + 1}`,
+          title: `Event ${index + 1}`,
+          summary: `Event item ${index + 1}`,
+          evidenceChunkIds: [chunk.id],
+          evidenceStatus: "supported" as const,
+          closureStatus: "partial" as const,
+          classificationRationale: "test",
+          confidence: 0.8,
+        })),
+        relations: [],
+        gaps: [],
+      }],
+    });
+
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel()).create(
+      library.id,
+      "timeline 2005 events",
+      "full",
+    );
+
+    expect(pulse.pulse.answer).toContain("Alice paid Huang");
+    expect(pulse.pulse.answer).toContain("Bob paid Huang");
+    expect(pulse.pulse.answer).not.toContain("Charlie paid Huang [");
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_skill");
+    const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
+    expect(diagnostics.selectedSkill).toBe("timeline");
+    expect((diagnostics.timelineResult as { events: unknown[] }).events).toHaveLength(2);
+    db.close();
+  });
+
   it("uses BFS full traversal and answers from chunk text instead of AORI summaries", async () => {
     const db = await database();
     const library = db.createLibrary("BFS AORI");

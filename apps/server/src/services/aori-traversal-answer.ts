@@ -18,6 +18,8 @@ import type {
   RetrievalTrace,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
+import { buildAoriSkillRouterInput } from "./aori-skill-router.js";
+import { executeAoriSkill } from "./aori-skills/index.js";
 import type { ModelProvider } from "./models.js";
 
 type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
@@ -37,7 +39,16 @@ type TraversalEventType =
   | "chunk_summary_started"
   | "chunk_summary_finished"
   | "final_answer_started"
-  | "final_answer_finished";
+  | "final_answer_finished"
+  | "skill_route_generated"
+  | "skill_execution_started"
+  | "facet_table_build_started"
+  | "facet_row_extracted"
+  | "facet_table_build_finished"
+  | "facet_operation_planned"
+  | "facet_filter_applied"
+  | "facet_dedupe_finished"
+  | "skill_answer_synthesized";
 
 interface QueueEntry {
   node: AoriTraversalNode;
@@ -235,6 +246,8 @@ export function buildAoriTraversalMap(db: AgentDatabase, libraryId: string): Aor
         documentId: index.documentId,
         versionId: index.versionId,
         aspectId: aspect.id,
+        aspectKind: aspect.kind,
+        domainKind: aspect.domainKind,
         parentIds: [],
         childIds: [],
         relationIds: [],
@@ -254,6 +267,7 @@ export function buildAoriTraversalMap(db: AgentDatabase, libraryId: string): Aor
           documentId: index.documentId,
           versionId: index.versionId,
           aspectId: aspect.id,
+          itemId: item.id,
           parentIds: [],
           childIds: [],
           relationIds: [],
@@ -812,10 +826,49 @@ export class AoriTraversalAnswerEngine {
     const allChunkIds = uniqueStrings(Object.values(map.nodesById).flatMap((node) => node.chunkIds));
     const allChunks = this.db.getChunksByIds(allChunkIds);
     const chunksById = new Map(allChunks.map((chunk) => [chunk.id, chunk]));
+    const skillRouteInput = buildAoriSkillRouterInput(input.question, map);
+    const skillRoute = await this.model.routeAoriSkill(skillRouteInput);
+    await emitTraversal(input.eventSink, "skill_route_generated", `AORI skill route selected ${skillRoute.skill}.`, {
+      route: skillRoute,
+      skillRouteFallback: this.model.name === "fake",
+    });
+    await emitPulse(input.eventSink, { type: "stage", message: `AORI skill route: ${skillRoute.skill}` });
+    if (skillRoute.skill !== "normal_traversal") {
+      const skillResult = await executeAoriSkill({
+        libraryId: input.libraryId,
+        question: input.question,
+        map,
+        route: skillRoute,
+        chunksById,
+        model: this.model,
+        ...(input.eventSink ? { eventSink: input.eventSink } : {}),
+      });
+      const evidencePack: ChunkEvidencePack = {
+        question: input.question,
+        mode: input.mode === "progressive" ? "dfs_pulse" : "bfs_full",
+        selectedChunks: [],
+        skippedNodes: [],
+        unresolvedQuestions: [],
+        diagnostics: {
+          visitedNodeCount: 0,
+          selectedChunkCount: 0,
+          stoppedReason: "aori_skill_pipeline",
+        },
+      };
+      return {
+        evidencePack,
+        chunkSummaries: [],
+        answer: skillResult.answer,
+        chunks: skillResult.chunks,
+        hits: skillResult.hits,
+        storageEvidencePack: skillResult.evidencePack,
+      };
+    }
     await emitTraversal(input.eventSink, "aori_traversal_started", "AORI traversal started.", {
       mode: input.mode,
       documentCount: map.documentCards.length,
       nodeCount: Object.keys(map.nodesById).length,
+      reason: "Skill router selected normal_traversal",
     });
     await emitPulse(input.eventSink, { type: "stage", message: input.mode === "progressive" ? "正在 DFS 探索 AORI 路径" : "正在 BFS 遍历 AORI 地图" });
     const evidencePack = input.mode === "progressive"
@@ -865,7 +918,19 @@ export class AoriTraversalAnswerEngine {
         };
       }),
     };
-    const answer = await this.model.synthesizeAnswerFromChunks(answerInput);
+    const answerDraft = await this.model.synthesizeAnswerFromChunks(answerInput);
+    const answer = {
+      ...answerDraft,
+      diagnostics: {
+        ...answerDraft.diagnostics,
+        answerPipeline: "aori_traversal",
+        selectedSkill: "normal_traversal",
+        skillRoute,
+        targetAspects: skillRoute.targetAspects,
+        fallbackTraversalUsed: true,
+        skillRouteFallback: this.model.name === "fake",
+      },
+    } satisfies PulseAnswerOutput;
     await emitTraversal(input.eventSink, "final_answer_finished", answer.summary, {
       answer,
     });
@@ -876,6 +941,14 @@ export class AoriTraversalAnswerEngine {
       chunkSummaries,
       chunks: selectedChunks,
     });
+    storageEvidencePack.diagnostics = {
+      answerPipeline: "aori_traversal",
+      selectedSkill: "normal_traversal",
+      skillRoute,
+      reason: "Skill router selected normal_traversal",
+      fallbackTraversalUsed: true,
+      skillRouteFallback: this.model.name === "fake",
+    };
     return {
       evidencePack,
       chunkSummaries,

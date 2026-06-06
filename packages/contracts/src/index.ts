@@ -920,6 +920,9 @@ export interface AoriTraversalNode {
   documentId?: string | undefined;
   versionId?: string | undefined;
   aspectId?: string | undefined;
+  aspectKind?: AspectKind | undefined;
+  domainKind?: string | undefined;
+  itemId?: string | undefined;
   parentIds: string[];
   childIds: string[];
   relationIds: string[];
@@ -943,6 +946,160 @@ export interface AoriTraversalMap {
     summary: string;
     centralQuestion?: string | undefined;
   }>;
+}
+
+export type AoriSkillName =
+  | "facet_count"
+  | "facet_sum"
+  | "argument_response"
+  | "timeline"
+  | "normal_traversal";
+
+export interface AoriSkillRoute {
+  skill: AoriSkillName;
+  targetAspects: Array<{
+    aspectId: string;
+    title: string;
+    reason: string;
+  }>;
+  requiredFields: string[];
+  operationPlan: string;
+  confidence: number;
+  reason: string;
+  ambiguity: string[];
+}
+
+export interface AoriSkillRouterInput {
+  question: string;
+  globalSummary: string;
+  documentCards: AoriTraversalMap["documentCards"];
+  aspects: Array<{
+    aspectId: string;
+    title: string;
+    kind: string;
+    domainKind: string;
+    summary: string;
+    centralQuestion?: string | undefined;
+    itemCount: number;
+  }>;
+  relationLexicon?: Array<{
+    domainRelation: string;
+    relationFamily?: string | undefined;
+    summary?: string | undefined;
+  }> | undefined;
+  selfQuestions?: Array<{
+    question: string;
+    answer?: string | undefined;
+    status: string;
+  }> | undefined;
+}
+
+export interface FacetFieldValue {
+  value: unknown;
+  confidence: number;
+  evidenceChunkIds: string[];
+  quote?: string | undefined;
+}
+
+export interface FacetFactRow {
+  rowId: string;
+  itemId: string;
+  itemTitle: string;
+  itemSummary: string;
+  fields: Record<string, FacetFieldValue>;
+  evidenceChunkIds: string[];
+}
+
+export interface FacetFactTable {
+  aspectId: string;
+  aspectTitle: string;
+  rows: FacetFactRow[];
+}
+
+export interface FacetCountOperation {
+  countTarget: "person" | "organization" | "source_group" | "event" | "unknown";
+  filters: Array<{
+    field: string;
+    operator: "overlaps_time" | "equals" | "contains" | "exists";
+    value: string;
+  }>;
+  dedupeBy: string[];
+  countPolicy: string;
+}
+
+export interface FacetTimeFilterResult {
+  match: "include" | "exclude" | "uncertain";
+  reason: string;
+}
+
+export interface FacetCountResult {
+  countPolicy: string;
+  included: Array<{
+    key: string;
+    displayName: string;
+    type: "person" | "organization" | "source_group" | "event" | "unknown";
+    rowIds: string[];
+    evidenceChunkIds: string[];
+    quotes: string[];
+    reason: string;
+  }>;
+  excluded: Array<{
+    displayName: string;
+    rowIds: string[];
+    reason: string;
+  }>;
+  uncertain: Array<{
+    displayName: string;
+    rowIds: string[];
+    reason: string;
+  }>;
+  finalCount: number;
+}
+
+export interface FacetFactRowExtractionInput {
+  question: string;
+  aspectTitle: string;
+  requiredFields: string[];
+  item: {
+    id: string;
+    title: string;
+    summary: string;
+  };
+  chunks: Array<{
+    id: string;
+    text: string;
+  }>;
+}
+
+export interface FacetCountOperationPlanInput {
+  question: string;
+  route: AoriSkillRoute;
+  tablePreview: Array<{
+    itemTitle: string;
+    itemSummary: string;
+  }>;
+}
+
+export interface FacetTimeFilterInput {
+  question: string;
+  filterValue: string;
+  rowTimeValue: unknown;
+  rowText: string;
+}
+
+export interface FacetCountDedupeInput {
+  question: string;
+  operation: FacetCountOperation;
+  rows: FacetFactRow[];
+  timeFilterResults?: Record<string, FacetTimeFilterResult> | undefined;
+}
+
+export interface FacetCountAnswerInput {
+  question: string;
+  route: AoriSkillRoute;
+  table: FacetFactTable;
+  operation: FacetCountOperation;
+  result: FacetCountResult;
 }
 
 export interface BfsExpansionInput {
@@ -1563,7 +1720,16 @@ export type PulseStreamEvent =
       | "chunk_summary_started"
       | "chunk_summary_finished"
       | "final_answer_started"
-      | "final_answer_finished";
+      | "final_answer_finished"
+      | "skill_route_generated"
+      | "skill_execution_started"
+      | "facet_table_build_started"
+      | "facet_row_extracted"
+      | "facet_table_build_finished"
+      | "facet_operation_planned"
+      | "facet_filter_applied"
+      | "facet_dedupe_finished"
+      | "skill_answer_synthesized";
     message: string;
     payload?: unknown;
   }
@@ -1644,7 +1810,13 @@ export type PulseEvidenceTool =
   | "readRemainingChunksAfter"
   | "getDocumentOutline"
   | "getChunkEvidenceAround"
-  | "getGraphContext";
+  | "getGraphContext"
+  | "routeAoriSkill"
+  | "extractFacetFactRows"
+  | "planFacetCountOperation"
+  | "applyFacetCountFilters"
+  | "dedupeFacetCountRows"
+  | "synthesizeFacetCountAnswer";
 
 export type PulseEvidenceType = "fact" | "amount" | "date" | "entity_relation" | "claim" | "quote" | "timeline_event" | "table_value" | "other";
 
@@ -1931,7 +2103,7 @@ export interface EvidencePack {
   evidencePackSchemaVersion?: 1 | 2 | undefined;
   pipeline?: {
     indexProfile: ActiveIndexProfile;
-    packBuilder: "legacy" | "v2" | "aori_traversal";
+    packBuilder: "legacy" | "v2" | "aori_traversal" | "aori_skill";
     model: string;
     promptVersion: string;
   } | undefined;
@@ -1973,6 +2145,7 @@ export interface EvidencePack {
   gaps: PulseEvidenceGap[];
   retrievalTrace: RetrievalTrace[];
   reconciliation?: PulseEvidenceReconciliation | undefined;
+  diagnostics?: Record<string, unknown> | undefined;
 }
 
 export interface EvidenceTable {
@@ -2097,6 +2270,19 @@ export interface PulseAnswerOutput {
     retrievalSteps?: PulseEvidenceStep[] | undefined;
     citedChunkIds?: string[] | undefined;
     warnings?: string[] | undefined;
+    answerPipeline?: "aori_skill" | "aori_traversal" | undefined;
+    selectedSkill?: AoriSkillName | undefined;
+    skillRoute?: AoriSkillRoute | undefined;
+    targetAspects?: AoriSkillRoute["targetAspects"] | undefined;
+    facetFactTable?: FacetFactTable | undefined;
+    facetOperation?: unknown;
+    facetResult?: unknown;
+    argumentResult?: unknown;
+    timelineResult?: unknown;
+    structuredResult?: unknown;
+    sourceChunkIds?: string[] | undefined;
+    fallbackTraversalUsed?: boolean | undefined;
+    skillRouteFallback?: boolean | undefined;
   } | undefined;
   evidenceRows?: PulseEvidenceRow[] | undefined;
 }
@@ -2653,7 +2839,7 @@ export const pulseAnswerSchema = z.object({
     retrievalSteps: z.array(pulseEvidenceStepSchema).optional(),
     citedChunkIds: z.array(z.string()).optional(),
     warnings: z.array(z.string()).optional(),
-  }).optional(),
+  }).passthrough().optional(),
   evidenceRows: z.array(pulseEvidenceRowSchema).optional(),
 });
 export type PulseAnswerSchemaOutput = z.infer<typeof pulseAnswerSchema>;

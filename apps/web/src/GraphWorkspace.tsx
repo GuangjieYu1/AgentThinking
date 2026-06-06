@@ -2642,6 +2642,15 @@ function EvidencePackPanel({ evidencePack, onOpenChunk }: { evidencePack?: Evide
       </div>
     );
   }
+  const skillDiagnostics = evidencePack.diagnostics as {
+    answerPipeline?: string;
+    selectedSkill?: string;
+    targetAspects?: Array<{ title: string }>;
+    facetResult?: { finalCount?: number; total?: number; unit?: string };
+    argumentResult?: { pairs?: unknown[] };
+    timelineResult?: { events?: unknown[] };
+    fallbackTraversalUsed?: boolean;
+  } | undefined;
   return (
     <div className="workspace-panel evidence-pack-panel">
       <div className="pulse-panel-heading">
@@ -2664,6 +2673,18 @@ function EvidencePackPanel({ evidencePack, onOpenChunk }: { evidencePack?: Evide
           <span>{evidencePack.chunkEvidencePack.mode}</span>
           <span>{evidencePack.chunkEvidencePack.diagnostics.visitedNodeCount} visited nodes</span>
           <span>{evidencePack.chunkEvidencePack.diagnostics.selectedChunkCount} selected chunks</span>
+        </div>
+      )}
+      {skillDiagnostics?.answerPipeline && (
+        <div className="pipeline-strip">
+          <span>{skillDiagnostics.answerPipeline}</span>
+          {skillDiagnostics.selectedSkill && <span>{skillDiagnostics.selectedSkill}</span>}
+          {skillDiagnostics.targetAspects?.length ? <span>{skillDiagnostics.targetAspects.map((aspect) => aspect.title).join(" / ")}</span> : null}
+          {typeof skillDiagnostics.facetResult?.finalCount === "number" && <span>count {skillDiagnostics.facetResult.finalCount}</span>}
+          {typeof skillDiagnostics.facetResult?.total === "number" && <span>sum {skillDiagnostics.facetResult.total} {skillDiagnostics.facetResult.unit ?? ""}</span>}
+          {skillDiagnostics.argumentResult?.pairs && <span>pairs {skillDiagnostics.argumentResult.pairs.length}</span>}
+          {skillDiagnostics.timelineResult?.events && <span>events {skillDiagnostics.timelineResult.events.length}</span>}
+          {skillDiagnostics.fallbackTraversalUsed && <span>fallback traversal</span>}
         </div>
       )}
       {(evidencePack.routePlan || evidencePack.questionTaskFrame || evidencePack.evidenceTables?.length) && (

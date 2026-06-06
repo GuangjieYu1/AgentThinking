@@ -114,7 +114,7 @@ export class PulseEngine {
         ...(eventSink ? { eventSink } : {}),
       });
       await emitPulse(eventSink, { type: "answer", answer: result.answer.answer, summary: result.answer.summary });
-      await emitPulse(eventSink, { type: "stage", message: "正在保存 AORI traversal 脉冲结果" });
+      await emitPulse(eventSink, { type: "stage", message: "正在保存 AORI answer 脉冲结果" });
       const pulse = this.db.createPulse(
         libraryId,
         question,

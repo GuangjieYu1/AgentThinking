@@ -1,6 +1,8 @@
 import type {
   AbstractNodeKind,
   AoriDocumentDraft,
+  AoriSkillRoute,
+  AoriSkillRouterInput,
   BfsExpansionDecision,
   BfsExpansionInput,
   AoriIndexingStage,
@@ -14,6 +16,16 @@ import type {
   DfsStepInput,
   ExtractionOutput,
   FinalAnswerFromChunksInput,
+  FacetCountAnswerInput,
+  FacetCountDedupeInput,
+  FacetCountOperation,
+  FacetCountOperationPlanInput,
+  FacetCountResult,
+  FacetFieldValue,
+  FacetFactRow,
+  FacetFactRowExtractionInput,
+  FacetTimeFilterInput,
+  FacetTimeFilterResult,
   GraphRuleStage,
   MappingAudit,
   MappingAuditResult,
@@ -188,6 +200,10 @@ function normalizedStringArray(value: unknown): string[] {
     .filter((entry): entry is string => typeof entry === "string")
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function uniqueStrings(values: Array<string | undefined | null>): string[] {
+  return [...new Set(values.map((value) => value?.trim() ?? "").filter(Boolean))];
 }
 
 function normalizedAuditEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T | string {
@@ -439,6 +455,201 @@ function cleanChunkAnswerSummary(value: unknown, input: ChunkSummaryInput): Chun
       ? Math.max(0, Math.min(1, source.confidence))
       : 0.3,
     ...(usage ? { usage } : {}),
+  };
+}
+
+const aoriSkillNames = ["facet_count", "facet_sum", "argument_response", "timeline", "normal_traversal"] as const;
+const facetCountTargets = ["person", "organization", "source_group", "event", "unknown"] as const;
+const facetFilterOperators = ["overlaps_time", "equals", "contains", "exists"] as const;
+const facetFilterMatches = ["include", "exclude", "uncertain"] as const;
+
+function normalizedUnknownObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function normalizedNumber(value: unknown, fallback: number): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function defaultFieldsForSkill(skill: AoriSkillRoute["skill"]): string[] {
+  if (skill === "facet_count") {
+    return ["source_name", "person_names", "organization_names", "time_range", "amount", "role", "evidence"];
+  }
+  if (skill === "facet_sum") {
+    return ["amount", "currency", "converted_amount_rmb", "component_amounts", "source_name", "evidence"];
+  }
+  if (skill === "argument_response") return ["argument", "response", "finding", "status", "evidence"];
+  if (skill === "timeline") return ["event", "time_range", "source_name", "evidence"];
+  return [];
+}
+
+function cleanAoriSkillRoute(value: unknown, input: AoriSkillRouterInput): AoriSkillRoute {
+  const source = normalizedUnknownObject(value);
+  const skill = aoriSkillNames.includes(source.skill as AoriSkillRoute["skill"])
+    ? source.skill as AoriSkillRoute["skill"]
+    : "normal_traversal";
+  const allowedAspects = new Map(input.aspects.map((aspect) => [aspect.aspectId, aspect]));
+  const targetAspects = (Array.isArray(source.targetAspects) ? source.targetAspects : [])
+    .flatMap((entry): AoriSkillRoute["targetAspects"] => {
+      const target = normalizedUnknownObject(entry);
+      const aspectId = typeof target.aspectId === "string" ? target.aspectId.trim() : "";
+      const aspect = allowedAspects.get(aspectId);
+      if (!aspect) return [];
+      return [{
+        aspectId,
+        title: aspect.title,
+        reason: normalizedText(target.reason, "Model selected this AORI aspect for the requested skill.", 800),
+      }];
+    });
+  const fallbackTarget = input.aspects
+    .filter((aspect) => aspect.itemCount > 0)
+    .sort((left, right) => right.itemCount - left.itemCount)[0];
+  const finalTargets = skill === "normal_traversal"
+    ? []
+    : targetAspects.length > 0
+      ? targetAspects
+      : fallbackTarget
+        ? [{
+          aspectId: fallbackTarget.aspectId,
+          title: fallbackTarget.title,
+          reason: "Router output omitted a valid target aspect; selected the largest source-bound aspect as a guarded fallback.",
+        }]
+        : [];
+  const requiredFields = normalizedStringArray(source.requiredFields).slice(0, 16);
+  return {
+    skill,
+    targetAspects: finalTargets,
+    requiredFields: requiredFields.length > 0 ? requiredFields : defaultFieldsForSkill(skill),
+    operationPlan: normalizedText(source.operationPlan, skill === "normal_traversal" ? "Use AORI traversal fallback." : "Build a source-bound structured table before answering.", 1600),
+    confidence: safeConfidence(source.confidence),
+    reason: normalizedText(source.reason, "Model selected the AORI answering skill from the supplied map.", 1200),
+    ambiguity: normalizedStringArray(source.ambiguity).slice(0, 8),
+  };
+}
+
+function cleanFacetFieldValue(value: unknown, allowedChunkIds: Set<string>, fallbackQuote: string): FacetFieldValue {
+  const source = normalizedUnknownObject(value);
+  const evidenceChunkIds = normalizedStringArray(source.evidenceChunkIds)
+    .filter((chunkId) => allowedChunkIds.has(chunkId));
+  const quote = typeof source.quote === "string" && source.quote.trim()
+    ? truncateText(source.quote.trim(), 500)
+    : truncateText(fallbackQuote, 500);
+  return {
+    value: Object.hasOwn(source, "value") ? source.value : null,
+    confidence: safeConfidence(source.confidence),
+    evidenceChunkIds,
+    ...(quote ? { quote } : {}),
+  };
+}
+
+function cleanFacetFactRow(value: unknown, input: FacetFactRowExtractionInput): FacetFactRow {
+  const source = normalizedUnknownObject(value);
+  const allowedChunkIds = new Set(input.chunks.map((chunk) => chunk.id));
+  const fallbackQuote = input.chunks[0]?.text.slice(0, 220) ?? "";
+  const rawFields = normalizedUnknownObject(source.fields);
+  const fields: Record<string, FacetFieldValue> = {};
+  for (const field of input.requiredFields) {
+    fields[field] = cleanFacetFieldValue(rawFields[field], allowedChunkIds, fallbackQuote);
+    if (fields[field].evidenceChunkIds.length === 0 && input.chunks[0]) {
+      fields[field] = {
+        ...fields[field],
+        evidenceChunkIds: [input.chunks[0].id],
+      };
+    }
+  }
+  const rowEvidence = uniqueStrings([
+    ...normalizedStringArray(source.evidenceChunkIds).filter((chunkId) => allowedChunkIds.has(chunkId)),
+    ...Object.values(fields).flatMap((field) => field.evidenceChunkIds),
+  ]);
+  return {
+    rowId: normalizedText(source.rowId, `facet-row-${input.item.id}`, 160),
+    itemId: input.item.id,
+    itemTitle: input.item.title,
+    itemSummary: input.item.summary,
+    fields,
+    evidenceChunkIds: rowEvidence.length > 0 ? rowEvidence : input.chunks.map((chunk) => chunk.id),
+  };
+}
+
+function cleanFacetCountOperation(value: unknown): FacetCountOperation {
+  const source = normalizedUnknownObject(value);
+  const countTarget = facetCountTargets.includes(source.countTarget as FacetCountOperation["countTarget"])
+    ? source.countTarget as FacetCountOperation["countTarget"]
+    : "unknown";
+  const filters = (Array.isArray(source.filters) ? source.filters : [])
+    .slice(0, 8)
+    .flatMap((entry): FacetCountOperation["filters"] => {
+      const filter = normalizedUnknownObject(entry);
+      const field = typeof filter.field === "string" ? filter.field.trim() : "";
+      const valueText = typeof filter.value === "string" ? filter.value.trim() : "";
+      const operator = facetFilterOperators.includes(filter.operator as FacetCountOperation["filters"][number]["operator"])
+        ? filter.operator as FacetCountOperation["filters"][number]["operator"]
+        : "contains";
+      if (!field) return [];
+      return [{ field, operator, value: valueText }];
+    });
+  return {
+    countTarget,
+    filters,
+    dedupeBy: normalizedStringArray(source.dedupeBy).slice(0, 6),
+    countPolicy: normalizedText(source.countPolicy, "Count distinct source-bound rows after filters and dedupe.", 1200),
+  };
+}
+
+function cleanFacetTimeFilterResult(value: unknown): FacetTimeFilterResult {
+  const source = normalizedUnknownObject(value);
+  return {
+    match: facetFilterMatches.includes(source.match as FacetTimeFilterResult["match"])
+      ? source.match as FacetTimeFilterResult["match"]
+      : "uncertain",
+    reason: normalizedText(source.reason, "Time filter result was not explicit enough; marked uncertain.", 800),
+  };
+}
+
+function cleanFacetCountResult(value: unknown, input: FacetCountDedupeInput): FacetCountResult {
+  const source = normalizedUnknownObject(value);
+  const allowedRowIds = new Set(input.rows.map((row) => row.rowId));
+  const cleanRows = <T extends "included" | "excluded" | "uncertain">(
+    entries: unknown,
+    bucket: T,
+  ): T extends "included" ? FacetCountResult["included"] : FacetCountResult["excluded"] => {
+    const rows = Array.isArray(entries) ? entries : [];
+    return rows.slice(0, 120).flatMap((entry, index) => {
+      const row = normalizedUnknownObject(entry);
+      const rowIds = normalizedStringArray(row.rowIds).filter((rowId) => allowedRowIds.has(rowId));
+      if (rowIds.length === 0) return [];
+      const displayName = normalizedText(row.displayName, `item ${index + 1}`, 240);
+      if (bucket === "included") {
+        const type = facetCountTargets.includes(row.type as FacetCountResult["included"][number]["type"])
+          ? row.type as FacetCountResult["included"][number]["type"]
+          : input.operation.countTarget;
+        return [{
+          key: normalizedText(row.key, displayName, 240),
+          displayName,
+          type,
+          rowIds,
+          evidenceChunkIds: normalizedStringArray(row.evidenceChunkIds),
+          quotes: normalizedStringArray(row.quotes).slice(0, 8),
+          reason: normalizedText(row.reason, "Included by the facet count operation.", 800),
+        }];
+      }
+      return [{
+        displayName,
+        rowIds,
+        reason: normalizedText(row.reason, bucket === "excluded" ? "Excluded by filters." : "Kept uncertain by filters or extraction gaps.", 800),
+      }];
+    }) as T extends "included" ? FacetCountResult["included"] : FacetCountResult["excluded"];
+  };
+  const included = cleanRows(source.included, "included");
+  const excluded = cleanRows(source.excluded, "excluded");
+  const uncertain = cleanRows(source.uncertain, "uncertain");
+  return {
+    countPolicy: normalizedText(source.countPolicy, input.operation.countPolicy, 1200),
+    included,
+    excluded,
+    uncertain,
+    finalCount: Math.max(0, Math.trunc(normalizedNumber(source.finalCount, included.length))),
   };
 }
 
@@ -849,6 +1060,12 @@ export interface ModelProvider {
   }): Promise<PulseAnswerOutput>;
   answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput>;
   selectPulseNavigation(question: string, step: string, candidates: PulseNavigationCandidate[]): Promise<PulseNavigationDecision>;
+  routeAoriSkill(input: AoriSkillRouterInput): Promise<AoriSkillRoute>;
+  extractFacetFactRow(input: FacetFactRowExtractionInput): Promise<FacetFactRow>;
+  planFacetCountOperation(input: FacetCountOperationPlanInput): Promise<FacetCountOperation>;
+  evaluateTimeFilter(input: FacetTimeFilterInput): Promise<FacetTimeFilterResult>;
+  dedupeFacetCountRows(input: FacetCountDedupeInput): Promise<FacetCountResult>;
+  synthesizeFacetCountAnswer(input: FacetCountAnswerInput): Promise<PulseAnswerOutput>;
   decideAoriBfsExpansion(input: BfsExpansionInput): Promise<BfsExpansionDecision>;
   chooseAoriDfsNext(input: DfsStepInput): Promise<DfsStepDecision>;
   summarizeChunkForQuestion(input: ChunkSummaryInput): Promise<ChunkAnswerSummary>;
@@ -1259,6 +1476,218 @@ export class FakeModelProvider implements ModelProvider {
       rationale: selected.length > 0
         ? `选择 ${selected.map((candidate) => candidate.label).join("、")}，因为它们与问题词或候选分数更接近。`
         : "没有足够候选可继续展开。",
+    };
+  }
+
+  async routeAoriSkill(input: AoriSkillRouterInput): Promise<AoriSkillRoute> {
+    const question = input.question.normalize("NFKC").toLowerCase();
+    const hasCountIntent = /how many|count|list|total|all|\u591a\u5c11|\u51e0|\u5171\u6709|\u603b\u5171|\u5217\u51fa/.test(question);
+    const hasCountObject = /person|people|unit|organization|source|event|\u4eba|\u5355\u4f4d|\u6765\u6e90|\u8d77|\u4ef6|\u540d\u5355/.test(question);
+    const hasSumIntent = /sum|amount|money|total amount|\u52a0\u8d77\u6765|\u591a\u5c11\u94b1|\u603b\u989d|\u5408\u8ba1|\u91d1\u989d/.test(question);
+    const hasArgumentIntent = /defense|argument|response|court|\u8fa9\u62a4|\u610f\u89c1|\u91c7\u7eb3|\u6cd5\u9662|\u56de\u5e94|\u4e0a\u8bc9/.test(question);
+    const hasTimelineIntent = /timeline|chronology|\u65f6\u95f4\u7ebf|\u6309\u65f6\u95f4|\u67d0\u5e74|\u54ea\u4e9b\u4e8b/.test(question);
+    const skill: AoriSkillRoute["skill"] = hasCountIntent && hasCountObject
+      ? "facet_count"
+      : hasSumIntent
+        ? "facet_sum"
+        : hasArgumentIntent
+          ? "argument_response"
+          : hasTimelineIntent
+            ? "timeline"
+            : "normal_traversal";
+    const target = input.aspects
+      .filter((aspect) => aspect.itemCount > 0)
+      .sort((left, right) => right.itemCount - left.itemCount)[0];
+    return {
+      skill,
+      targetAspects: skill === "normal_traversal" || !target
+        ? []
+        : [{
+          aspectId: target.aspectId,
+          title: target.title,
+          reason: "Fake provider fallback selected the largest source-bound aspect for this structured skill.",
+        }],
+      requiredFields: defaultFieldsForSkill(skill),
+      operationPlan: skill === "normal_traversal"
+        ? "Use normal AORI traversal fallback."
+        : "Build a source-bound facet fact table, then run filters and dedupe before answering.",
+      confidence: skill === "normal_traversal" ? 0.55 : 0.72,
+      reason: "Fake provider rule fallback selected a skill for local tests.",
+      ambiguity: [],
+    };
+  }
+
+  async extractFacetFactRow(input: FacetFactRowExtractionInput): Promise<FacetFactRow> {
+    const text = input.chunks.map((chunk) => chunk.text).join("\n\n");
+    const quote = text.replace(/\s+/g, " ").trim().slice(0, 220);
+    const chunkIds = input.chunks.map((chunk) => chunk.id);
+    const readLabel = (labels: string[]): string | undefined => {
+      for (const label of labels) {
+        const match = text.match(new RegExp(`${label}\\s*[:=]\\s*([^;\\n]+)`, "i"));
+        if (match?.[1]?.trim()) return match[1].trim();
+      }
+      return undefined;
+    };
+    const listValue = (labels: string[]): string[] => {
+      const raw = readLabel(labels);
+      if (!raw) return [];
+      return raw.split(/[\u3001\uff0c,;；\s]+/u).map((entry) => entry.trim()).filter(Boolean);
+    };
+    const fieldValue = (field: string): unknown => {
+      if (field === "source_name") return readLabel(["source", "source_name"]) ?? input.item.title;
+      if (field === "person_names") return listValue(["person", "people", "person_names", "persons"]);
+      if (field === "organization_names") return listValue(["organization", "org", "organization_names", "unit"]);
+      if (field === "time_range") return readLabel(["time", "time_range", "date"]) ?? text.match(/\b(19|20)\d{2}\b/u)?.[0] ?? null;
+      if (field === "amount") return readLabel(["amount", "money"]) ?? text.match(/\d+(?:\.\d+)?\s*(?:yuan|rmb|cny|wan|万|元)/iu)?.[0] ?? null;
+      if (field === "evidence") return quote || null;
+      if (field === "role") return readLabel(["role"]) ?? null;
+      return readLabel([field]) ?? null;
+    };
+    const fields = Object.fromEntries(input.requiredFields.map((field) => [field, {
+      value: fieldValue(field),
+      confidence: quote ? 0.78 : 0.25,
+      evidenceChunkIds: chunkIds,
+      ...(quote ? { quote } : {}),
+    } satisfies FacetFieldValue]));
+    return {
+      rowId: `facet-row-${input.item.id}`,
+      itemId: input.item.id,
+      itemTitle: input.item.title,
+      itemSummary: input.item.summary,
+      fields,
+      evidenceChunkIds: chunkIds,
+    };
+  }
+
+  async planFacetCountOperation(input: FacetCountOperationPlanInput): Promise<FacetCountOperation> {
+    const question = input.question.normalize("NFKC").toLowerCase();
+    const countTarget: FacetCountOperation["countTarget"] = /organization|unit|\u5355\u4f4d|\u7ec4\u7ec7/.test(question)
+      ? "organization"
+      : /source|\u6765\u6e90|\u4eba\u6216\u5355\u4f4d/.test(question)
+        ? "source_group"
+        : /event|\u4e8b\u4ef6|\u8d77|\u4ef6/.test(question)
+          ? "event"
+          : /person|people|\u4eba/.test(question)
+            ? "person"
+            : "unknown";
+    const year = question.match(/\b(19|20)\d{2}\b/u)?.[0];
+    return {
+      countTarget,
+      filters: year ? [{ field: "time_range", operator: "overlaps_time", value: year }] : [],
+      dedupeBy: countTarget === "person"
+        ? ["person_names"]
+        : countTarget === "organization"
+          ? ["organization_names"]
+          : countTarget === "source_group"
+            ? ["source_name"]
+            : ["itemId"],
+      countPolicy: `Count distinct ${countTarget} entries from source-bound facet rows after applying filters.`,
+    };
+  }
+
+  async evaluateTimeFilter(input: FacetTimeFilterInput): Promise<FacetTimeFilterResult> {
+    const filterYear = input.filterValue.match(/\b(19|20)\d{2}\b/u)?.[0];
+    const rowText = `${String(input.rowTimeValue ?? "")} ${input.rowText}`.normalize("NFKC");
+    const years = [...rowText.matchAll(/\b(19|20)\d{2}\b/gu)].map((match) => Number(match[0]));
+    if (!filterYear) return { match: "include", reason: "No explicit year filter was requested." };
+    if (years.length === 0) return { match: "uncertain", reason: "The row does not expose a clear time value." };
+    const target = Number(filterYear);
+    if (years.length >= 2) {
+      const start = Math.min(...years);
+      const end = Math.max(...years);
+      return target >= start && target <= end
+        ? { match: "include", reason: `The requested year ${target} overlaps the row time range ${start}-${end}.` }
+        : { match: "exclude", reason: `The requested year ${target} does not overlap the row time range ${start}-${end}.` };
+    }
+    return years[0] === target
+      ? { match: "include", reason: `The row time value is ${target}.` }
+      : { match: "exclude", reason: `The row time value ${years[0]} is outside ${target}.` };
+  }
+
+  async dedupeFacetCountRows(input: FacetCountDedupeInput): Promise<FacetCountResult> {
+    const asArray = (value: unknown): string[] => {
+      if (Array.isArray(value)) return value.map((entry) => String(entry).trim()).filter(Boolean);
+      if (typeof value === "string") return value.split(/[\u3001\uff0c,;；\s]+/u).map((entry) => entry.trim()).filter(Boolean);
+      return [];
+    };
+    const field = (row: FacetFactRow, name: string): unknown => row.fields[name]?.value;
+    const displayForRow = (row: FacetFactRow): string => {
+      const source = field(row, "source_name");
+      return typeof source === "string" && source.trim() ? source.trim() : row.itemTitle;
+    };
+    const included = new Map<string, FacetCountResult["included"][number]>();
+    const excluded: FacetCountResult["excluded"] = [];
+    const uncertain: FacetCountResult["uncertain"] = [];
+    for (const row of input.rows) {
+      const timeResult = input.timeFilterResults?.[row.rowId];
+      if (timeResult?.match === "exclude") {
+        excluded.push({ displayName: displayForRow(row), rowIds: [row.rowId], reason: timeResult.reason });
+        continue;
+      }
+      if (timeResult?.match === "uncertain") {
+        uncertain.push({ displayName: displayForRow(row), rowIds: [row.rowId], reason: timeResult.reason });
+        continue;
+      }
+      const names = input.operation.countTarget === "person"
+        ? asArray(field(row, "person_names"))
+        : input.operation.countTarget === "organization"
+          ? asArray(field(row, "organization_names"))
+          : [displayForRow(row)];
+      const values = names.length > 0 ? names : [row.itemTitle];
+      for (const name of values) {
+        const key = `${input.operation.countTarget}:${name.normalize("NFKC").toLowerCase()}`;
+        const quotes = Object.values(row.fields).flatMap((fieldValue) => fieldValue.quote ? [fieldValue.quote] : []);
+        const existing = included.get(key);
+        if (existing) {
+          existing.rowIds = uniqueStrings([...existing.rowIds, row.rowId]);
+          existing.evidenceChunkIds = uniqueStrings([...existing.evidenceChunkIds, ...row.evidenceChunkIds]);
+          existing.quotes = uniqueStrings([...existing.quotes, ...quotes]).slice(0, 8);
+        } else {
+          included.set(key, {
+            key,
+            displayName: name,
+            type: input.operation.countTarget,
+            rowIds: [row.rowId],
+            evidenceChunkIds: row.evidenceChunkIds,
+            quotes: quotes.slice(0, 8),
+            reason: "Included after source-bound extraction, filters, and dedupe.",
+          });
+        }
+      }
+    }
+    return {
+      countPolicy: input.operation.countPolicy,
+      included: [...included.values()],
+      excluded,
+      uncertain,
+      finalCount: included.size,
+    };
+  }
+
+  async synthesizeFacetCountAnswer(input: FacetCountAnswerInput): Promise<PulseAnswerOutput> {
+    const included = input.result.included.map((entry) => `${entry.displayName} (${entry.evidenceChunkIds.join(", ")})`).join("; ");
+    const excluded = input.result.excluded.map((entry) => `${entry.displayName}: ${entry.reason}`).join("; ") || "none";
+    const uncertain = input.result.uncertain.map((entry) => `${entry.displayName}: ${entry.reason}`).join("; ") || "none";
+    return {
+      answer: [
+        `Count policy: ${input.result.countPolicy}`,
+        `Result count: ${input.result.finalCount}`,
+        `Included: ${included || "none"}`,
+        `Excluded: ${excluded}`,
+        `Uncertain: ${uncertain}`,
+      ].join("\n"),
+      summary: `facet_count returned ${input.result.finalCount} included entries from ${input.table.rows.length} facet row(s).`,
+      diagnostics: {
+        answerPipeline: "aori_skill",
+        selectedSkill: "facet_count",
+        skillRoute: input.route,
+        targetAspects: input.route.targetAspects,
+        facetFactTable: input.table,
+        facetOperation: input.operation,
+        facetResult: input.result,
+        sourceChunkIds: uniqueStrings(input.table.rows.flatMap((row) => row.evidenceChunkIds)),
+        fallbackTraversalUsed: false,
+      },
     };
   }
 
@@ -2317,6 +2746,197 @@ export class OpenAICompatibleProvider implements ModelProvider {
       };
     }
     return { ...parsed, selectedIds };
+  }
+
+  async routeAoriSkill(input: AoriSkillRouterInput): Promise<AoriSkillRoute> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "AORI Skill Router. Choose one answering skill from the supplied AORI map. " +
+            "Use semantic judgment from question, aspects, document cards, relation lexicon, and self questions. " +
+            "Do not answer the question. Do not use keyword scoring as the final basis. " +
+            "Choose facet_count for counts/lists of people, units, sources, or events; facet_sum for monetary totals; " +
+            "argument_response for arguments and court/authority responses; timeline for chronological questions; normal_traversal for ordinary fact lookup. " +
+            'Return JSON only: {"skill":"facet_count|facet_sum|argument_response|timeline|normal_traversal","targetAspects":[{"aspectId":"...","title":"...","reason":"..."}],"requiredFields":["..."],"operationPlan":"...","confidence":0.8,"reason":"...","ambiguity":["..."]}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1400,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanAoriSkillRoute(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input);
+  }
+
+  async extractFacetFactRow(input: FacetFactRowExtractionInput): Promise<FacetFactRow> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.03,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Extract one source-bound FacetFactRow for a structured AORI skill. " +
+            "Use only the supplied chunks as factual evidence. The item title and summary are navigation context, not final evidence. " +
+            "For every required field, return an object with value, confidence, evidenceChunkIds, and quote. " +
+            "If the chunks do not support a field, set value to null, confidence low, and explain through the quote if possible. " +
+            'Return JSON only: {"rowId":"...","itemId":"...","itemTitle":"...","itemSummary":"...","fields":{"field_name":{"value":null,"confidence":0.2,"evidenceChunkIds":["chunk-id"],"quote":"short source quote"}},"evidenceChunkIds":["chunk-id"]}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1800,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanFacetFactRow(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input);
+  }
+
+  async planFacetCountOperation(input: FacetCountOperationPlanInput): Promise<FacetCountOperation> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.03,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Plan a facet_count operation from the question and facet table preview. " +
+            "Do not answer and do not do arithmetic. Decide countTarget, filters, dedupeBy, and countPolicy. " +
+            'Return JSON only: {"countTarget":"person|organization|source_group|event|unknown","filters":[{"field":"time_range","operator":"overlaps_time|equals|contains|exists","value":"2005"}],"dedupeBy":["person_names"],"countPolicy":"..."}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 900,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanFacetCountOperation(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+  }
+
+  async evaluateTimeFilter(input: FacetTimeFilterInput): Promise<FacetTimeFilterResult> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.02,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Evaluate whether a row time value matches a requested time filter. " +
+            "Return include if the row overlaps the requested period, exclude if it does not, uncertain if the row time is unclear. " +
+            'Return JSON only: {"match":"include|exclude|uncertain","reason":"..."}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 400,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanFacetTimeFilterResult(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+  }
+
+  async dedupeFacetCountRows(input: FacetCountDedupeInput): Promise<FacetCountResult> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.02,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Dedupe and count source-bound facet rows for a facet_count skill. " +
+            "Respect the count target and timeFilterResults. Split parallel person names when the field contains multiple names. " +
+            "If the question asks for people or units, source_group counting is allowed but must be explicit. " +
+            "Every included entry must trace to rowIds, evidenceChunkIds, and quotes. " +
+            'Return JSON only: {"countPolicy":"...","included":[{"key":"...","displayName":"...","type":"person|organization|source_group|event|unknown","rowIds":["..."],"evidenceChunkIds":["..."],"quotes":["..."],"reason":"..."}],"excluded":[{"displayName":"...","rowIds":["..."],"reason":"..."}],"uncertain":[{"displayName":"...","rowIds":["..."],"reason":"..."}],"finalCount":0}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 2200,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    return cleanFacetCountResult(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"), input);
+  }
+
+  async synthesizeFacetCountAnswer(input: FacetCountAnswerInput): Promise<PulseAnswerOutput> {
+    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Write the final answer for a facet_count AORI skill. " +
+            "Use only the supplied table, operation, and result. Include count policy, final count, included list, excluded items, uncertain items, and evidence citations by chunkId/quote. " +
+            "Do not mention any traversal chunk limit or say 'only in the provided 16 chunks'. " +
+            'Return JSON only: {"answer":"...","summary":"...","diagnostics":{"warnings":[]}}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 1800,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+      this.config.aiBaseUrl,
+      this.config.aiApiKey,
+      "/chat/completions",
+      body,
+    );
+    const answer = pulseAnswerSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+    return {
+      ...answer,
+      diagnostics: {
+        ...answer.diagnostics,
+        answerPipeline: "aori_skill",
+        selectedSkill: "facet_count",
+        skillRoute: input.route,
+        targetAspects: input.route.targetAspects,
+        facetFactTable: input.table,
+        facetOperation: input.operation,
+        facetResult: input.result,
+        sourceChunkIds: uniqueStrings(input.table.rows.flatMap((row) => row.evidenceChunkIds)),
+        fallbackTraversalUsed: false,
+      },
+    };
   }
 
   async decideAoriBfsExpansion(input: BfsExpansionInput): Promise<BfsExpansionDecision> {

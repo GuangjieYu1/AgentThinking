@@ -103,6 +103,38 @@ function model(): ModelProvider {
       observation: "ok",
       rationale: "ok",
     }),
+    routeAoriSkill: async () => ({
+      skill: "normal_traversal",
+      targetAspects: [],
+      requiredFields: [],
+      operationPlan: "test",
+      confidence: 0.5,
+      reason: "test",
+      ambiguity: [],
+    }),
+    extractFacetFactRow: async (input) => ({
+      rowId: `row-${input.item.id}`,
+      itemId: input.item.id,
+      itemTitle: input.item.title,
+      itemSummary: input.item.summary,
+      fields: {},
+      evidenceChunkIds: input.chunks.map((chunk) => chunk.id),
+    }),
+    planFacetCountOperation: async () => ({
+      countTarget: "unknown",
+      filters: [],
+      dedupeBy: [],
+      countPolicy: "test",
+    }),
+    evaluateTimeFilter: async () => ({ match: "include", reason: "test" }),
+    dedupeFacetCountRows: async () => ({
+      countPolicy: "test",
+      included: [],
+      excluded: [],
+      uncertain: [],
+      finalCount: 0,
+    }),
+    synthesizeFacetCountAnswer: async () => ({ answer: "ok", summary: "ok" }),
     decideAoriBfsExpansion: async (input) => ({
       decisions: input.currentLayer.map((node) => ({
         nodeId: node.nodeId,

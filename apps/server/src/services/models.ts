@@ -1644,8 +1644,8 @@ export class FakeModelProvider implements ModelProvider {
     const hasCount = /how many|count|list|\u591a\u5c11\u4eba|\u51e0\u4eba|\u603b\u5171|\u5217\u51fa|\u540d\u5b57|\u540d\u5355/.test(question);
     const hasTimeline = /timeline|\u65f6\u95f4\u7ebf|\u6309\u65f6\u95f4|\u54ea\u4e9b\u4e8b/.test(question);
     const hasArgument = /argument|defense|court|response|\u8fa9\u62a4|\u6cd5\u9662|\u91c7\u7eb3|\u56de\u5e94|\u4e0a\u8bc9/.test(question);
-    const coverage: DemandAnswerPlan["requiredRecords"][number]["coverage"] = hasCount || hasAmount || hasTimeline ? "all" : "single";
-    const fields = hasAmount
+    const coverage: DemandAnswerPlan["requiredRecords"][number]["coverage"] = hasCount || hasAmount || hasTimeline || hasArgument ? "all" : "single";
+    const fields: DemandAnswerPlan["requiredRecords"][number]["fields"] = hasAmount
       ? [
         { name: "source_name", description: "Source person or organization for the value.", required: true },
         { name: "amount", description: "Amount in source text, preferably RMB-normalized.", required: true },
@@ -1657,6 +1657,7 @@ export class FakeModelProvider implements ModelProvider {
           { name: "source_name", description: "Person or organization to count/list.", required: true },
           { name: "person_names", description: "Natural person names when present.", required: false },
           { name: "organization_names", description: "Organization names when present.", required: false },
+          ...(year ? [{ name: "time_range", description: "Time or period for filtering the counted/listed entity.", required: true }] : []),
           { name: "evidence", description: "Source quote supporting the source.", required: true },
         ]
         : hasTimeline
@@ -1681,6 +1682,7 @@ export class FakeModelProvider implements ModelProvider {
               { name: "evidence", description: "Source quote supporting the answer.", required: true },
             ];
     const operations: DemandAnswerPlan["operations"] = [];
+    const scopedRecordName = year ? `${year}_records` : recordName;
     if (year) {
       operations.push({
         type: "filter",
@@ -1694,7 +1696,7 @@ export class FakeModelProvider implements ModelProvider {
     if (hasAmount) {
       operations.push({
         type: "sum",
-        inputRecord: year ? `${year}_records` : recordName,
+        inputRecord: scopedRecordName,
         field: "amount",
         outputName: year ? `${year}_confirmed_amount` : "confirmed_total_amount",
         reason: "Amounts must be summed by program arithmetic from extracted records.",
@@ -1702,7 +1704,7 @@ export class FakeModelProvider implements ModelProvider {
     } else if (hasCount) {
       operations.push({
         type: "list",
-        inputRecord: recordName,
+        inputRecord: scopedRecordName,
         field: "source_name",
         outputName: "source_list",
         reason: "The answer needs the complete source list before counting.",
@@ -1716,7 +1718,7 @@ export class FakeModelProvider implements ModelProvider {
     } else if (hasTimeline) {
       operations.push({
         type: "timeline",
-        inputRecord: year ? `${year}_records` : recordName,
+        inputRecord: scopedRecordName,
         field: "time_range",
         outputName: "timeline",
         reason: "The question asks for events in chronological order.",
@@ -3130,6 +3132,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "Decide which source-bound records, fields, coverage, and operations are needed. " +
             "AORI summaries and document cards are navigation hints, never final evidence. " +
             "Prefer full aspect item coverage for exhaustive count/list/sum questions, and narrow coverage for single fact lookup. " +
+            "If an operation filters by a field, include that field in requiredRecords.fields. Later operations should consume prior operation outputName when appropriate. " +
             "Operations may consume either a requiredRecords recordName or a previous operation outputName. " +
             'Return JSON only matching: {"answerGoal":"...","targetScope":{"documentIds":[],"aspectIds":[],"nodeIds":[],"reason":"..."},"requiredRecords":[{"recordName":"...","source":"aspect_items|relations|chunks|document_summary","aspectId":"...","fields":[{"name":"...","description":"...","required":true}],"coverage":"single|some|all"}],"operations":[{"type":"filter|count|sum|list|group_by|compare|timeline|explain|direct_answer","inputRecord":"...","field":"...","condition":"...","outputName":"...","reason":"..."}],"answerPolicy":{"mustCiteSourceChunks":true,"allowPartialAnswer":true,"exposeUncertainty":true,"whatCountsAsInsufficient":"..."},"reason":"...","confidence":0.8}.',
         },

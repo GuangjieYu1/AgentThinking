@@ -9,7 +9,6 @@ import type {
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import { AoriDemandAnswerEngine } from "./aori-demand-answer.js";
-import { AoriTraversalAnswerEngine } from "./aori-traversal-answer.js";
 import type { ModelProvider } from "./models.js";
 import { PulseEvidenceController } from "./pulse-evidence-controller.js";
 import type { VectorStore } from "./vector-store.js";
@@ -109,9 +108,7 @@ export class PulseEngine {
     await emitPulse(eventSink, { type: "start", mode, question });
     const aoriAnswerMode = this.options.aoriAnswerMode ?? "demand";
     if (aoriAnswerMode !== "legacy" && this.db.listAoriDocumentIndexes(libraryId).length > 0) {
-      const engine = aoriAnswerMode === "traversal" || aoriAnswerMode === "strict_evidence_table"
-        ? new AoriTraversalAnswerEngine(this.db, this.model)
-        : new AoriDemandAnswerEngine(this.db, this.model);
+      const engine = new AoriDemandAnswerEngine(this.db, this.model);
       const result = await engine.answer({
         libraryId,
         question,

@@ -1957,7 +1957,7 @@ export type PulseEvidenceTool =
   | "dedupeFacetCountRows"
   | "synthesizeFacetCountAnswer"
   | "planDemandAnswer"
-  | "extractDemandEvidenceRecords"
+  | "extractEvidenceRecords"
   | "executeDemandOperations"
   | "synthesizeDemandAnswer";
 
@@ -2880,7 +2880,7 @@ export const pulseEvidenceToolValues = [
   "getChunkEvidenceAround",
   "getGraphContext",
   "planDemandAnswer",
-  "extractDemandEvidenceRecords",
+  "extractEvidenceRecords",
   "executeDemandOperations",
   "synthesizeDemandAnswer",
 ] as const;

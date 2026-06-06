@@ -789,6 +789,68 @@ function buildHits(records: EvidenceRecord[], chunks: Chunk[]): PendingPulseHit[
   return hits;
 }
 
+export async function extractEvidenceRecords(input: {
+  question: string;
+  plan: DemandAnswerPlan;
+  map: AoriTraversalMap;
+  chunksById: Map<string, Chunk>;
+  model: ModelProvider;
+  eventSink?: PulseEventSink;
+}): Promise<EvidenceRecord[]> {
+  const records: EvidenceRecord[] = [];
+  let emittedHitCount = 0;
+  await emitDemand(input.eventSink, "demand_records_started", "Extracting evidence records from demand plan fields.", {
+    requiredRecordCount: input.plan.requiredRecords.length,
+  });
+  for (const recordSpec of input.plan.requiredRecords) {
+    const sourceItems = sourceItemsForRecord(input.question, input.map, input.plan, recordSpec);
+    for (const sourceItem of sourceItems) {
+      const chunks = sourceItem.chunkIds.flatMap((chunkId) => input.chunksById.get(chunkId) ?? []);
+      if (chunks.length === 0) continue;
+      const record = await input.model.extractDemandEvidenceRecord({
+        question: input.question,
+        recordSpec,
+        sourceItem: {
+          id: sourceItem.id,
+          title: sourceItem.title,
+          summary: sourceItem.summary,
+        },
+        chunks: chunks.map((chunk) => ({ id: chunk.id, text: chunk.text })),
+      });
+      const normalized: EvidenceRecord = {
+        ...record,
+        ...(sourceItem.sourceNodeId ? { sourceNodeId: sourceItem.sourceNodeId } : {}),
+        ...(sourceItem.sourceAspectId ? { sourceAspectId: sourceItem.sourceAspectId } : {}),
+        ...(sourceItem.sourceItemId ? { sourceItemId: sourceItem.sourceItemId } : {}),
+        evidenceChunkIds: uniqueStrings(record.evidenceChunkIds.filter((chunkId) => input.chunksById.has(chunkId))),
+      };
+      records.push(normalized);
+      await emitDemand(input.eventSink, "demand_record_extracted", `Extracted ${recordSpec.recordName}.`, {
+        record: normalized,
+        recordSpec,
+        sourceItem: {
+          id: sourceItem.id,
+          title: sourceItem.title,
+          summary: sourceItem.summary,
+          ...(sourceItem.sourceNodeId ? { sourceNodeId: sourceItem.sourceNodeId } : {}),
+          ...(sourceItem.sourceAspectId ? { sourceAspectId: sourceItem.sourceAspectId } : {}),
+          ...(sourceItem.sourceItemId ? { sourceItemId: sourceItem.sourceItemId } : {}),
+          chunkIds: sourceItem.chunkIds,
+        },
+        chunks: chunks.map((chunk) => ({
+          id: chunk.id,
+          label: chunkLabel(chunk),
+          excerpt: truncateText(chunk.text, 220),
+        })),
+      });
+      const hits = buildHitsForRecord(normalized, input.chunksById, emittedHitCount + 1);
+      emittedHitCount += hits.length;
+      for (const hit of hits) await emitPulse(input.eventSink, { type: "hit", hit });
+    }
+  }
+  return records;
+}
+
 function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[], operationResult: DemandOperationResult): RetrievalTrace[] {
   return [{
     stepIndex: 1,
@@ -800,8 +862,8 @@ function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[], opera
     status: plan.requiredRecords.length > 0 ? "success" : "empty",
   }, {
     stepIndex: 2,
-    tool: "extractDemandEvidenceRecords",
-    purpose: "Extract source-bound fields from AORI item chunks.",
+    tool: "extractEvidenceRecords",
+    purpose: "Extract source-bound fields from AORI item chunks according to the demand plan.",
     inputIds: allRecordChunkIds(records),
     outputIds: records.map((record) => record.recordId),
     newEvidenceRowCount: records.length,
@@ -905,57 +967,14 @@ export class AoriDemandAnswerEngine {
       plan,
       planFallback: this.model.name === "fake",
     });
-    const records: EvidenceRecord[] = [];
-    let emittedHitCount = 0;
-    await emitDemand(input.eventSink, "demand_records_started", "Extracting demand evidence records.", {
-      requiredRecordCount: plan.requiredRecords.length,
+    const records = await extractEvidenceRecords({
+      question: input.question,
+      plan,
+      map,
+      chunksById,
+      model: this.model,
+      ...(input.eventSink ? { eventSink: input.eventSink } : {}),
     });
-    for (const recordSpec of plan.requiredRecords) {
-      const sourceItems = sourceItemsForRecord(input.question, map, plan, recordSpec);
-      for (const sourceItem of sourceItems) {
-        const chunks = sourceItem.chunkIds.flatMap((chunkId) => chunksById.get(chunkId) ?? []);
-        if (chunks.length === 0) continue;
-        const record = await this.model.extractDemandEvidenceRecord({
-          question: input.question,
-          recordSpec,
-          sourceItem: {
-            id: sourceItem.id,
-            title: sourceItem.title,
-            summary: sourceItem.summary,
-          },
-          chunks: chunks.map((chunk) => ({ id: chunk.id, text: chunk.text })),
-        });
-        const normalized: EvidenceRecord = {
-          ...record,
-          ...(sourceItem.sourceNodeId ? { sourceNodeId: sourceItem.sourceNodeId } : {}),
-          ...(sourceItem.sourceAspectId ? { sourceAspectId: sourceItem.sourceAspectId } : {}),
-          ...(sourceItem.sourceItemId ? { sourceItemId: sourceItem.sourceItemId } : {}),
-          evidenceChunkIds: uniqueStrings(record.evidenceChunkIds.filter((chunkId) => chunksById.has(chunkId))),
-        };
-        records.push(normalized);
-        await emitDemand(input.eventSink, "demand_record_extracted", `Extracted ${recordSpec.recordName}.`, {
-          record: normalized,
-          recordSpec,
-          sourceItem: {
-            id: sourceItem.id,
-            title: sourceItem.title,
-            summary: sourceItem.summary,
-            ...(sourceItem.sourceNodeId ? { sourceNodeId: sourceItem.sourceNodeId } : {}),
-            ...(sourceItem.sourceAspectId ? { sourceAspectId: sourceItem.sourceAspectId } : {}),
-            ...(sourceItem.sourceItemId ? { sourceItemId: sourceItem.sourceItemId } : {}),
-            chunkIds: sourceItem.chunkIds,
-          },
-          chunks: chunks.map((chunk) => ({
-            id: chunk.id,
-            label: chunkLabel(chunk),
-            excerpt: truncateText(chunk.text, 220),
-          })),
-        });
-        const hits = buildHitsForRecord(normalized, chunksById, emittedHitCount + 1);
-        emittedHitCount += hits.length;
-        for (const hit of hits) await emitPulse(input.eventSink, { type: "hit", hit });
-      }
-    }
     const operationResult = await executeDemandOperations({
       question: input.question,
       plan,

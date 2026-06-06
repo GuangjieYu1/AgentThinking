@@ -41,16 +41,8 @@ class TraversalTestModel extends FakeModelProvider {
     throw new Error("legacy progressive navigation should not run when AORI traversal is available");
   }
 
-  override async routeAoriSkill() {
-    return {
-      skill: "normal_traversal" as const,
-      targetAspects: [],
-      requiredFields: [],
-      operationPlan: "test traversal fallback",
-      confidence: 0.9,
-      reason: "Traversal test fixture forces normal traversal.",
-      ambiguity: [],
-    };
+  override async routeAoriSkill(): Promise<never> {
+    throw new Error("routeAoriSkill should not run for Demand Plan answering");
   }
 
   override async decideAoriBfsExpansion(input: BfsExpansionInput): Promise<BfsExpansionDecision> {
@@ -113,20 +105,24 @@ class TraversalTestModel extends FakeModelProvider {
 }
 
 class SkillCountTestModel extends FakeModelProvider {
+  override async routeAoriSkill(): Promise<never> {
+    throw new Error("routeAoriSkill should not run for Demand Plan answering");
+  }
+
   override async decideAoriBfsExpansion(): Promise<never> {
-    throw new Error("BFS traversal should not run for facet_count");
+    throw new Error("BFS traversal should not run for Demand Plan answering");
   }
 
   override async chooseAoriDfsNext(): Promise<never> {
-    throw new Error("DFS traversal should not run for facet_count");
+    throw new Error("DFS traversal should not run for Demand Plan answering");
   }
 
   override async summarizeChunkForQuestion(): Promise<never> {
-    throw new Error("Chunk summary traversal synthesis should not run for facet_count");
+    throw new Error("Chunk summary traversal synthesis should not run for Demand Plan answering");
   }
 
   override async synthesizeAnswerFromChunks(): Promise<never> {
-    throw new Error("Traversal final synthesis should not run for facet_count");
+    throw new Error("Traversal final synthesis should not run for Demand Plan answering");
   }
 }
 
@@ -174,7 +170,7 @@ afterEach(async () => {
 });
 
 describe("AORI traversal answering", () => {
-  it("routes count questions to facet_count without traversal chunk limits", async () => {
+  it("answers count questions through Demand Plan, not facet_count routing", async () => {
     const db = await database();
     const library = db.createLibrary("Skill Count AORI");
     const version = db.createDocumentVersion(library.id, "skill-count.md", "text/markdown", "hash", "skill-count.md", {
@@ -228,31 +224,39 @@ describe("AORI traversal answering", () => {
       },
     );
 
-    expect(pulse.pulse.answer).toContain("Result count: 3");
-    expect(pulse.pulse.answer).toContain("Alice");
-    expect(pulse.pulse.answer).toContain("Bob");
-    expect(pulse.pulse.answer).toContain("Dana");
-    expect(pulse.pulse.answer).not.toContain("Charlie");
-    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_skill");
-    expect(pulse.evidencePack?.chunkEvidencePack).toBeUndefined();
+    expect(pulse.pulse.answer).toContain('"count":2');
+    expect(pulse.pulse.answer).toContain("SourceA");
+    expect(pulse.pulse.answer).toContain("SourceB");
+    expect(pulse.pulse.answer).not.toContain("SourceC");
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
     const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
-    expect(diagnostics.answerPipeline).toBe("aori_skill");
-    expect(diagnostics.selectedSkill).toBe("facet_count");
+    expect(diagnostics.answerPipeline).toBe("aori_demand");
+    expect(diagnostics.selectedSkill).toBeUndefined();
     expect(diagnostics.skillRouteFallback).toBe(true);
-    expect((diagnostics.facetFactTable as { rows: unknown[] }).rows).toHaveLength(5);
+    expect((diagnostics.evidenceRecords as unknown[])).toHaveLength(5);
+    const operationResult = diagnostics.demandOperationResult as { operationResults: Array<{ outputName: string; uncertainRecordIds: unknown[] }> };
+    expect(operationResult.operationResults.map((operation) => operation.outputName)).toEqual(["2005_records", "source_list", "source_count"]);
+    expect(operationResult.operationResults.find((operation) => operation.outputName === "2005_records")?.uncertainRecordIds).toHaveLength(2);
+    expect(pulse.evidencePack?.retrievalTrace?.map((step) => step.tool)).toEqual([
+      "planDemandAnswer",
+      "extractEvidenceRecords",
+      "executeDemandOperations",
+      "synthesizeDemandAnswer",
+    ]);
     expect(events).toEqual(expect.arrayContaining([
-      "skill_route_generated",
-      "skill_execution_started",
-      "facet_table_build_started",
-      "facet_row_extracted",
-      "facet_dedupe_finished",
-      "skill_answer_synthesized",
+      "demand_plan_generated",
+      "demand_records_started",
+      "demand_record_extracted",
+      "demand_operations_finished",
+      "demand_answer_synthesized",
     ]));
+    expect(events).not.toContain("skill_route_generated");
+    expect(events).not.toContain("facet_row_extracted");
     expect(events).not.toContain("bfs_node_decision");
     db.close();
   });
 
-  it("routes argument questions to argument_response without traversal", async () => {
+  it("answers argument questions through Demand Plan, not argument_response routing", async () => {
     const db = await database();
     const library = db.createLibrary("Argument Skill AORI");
     const version = db.createDocumentVersion(library.id, "argument.md", "text/markdown", "hash", "argument.md", {
@@ -301,14 +305,20 @@ describe("AORI traversal answering", () => {
 
     expect(pulse.pulse.answer).toContain("payment was a loan");
     expect(pulse.pulse.answer).toContain("court rejected the defense");
-    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_skill");
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
     const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
-    expect(diagnostics.selectedSkill).toBe("argument_response");
-    expect((diagnostics.argumentResult as { pairs: unknown[] }).pairs).toHaveLength(2);
+    expect(diagnostics.selectedSkill).toBeUndefined();
+    expect((diagnostics.evidenceRecords as unknown[])).toHaveLength(2);
+    expect(pulse.evidencePack?.retrievalTrace?.map((step) => step.tool)).toEqual([
+      "planDemandAnswer",
+      "extractEvidenceRecords",
+      "executeDemandOperations",
+      "synthesizeDemandAnswer",
+    ]);
     db.close();
   });
 
-  it("routes timeline questions to timeline and filters by year", async () => {
+  it("answers timeline questions through Demand Plan operations", async () => {
     const db = await database();
     const library = db.createLibrary("Timeline Skill AORI");
     const version = db.createDocumentVersion(library.id, "timeline.md", "text/markdown", "hash", "timeline.md", {
@@ -357,16 +367,18 @@ describe("AORI traversal answering", () => {
     );
 
     expect(pulse.pulse.answer).toContain("Alice paid Huang");
-    expect(pulse.pulse.answer).toContain("Bob paid Huang");
+    expect(pulse.pulse.answer).not.toContain("Bob paid Huang");
     expect(pulse.pulse.answer).not.toContain("Charlie paid Huang [");
-    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_skill");
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
     const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
-    expect(diagnostics.selectedSkill).toBe("timeline");
-    expect((diagnostics.timelineResult as { events: unknown[] }).events).toHaveLength(2);
+    expect(diagnostics.selectedSkill).toBeUndefined();
+    const operationResult = diagnostics.demandOperationResult as { operationResults: Array<{ outputName: string; result: unknown; uncertainRecordIds: unknown[] }> };
+    expect(operationResult.operationResults.map((operation) => operation.outputName)).toEqual(["2005_records", "timeline"]);
+    expect(operationResult.operationResults.find((operation) => operation.outputName === "2005_records")?.uncertainRecordIds).toHaveLength(1);
     db.close();
   });
 
-  it("uses BFS full traversal and answers from chunk text instead of AORI summaries", async () => {
+  it("uses Demand Plan for full AORI answers instead of BFS traversal", async () => {
     const db = await database();
     const library = db.createLibrary("BFS AORI");
     const version = db.createDocumentVersion(library.id, "case.md", "text/markdown", "hash", "case.md", {
@@ -421,17 +433,19 @@ describe("AORI traversal answering", () => {
       events.push(event.type);
     });
 
-    expect(model.bfsInputs.length).toBeGreaterThan(0);
-    expect(pulse.evidencePack?.chunkEvidencePack?.mode).toBe("bfs_full");
+    expect(model.bfsInputs).toHaveLength(0);
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
     expect(pulse.evidencePack?.chunkEvidencePack?.selectedChunks.map((chunk) => chunk.chunkId)).toContain(chunks[1]!.id);
-    expect(pulse.evidencePack?.chunkSummaries?.every((summary) => summary.chunkId)).toBe(true);
+    expect(pulse.evidencePack?.chunkSummaries).toEqual([]);
     expect(pulse.pulse.answer).toContain("90 万");
     expect(pulse.pulse.answer).not.toContain("100 万");
-    expect(events).toEqual(expect.arrayContaining(["aori_traversal_started", "bfs_node_decision", "bfs_chunk_collected", "chunk_summary_finished", "final_answer_finished"]));
+    expect(events).toEqual(expect.arrayContaining(["demand_plan_generated", "demand_record_extracted", "demand_operations_finished", "demand_answer_synthesized"]));
+    expect(events).not.toContain("aori_traversal_started");
+    expect(events).not.toContain("bfs_node_decision");
     db.close();
   });
 
-  it("uses DFS progressive traversal and backtracks after finding a chunk", async () => {
+  it("uses Demand Plan for progressive AORI answers instead of DFS traversal", async () => {
     const db = await database();
     const library = db.createLibrary("DFS AORI");
     const version = db.createDocumentVersion(library.id, "gifts.md", "text/markdown", "hash", "gifts.md", {
@@ -483,11 +497,13 @@ describe("AORI traversal answering", () => {
       events.push(event.type);
     });
 
-    expect(model.dfsInputs.length).toBeGreaterThan(0);
-    expect(pulse.evidencePack?.chunkEvidencePack?.mode).toBe("dfs_pulse");
+    expect(model.dfsInputs).toHaveLength(0);
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
     expect(pulse.evidencePack?.chunkEvidencePack?.selectedChunks.map((chunk) => chunk.chunkId)).toEqual([chunks[0]!.id]);
     expect(pulse.pulse.answer).toContain("杨某丙");
-    expect(events).toEqual(expect.arrayContaining(["dfs_node_entered", "dfs_candidate_selected", "dfs_chunk_found", "dfs_backtrack"]));
+    expect(events).toEqual(expect.arrayContaining(["demand_plan_generated", "demand_record_extracted", "demand_operations_finished", "demand_answer_synthesized"]));
+    expect(events).not.toContain("dfs_node_entered");
+    expect(events).not.toContain("dfs_candidate_selected");
     db.close();
   });
 

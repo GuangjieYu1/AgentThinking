@@ -234,22 +234,19 @@ describe("AORI traversal answering", () => {
     expect(diagnostics.selectedSkill).toBeUndefined();
     expect(diagnostics.skillRouteFallback).toBe(true);
     expect((diagnostics.evidenceRecords as unknown[])).toHaveLength(5);
-    const operationResult = diagnostics.demandOperationResult as { operationResults: Array<{ outputName: string; uncertainRecordIds: unknown[] }> };
-    expect(operationResult.operationResults.map((operation) => operation.outputName)).toEqual(["2005_records", "source_list", "source_count"]);
-    expect(operationResult.operationResults.find((operation) => operation.outputName === "2005_records")?.uncertainRecordIds).toHaveLength(2);
+    expect(diagnostics.demandOperationResult).toBeUndefined();
     expect(pulse.evidencePack?.retrievalTrace?.map((step) => step.tool)).toEqual([
       "planDemandAnswer",
       "extractEvidenceRecords",
-      "executeDemandOperations",
       "synthesizeDemandAnswer",
     ]);
     expect(events).toEqual(expect.arrayContaining([
       "demand_plan_generated",
       "demand_records_started",
       "demand_record_extracted",
-      "demand_operations_finished",
       "demand_answer_synthesized",
     ]));
+    expect(events).not.toContain("demand_operations_finished");
     expect(events).not.toContain("skill_route_generated");
     expect(events).not.toContain("facet_row_extracted");
     expect(events).not.toContain("bfs_node_decision");
@@ -312,13 +309,12 @@ describe("AORI traversal answering", () => {
     expect(pulse.evidencePack?.retrievalTrace?.map((step) => step.tool)).toEqual([
       "planDemandAnswer",
       "extractEvidenceRecords",
-      "executeDemandOperations",
       "synthesizeDemandAnswer",
     ]);
     db.close();
   });
 
-  it("answers timeline questions through Demand Plan operations", async () => {
+  it("answers timeline questions through Demand Plan synthesis", async () => {
     const db = await database();
     const library = db.createLibrary("Timeline Skill AORI");
     const version = db.createDocumentVersion(library.id, "timeline.md", "text/markdown", "hash", "timeline.md", {
@@ -372,9 +368,7 @@ describe("AORI traversal answering", () => {
     expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
     const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
     expect(diagnostics.selectedSkill).toBeUndefined();
-    const operationResult = diagnostics.demandOperationResult as { operationResults: Array<{ outputName: string; result: unknown; uncertainRecordIds: unknown[] }> };
-    expect(operationResult.operationResults.map((operation) => operation.outputName)).toEqual(["2005_records", "timeline"]);
-    expect(operationResult.operationResults.find((operation) => operation.outputName === "2005_records")?.uncertainRecordIds).toHaveLength(1);
+    expect(diagnostics.demandOperationResult).toBeUndefined();
     db.close();
   });
 
@@ -439,7 +433,8 @@ describe("AORI traversal answering", () => {
     expect(pulse.evidencePack?.chunkSummaries).toEqual([]);
     expect(pulse.pulse.answer).toContain("90 万");
     expect(pulse.pulse.answer).not.toContain("100 万");
-    expect(events).toEqual(expect.arrayContaining(["demand_plan_generated", "demand_record_extracted", "demand_operations_finished", "demand_answer_synthesized"]));
+    expect(events).toEqual(expect.arrayContaining(["demand_plan_generated", "demand_record_extracted", "demand_answer_synthesized"]));
+    expect(events).not.toContain("demand_operations_finished");
     expect(events).not.toContain("aori_traversal_started");
     expect(events).not.toContain("bfs_node_decision");
     db.close();
@@ -501,7 +496,8 @@ describe("AORI traversal answering", () => {
     expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
     expect(pulse.evidencePack?.chunkEvidencePack?.selectedChunks.map((chunk) => chunk.chunkId)).toEqual([chunks[0]!.id]);
     expect(pulse.pulse.answer).toContain("杨某丙");
-    expect(events).toEqual(expect.arrayContaining(["demand_plan_generated", "demand_record_extracted", "demand_operations_finished", "demand_answer_synthesized"]));
+    expect(events).toEqual(expect.arrayContaining(["demand_plan_generated", "demand_record_extracted", "demand_answer_synthesized"]));
+    expect(events).not.toContain("demand_operations_finished");
     expect(events).not.toContain("dfs_node_entered");
     expect(events).not.toContain("dfs_candidate_selected");
     db.close();
@@ -547,14 +543,11 @@ describe("AORI traversal answering", () => {
     );
 
     expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_demand");
-    expect(pulse.pulse.answer).toContain("2007_confirmed_amount: null");
+    expect(pulse.pulse.answer).toContain("2007 amount: null");
     expect(pulse.pulse.answer).not.toContain('"total":0');
     const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
     expect(diagnostics.answerPipeline).toBe("aori_demand");
-    const operationResult = diagnostics.demandOperationResult as { status: string; operationResults: Array<{ outputName: string; result: unknown; uncertainRecordIds: unknown[] }> };
-    expect(operationResult.status).toBe("partial");
-    expect(operationResult.operationResults.find((operation) => operation.outputName === "2007_records")?.uncertainRecordIds).toHaveLength(1);
-    expect(operationResult.operationResults.find((operation) => operation.outputName === "2007_confirmed_amount")?.result).toBeNull();
+    expect(diagnostics.demandOperationResult).toBeUndefined();
     db.close();
   });
 

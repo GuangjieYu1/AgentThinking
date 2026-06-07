@@ -33,7 +33,6 @@ import {
   type AspectKind,
   type Citation,
   type DemandAnswerPlan,
-  type DemandOperationResult,
   type Document,
   type DocumentTreeNode,
   type EvidencePack,
@@ -92,7 +91,6 @@ type DemandRecordEventPayload = {
   chunks?: Array<{ id: string; label: string; excerpt: string }>;
 };
 type DemandPlanEventPayload = { plan?: DemandAnswerPlan };
-type DemandOperationEventPayload = { operationResult?: DemandOperationResult };
 type SearchFocus = { matchIds: ReadonlySet<string>; activeId?: string };
 type PulsePlaybackStep =
   | { kind: "hit"; hit: PulseHitRecord }
@@ -548,7 +546,6 @@ function pulseProcessTitle(type: PulseProcessEvent["type"]): string {
     case "demand_plan_generated": return "生成 Demand Plan";
     case "demand_records_started": return "开始抽取 Evidence Records";
     case "demand_record_extracted": return "抽取 Evidence Record";
-    case "demand_operations_finished": return "执行 Operations";
     case "demand_answer_synthesized": return "合成答案";
     case "skill_route_generated": return "选择回答路径";
     case "skill_execution_started": return "执行回答路径";
@@ -634,34 +631,9 @@ function DemandRecordDetails({ event }: { event: PulseProcessEvent }): ReactNode
   );
 }
 
-function DemandOperationDetails({ event }: { event: PulseProcessEvent }): ReactNode {
-  const operationResult = payloadOf<DemandOperationEventPayload>(event)?.operationResult;
-  if (!operationResult) return null;
-  return (
-    <div className="pulse-process-detail">
-      <small>处理状态：{operationResult.status}</small>
-      {operationResult.operationResults.slice(0, 4).map((operation) => (
-        <small key={operation.outputName}>
-          {operation.outputName}：included {operation.includedRecordIds.length}
-          {" · "}excluded {operation.excludedRecordIds.length}
-          {" · "}uncertain {operation.uncertainRecordIds.length}
-          {operation.warnings.length ? ` · ${operation.warnings.slice(0, 2).join("；")}` : ""}
-        </small>
-      ))}
-      {operationResult.answerFacts.slice(0, 3).map((fact, index) => (
-        <small key={`${fact.text}-${index}`}>可回答事实：{compactText(fact.text, 150)}</small>
-      ))}
-      {operationResult.warnings.slice(0, 3).map((warning, index) => (
-        <small key={`${warning}-${index}`}>警告：{compactText(warning, 130)}</small>
-      ))}
-    </div>
-  );
-}
-
 function PulseProcessDetails({ event }: { event: PulseProcessEvent }): ReactNode {
   if (event.type === "demand_plan_generated") return <DemandPlanDetails event={event} />;
   if (event.type === "demand_record_extracted") return <DemandRecordDetails event={event} />;
-  if (event.type === "demand_operations_finished") return <DemandOperationDetails event={event} />;
   return null;
 }
 

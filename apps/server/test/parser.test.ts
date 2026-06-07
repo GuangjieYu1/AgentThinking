@@ -112,12 +112,6 @@ function model(): ModelProvider {
         fields: [{ name: "answer_value", description: "test", required: true }],
         coverage: "some",
       }],
-      operations: [{
-        type: "direct_answer",
-        inputRecord: "test_records",
-        outputName: "answer",
-        reason: "test",
-      }],
       answerPolicy: {
         mustCiteSourceChunks: true,
         allowPartialAnswer: true,

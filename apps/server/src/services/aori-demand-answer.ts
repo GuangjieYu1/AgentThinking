@@ -6,12 +6,9 @@ import type {
   ChunkEvidencePack,
   DemandAnswerPlan,
   DemandAnswerPlanInput,
-  DemandOperationExecutionInput,
-  DemandOperationResult,
   EvidenceCitation,
   EvidencePack,
   EvidenceRecord,
-  EvidenceRecordField,
   PulseAnswerOutput,
   PulseEvidenceRow,
   PulseInputMode,
@@ -27,7 +24,6 @@ type DemandEventType =
   | "demand_plan_generated"
   | "demand_records_started"
   | "demand_record_extracted"
-  | "demand_operations_finished"
   | "demand_answer_synthesized";
 
 interface DemandSourceItem {
@@ -38,13 +34,6 @@ interface DemandSourceItem {
   sourceAspectId?: string | undefined;
   sourceItemId?: string | undefined;
   chunkIds: string[];
-}
-
-interface OperationOutcome {
-  result: DemandOperationResult["operationResults"][number];
-  outputRecords: EvidenceRecord[];
-  answerFacts: DemandOperationResult["answerFacts"];
-  status: DemandOperationResult["status"];
 }
 
 function truncateText(value: string, max: number): string {
@@ -90,6 +79,17 @@ function buildDemandPlanInput(question: string, map: AoriTraversalMap): DemandAn
         itemCount: node.childIds
           .map((childId) => map.nodesById[childId])
           .filter((child) => child?.type === "aspect_item").length,
+        items: node.childIds.flatMap((childId) => {
+          const child = map.nodesById[childId];
+          if (!child || child.type !== "aspect_item") return [];
+          return [{
+            nodeId: child.id,
+            ...(child.itemId ? { itemId: child.itemId } : {}),
+            title: child.title,
+            summary: truncateText(child.summary, 500),
+            chunkCount: child.chunkIds.length,
+          }];
+        }).slice(0, 80),
       })),
     relationLexicon: [...new Map(map.relations.map((relation) => [
       relation.label,
@@ -103,29 +103,6 @@ function buildDemandPlanInput(question: string, map: AoriTraversalMap): DemandAn
 
 function nodeChunkIds(node: AoriTraversalNode): string[] {
   return uniqueStrings(node.chunkIds);
-}
-
-function candidateScore(question: string, item: DemandSourceItem): number {
-  const haystack = `${item.title} ${item.summary}`.normalize("NFKC").toLowerCase();
-  const normalizedQuestion = question.normalize("NFKC").toLowerCase();
-  const wordTerms = normalizedQuestion.match(/[a-z0-9]+/g) ?? [];
-  const charTerms = [...normalizedQuestion]
-    .filter((char) => /[\p{Script=Han}]/u.test(char))
-    .filter((char) => !"的了和与及或是多少什么哪些所有总共".includes(char));
-  return [
-    ...wordTerms.map((term) => haystack.includes(term) ? 4 : 0),
-    ...charTerms.map((term) => haystack.includes(term) ? 1 : 0),
-  ].reduce<number>((sum, value) => sum + value, 0);
-}
-
-function applyCoverage(question: string, coverage: DemandAnswerPlan["requiredRecords"][number]["coverage"], items: DemandSourceItem[]): DemandSourceItem[] {
-  if (coverage === "all") return items;
-  const ranked = items
-    .map((item, index) => ({ item, index, score: candidateScore(question, item) }))
-    .sort((left, right) => right.score - left.score || left.index - right.index);
-  if (coverage === "single") return ranked.slice(0, 1).map((entry) => entry.item);
-  const relevant = ranked.filter((entry) => entry.score > 0).map((entry) => entry.item);
-  return (relevant.length > 0 ? relevant : ranked.map((entry) => entry.item)).slice(0, 8);
 }
 
 function aspectNodesForRecord(map: AoriTraversalMap, plan: DemandAnswerPlan, recordSpec: DemandAnswerPlan["requiredRecords"][number]): AoriTraversalNode[] {
@@ -145,7 +122,6 @@ function aspectNodesForRecord(map: AoriTraversalMap, plan: DemandAnswerPlan, rec
 }
 
 function sourceItemsForRecord(
-  question: string,
   map: AoriTraversalMap,
   plan: DemandAnswerPlan,
   recordSpec: DemandAnswerPlan["requiredRecords"][number],
@@ -203,7 +179,7 @@ function sourceItemsForRecord(
     }));
   }
   const sourceBound = items.filter((item) => item.chunkIds.length > 0);
-  return applyCoverage(question, recordSpec.coverage, sourceBound);
+  return sourceBound;
 }
 
 function allRecordChunkIds(records: EvidenceRecord[]): string[] {
@@ -217,461 +193,114 @@ function fieldValueText(value: unknown): string {
   return String(value).trim();
 }
 
-function fieldEntries(record: EvidenceRecord, requestedField?: string): Array<[string, EvidenceRecordField]> {
-  const entries = Object.entries(record.fields);
-  if (!requestedField?.trim()) return entries;
-  const normalized = requestedField.normalize("NFKC").toLowerCase();
-  const exact = entries.filter(([name]) => name.normalize("NFKC").toLowerCase() === normalized);
-  if (exact.length > 0) return exact;
-  return entries.filter(([name]) => name.normalize("NFKC").toLowerCase().includes(normalized) || normalized.includes(name.normalize("NFKC").toLowerCase()));
-}
-
-function stringValues(record: EvidenceRecord, requestedField?: string): string[] {
-  return uniqueStrings(fieldEntries(record, requestedField).flatMap(([, field]) => {
-    if (Array.isArray(field.value)) return field.value.map(fieldValueText);
-    const text = fieldValueText(field.value);
-    if (!text) return [];
-    return text.split(/[、,;；/]/).map((value) => value.trim()).filter(Boolean);
-  }));
-}
-
-function firstFieldByNames(record: EvidenceRecord, patterns: RegExp[]): [string, EvidenceRecordField] | undefined {
-  return Object.entries(record.fields).find(([name, field]) =>
-    field.value !== null && field.value !== undefined && patterns.some((pattern) => pattern.test(name))
-  );
+function fieldChunkIds(field: EvidenceRecord["fields"][string]): string[] {
+  return uniqueStrings([field.chunkId, ...field.evidenceChunkIds]);
 }
 
 function fieldQuote(record: EvidenceRecord | undefined, chunkId?: string): string | undefined {
   if (!record) return undefined;
   const fields = Object.values(record.fields);
   const field = chunkId
-    ? fields.find((entry) => entry.evidenceChunkIds.includes(chunkId) && entry.quote)
+    ? fields.find((entry) => fieldChunkIds(entry).includes(chunkId) && entry.quote)
     : fields.find((entry) => entry.quote);
   return field?.quote;
 }
 
-function yearsFromText(text: string): number[] {
-  return uniqueStrings((text.match(/(?:19|20)\d{2}/g) ?? [])).map((year) => Number(year)).filter(Number.isFinite);
+function normalizedQuoteText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
-function requestedYear(question: string, condition?: string): number | undefined {
-  const source = `${condition ?? ""} ${question}`;
-  const [year] = yearsFromText(source);
-  return year;
+function quoteAppearsInChunk(quote: string, chunk: Chunk): boolean {
+  const normalizedQuote = normalizedQuoteText(quote);
+  if (!normalizedQuote) return false;
+  return normalizedQuoteText(chunk.text).includes(normalizedQuote);
 }
 
-function timeTextForRecord(record: EvidenceRecord, requestedField?: string): string {
-  const requested = stringValues(record, requestedField).join(" ");
-  if (requested.trim()) return requested;
-  const timeField = firstFieldByNames(record, [/time/i, /date/i, /year/i, /时间/u, /日期/u, /年份/u]);
-  return timeField ? fieldValueText(timeField[1].value) : "";
+function appendUncertainty(existing: string | undefined, addition: string): string {
+  return existing?.trim() ? `${existing.trim()} ${addition}` : addition;
 }
 
-function evaluateFilter(record: EvidenceRecord, question: string, condition?: string, field?: string): "include" | "exclude" | "uncertain" {
-  const targetYear = requestedYear(question, condition);
-  if (targetYear) {
-    const text = timeTextForRecord(record, field);
-    const years = yearsFromText(text);
-    if (years.length === 0) return "uncertain";
-    if (years.length >= 2) {
-      const min = Math.min(...years);
-      const max = Math.max(...years);
-      if (targetYear >= min && targetYear <= max) return min === max ? "include" : "uncertain";
-      return "exclude";
-    }
-    return years[0] === targetYear ? "include" : "exclude";
-  }
-  const conditionText = condition?.normalize("NFKC").toLowerCase().trim();
-  if (!conditionText) return "include";
-  const recordText = Object.entries(record.fields)
-    .map(([name, value]) => `${name}: ${fieldValueText(value.value)}`)
-    .join("\n")
-    .normalize("NFKC")
-    .toLowerCase();
-  return recordText.includes(conditionText) ? "include" : "uncertain";
-}
-
-function parseAmount(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  const text = fieldValueText(value).replace(/,/g, "");
-  if (!text) return undefined;
-  const match = text.match(/-?\d+(?:\.\d+)?/);
-  if (!match) return undefined;
-  const numeric = Number(match[0]);
-  if (!Number.isFinite(numeric)) return undefined;
-  const multiplier = /亿/u.test(text)
-    ? 100_000_000
-    : /万|wan/i.test(text)
-      ? 10_000
-      : 1;
-  return numeric * multiplier;
-}
-
-function amountField(record: EvidenceRecord, requestedField?: string): [string, EvidenceRecordField] | undefined {
-  if (requestedField) {
-    const [entry] = fieldEntries(record, requestedField);
-    if (entry) return entry;
-  }
-  return firstFieldByNames(record, [/amount/i, /money/i, /value/i, /金额/u, /钱/u, /总额/u, /数额/u]);
-}
-
-function preferredListField(record: EvidenceRecord, requestedField?: string): string[] {
-  if (requestedField) return stringValues(record, requestedField);
-  const preferred = Object.entries(record.fields)
-    .filter(([name, field]) =>
-      field.value !== null &&
-      field.value !== undefined &&
-      (/source/i.test(name) || /person/i.test(name) || /organization/i.test(name) || /name/i.test(name) || /来源/u.test(name) || /人名/u.test(name) || /单位/u.test(name) || /姓名/u.test(name))
-    )
-    .flatMap(([name]) => stringValues(record, name));
-  return preferred.length > 0 ? uniqueStrings(preferred) : stringValues(record, "answer_value");
-}
-
-function emptyOutcome(operation: DemandAnswerPlan["operations"][number]): OperationOutcome {
-  const warning = "No source-bound records extracted.";
-  return {
-    result: {
-      outputName: operation.outputName,
-      type: operation.type,
-      result: null,
-      includedRecordIds: [],
-      excludedRecordIds: [],
-      uncertainRecordIds: [],
-      warnings: [warning],
-    },
-    outputRecords: [],
-    answerFacts: [],
-    status: "insufficient",
-  };
-}
-
-function runFilter(
-  question: string,
-  operation: DemandAnswerPlan["operations"][number],
-  records: EvidenceRecord[],
-): OperationOutcome {
-  if (records.length === 0) return emptyOutcome(operation);
-  const included: EvidenceRecord[] = [];
-  const excluded: Array<{ recordId: string; reason: string }> = [];
-  const uncertain: Array<{ recordId: string; reason: string }> = [];
-  for (const record of records) {
-    const decision = evaluateFilter(record, question, operation.condition, operation.field);
-    if (decision === "include") included.push(record);
-    if (decision === "exclude") excluded.push({ recordId: record.recordId, reason: operation.condition ?? "Filter condition did not match." });
-    if (decision === "uncertain") uncertain.push({ recordId: record.recordId, reason: "Filter condition could not be decided from extracted fields." });
-  }
-  const warnings = included.length === 0 ? ["No records clearly satisfied the filter."] : [];
-  return {
-    result: {
-      outputName: operation.outputName,
-      type: operation.type,
-      result: {
-        recordIds: included.map((record) => record.recordId),
-        condition: operation.condition ?? null,
-      },
-      includedRecordIds: included.map((record) => record.recordId),
-      excludedRecordIds: excluded,
-      uncertainRecordIds: uncertain,
-      warnings,
-    },
-    outputRecords: included,
-    answerFacts: [],
-    status: included.length > 0 && uncertain.length === 0 ? "complete" : included.length > 0 || uncertain.length > 0 ? "partial" : "insufficient",
-  };
-}
-
-function runSum(operation: DemandAnswerPlan["operations"][number], records: EvidenceRecord[]): OperationOutcome {
-  if (records.length === 0) return emptyOutcome(operation);
-  const includedRows: Array<{ recordId: string; amount: number; field: string; evidenceChunkIds: string[] }> = [];
-  const uncertain: Array<{ recordId: string; reason: string }> = [];
-  for (const record of records) {
-    const entry = amountField(record, operation.field);
-    const amount = entry ? parseAmount(entry[1].value) : undefined;
-    if (entry && amount !== undefined) {
-      includedRows.push({
-        recordId: record.recordId,
-        amount,
-        field: entry[0],
-        evidenceChunkIds: entry[1].evidenceChunkIds,
-      });
-    } else {
-      uncertain.push({ recordId: record.recordId, reason: "No source-bound numeric amount field was extracted." });
-    }
-  }
-  if (includedRows.length === 0) {
-    const warnings = ["No included amount rows; total is null, not zero."];
-    return {
-      result: {
-        outputName: operation.outputName,
-        type: operation.type,
-        result: {
-          total: null,
-          unit: "RMB",
-          includedRows: [],
-          uncertainRows: uncertain,
-          status: uncertain.length > 0 ? "partial" : "insufficient",
-        },
-        includedRecordIds: [],
-        excludedRecordIds: [],
-        uncertainRecordIds: uncertain,
-        warnings,
-      },
-      outputRecords: [],
-      answerFacts: [],
-      status: uncertain.length > 0 ? "partial" : "insufficient",
-    };
-  }
-  const total = includedRows.reduce((sum, row) => sum + row.amount, 0);
-  const evidenceChunkIds = uniqueStrings(includedRows.flatMap((row) => row.evidenceChunkIds));
-  const totalWan = total / 10_000;
-  return {
-    result: {
-      outputName: operation.outputName,
-      type: operation.type,
-      result: {
-        total,
-        unit: "RMB",
-        totalWan,
-        displayTotal: `${Number(totalWan.toFixed(6))} 万元`,
-        includedRows,
-        uncertainRows: uncertain,
-        status: uncertain.length > 0 ? "partial" : "complete",
-      },
-      includedRecordIds: includedRows.map((row) => row.recordId),
-      excludedRecordIds: [],
-      uncertainRecordIds: uncertain,
-      warnings: uncertain.length > 0 ? ["Some records had no extractable amount and were not summed."] : [],
-    },
-    outputRecords: records.filter((record) => includedRows.some((row) => row.recordId === record.recordId)),
-    answerFacts: [{
-      text: `${operation.outputName}: ${total} RMB across ${includedRows.length} included record(s).`,
-      recordIds: includedRows.map((row) => row.recordId),
-      evidenceChunkIds,
-    }],
-    status: uncertain.length > 0 ? "partial" : "complete",
-  };
-}
-
-function runList(operation: DemandAnswerPlan["operations"][number], records: EvidenceRecord[]): OperationOutcome {
-  if (records.length === 0) return emptyOutcome(operation);
-  const values = new Map<string, { displayName: string; recordIds: string[]; evidenceChunkIds: string[] }>();
-  const uncertain: Array<{ recordId: string; reason: string }> = [];
-  for (const record of records) {
-    const names = preferredListField(record, operation.field);
-    if (names.length === 0) {
-      uncertain.push({ recordId: record.recordId, reason: "No listable field value was extracted." });
-      continue;
-    }
-    for (const name of names) {
-      const key = name.normalize("NFKC").toLowerCase();
-      const current = values.get(key) ?? { displayName: name, recordIds: [], evidenceChunkIds: [] };
-      current.recordIds = uniqueStrings([...current.recordIds, record.recordId]);
-      current.evidenceChunkIds = uniqueStrings([...current.evidenceChunkIds, ...record.evidenceChunkIds]);
-      values.set(key, current);
-    }
-  }
-  const listed = [...values.values()];
-  const warnings = listed.length === 0 ? ["No list values were extracted."] : [];
-  return {
-    result: {
-      outputName: operation.outputName,
-      type: operation.type,
-      result: {
-        values: listed,
-        status: listed.length > 0 ? uncertain.length > 0 ? "partial" : "complete" : "insufficient",
-      },
-      includedRecordIds: uniqueStrings(listed.flatMap((entry) => entry.recordIds)),
-      excludedRecordIds: [],
-      uncertainRecordIds: uncertain,
-      warnings,
-    },
-    outputRecords: records,
-    answerFacts: listed.length > 0 ? [{
-      text: `${operation.outputName}: ${listed.map((entry) => entry.displayName).join(", ")}`,
-      recordIds: uniqueStrings(listed.flatMap((entry) => entry.recordIds)),
-      evidenceChunkIds: uniqueStrings(listed.flatMap((entry) => entry.evidenceChunkIds)),
-    }] : [],
-    status: listed.length > 0 ? uncertain.length > 0 ? "partial" : "complete" : "insufficient",
-  };
-}
-
-function runCount(operation: DemandAnswerPlan["operations"][number], records: EvidenceRecord[]): OperationOutcome {
-  if (records.length === 0) return emptyOutcome(operation);
-  const listOutcome = runList({ ...operation, type: "list" }, records);
-  const listed = (listOutcome.result.result as { values?: Array<{ displayName: string; recordIds: string[]; evidenceChunkIds: string[] }> } | null)?.values ?? [];
-  if (listed.length === 0) {
-    return {
-      ...listOutcome,
-      result: {
-        ...listOutcome.result,
-        type: operation.type,
-        result: {
-          count: null,
-          values: [],
-          status: listOutcome.status,
-        },
-        warnings: uniqueStrings([...listOutcome.result.warnings, "No included rows to count; count is null, not zero."]),
-      },
-      answerFacts: [],
-    };
-  }
-  return {
-    ...listOutcome,
-    result: {
-      ...listOutcome.result,
-      type: operation.type,
-      result: {
-        count: listed.length,
-        values: listed,
-        status: listOutcome.status,
-      },
-    },
-    answerFacts: [{
-      text: `${operation.outputName}: ${listed.length} distinct value(s): ${listed.map((entry) => entry.displayName).join(", ")}`,
-      recordIds: uniqueStrings(listed.flatMap((entry) => entry.recordIds)),
-      evidenceChunkIds: uniqueStrings(listed.flatMap((entry) => entry.evidenceChunkIds)),
-    }],
-  };
-}
-
-function runDirect(operation: DemandAnswerPlan["operations"][number], records: EvidenceRecord[]): OperationOutcome {
-  if (records.length === 0) return emptyOutcome(operation);
-  const facts = records.flatMap((record) => {
-    const values = stringValues(record, operation.field);
-    const fallback = values.length > 0 ? values : Object.entries(record.fields)
-      .filter(([, field]) => field.value !== null && field.value !== undefined)
-      .map(([name, field]) => `${name}: ${fieldValueText(field.value)}`);
-    if (fallback.length === 0) return [];
-    return [{
-      text: `${record.recordName}: ${fallback.join("; ")}`,
-      recordIds: [record.recordId],
-      evidenceChunkIds: record.evidenceChunkIds,
+function validateEvidenceRecordCitations(record: EvidenceRecord, chunksById: Map<string, Chunk>): EvidenceRecord {
+  const sourceChunkIds = uniqueStrings(record.evidenceChunkIds.filter((chunkId) => chunksById.has(chunkId)));
+  const fields = Object.fromEntries(Object.entries(record.fields).map(([name, field]) => {
+    const candidateChunkIds = uniqueStrings([...fieldChunkIds(field), ...sourceChunkIds]).filter((chunkId) => chunksById.has(chunkId));
+    const quote = field.quote.trim();
+    const matchingChunkId = quote
+      ? candidateChunkIds.find((chunkId) => {
+        const chunk = chunksById.get(chunkId);
+        return chunk ? quoteAppearsInChunk(quote, chunk) : false;
+      })
+      : undefined;
+    const chunkId = matchingChunkId ?? candidateChunkIds[0] ?? sourceChunkIds[0] ?? "";
+    const chunk = chunkId ? chunksById.get(chunkId) : undefined;
+    const quoteVerified = Boolean(matchingChunkId);
+    const finalQuote = quoteVerified ? quote : truncateText(chunk?.text ?? quote, 500);
+    return [name, {
+      ...field,
+      chunkId,
+      evidenceChunkIds: chunkId ? uniqueStrings([chunkId, ...candidateChunkIds]) : [],
+      quote: finalQuote,
+      confidence: quoteVerified ? field.confidence : Math.min(field.confidence, 0.45),
+      ...(!quoteVerified
+        ? { uncertainty: appendUncertainty(field.uncertainty, "Field quote was not found verbatim in the cited chunk; citation was pinned to a source chunk excerpt.") }
+        : {}),
     }];
-  });
-  const warnings = facts.length === 0 ? ["Records were extracted but no source-bound field values were available."] : [];
+  }));
   return {
-    result: {
-      outputName: operation.outputName,
-      type: operation.type,
-      result: facts.map((fact) => fact.text),
-      includedRecordIds: facts.flatMap((fact) => fact.recordIds),
-      excludedRecordIds: [],
-      uncertainRecordIds: facts.length === 0 ? records.map((record) => ({ recordId: record.recordId, reason: "No extracted field value." })) : [],
-      warnings,
-    },
-    outputRecords: records,
-    answerFacts: facts,
-    status: facts.length > 0 ? "complete" : "insufficient",
+    ...record,
+    fields,
+    evidenceChunkIds: uniqueStrings([
+      ...sourceChunkIds,
+      ...Object.values(fields).flatMap((field) => fieldChunkIds(field)),
+    ]).filter((chunkId) => chunksById.has(chunkId)),
   };
 }
 
-function runTimeline(operation: DemandAnswerPlan["operations"][number], records: EvidenceRecord[]): OperationOutcome {
-  if (records.length === 0) return emptyOutcome(operation);
-  const timeline = records.map((record) => {
-    const time = timeTextForRecord(record, operation.field);
-    const event = stringValues(record, "event")[0] ?? stringValues(record, "answer_value")[0] ?? record.recordId;
-    return {
-      recordId: record.recordId,
-      time: time || null,
-      event,
-      evidenceChunkIds: record.evidenceChunkIds,
-      year: yearsFromText(time)[0] ?? null,
-    };
-  }).sort((left, right) => (left.year ?? 9999) - (right.year ?? 9999));
-  const uncertain = timeline.filter((entry) => !entry.time).map((entry) => ({ recordId: entry.recordId, reason: "No time field was extracted." }));
-  return {
-    result: {
-      outputName: operation.outputName,
-      type: operation.type,
-      result: { events: timeline, status: uncertain.length > 0 ? "partial" : "complete" },
-      includedRecordIds: timeline.filter((entry) => entry.time).map((entry) => entry.recordId),
-      excludedRecordIds: [],
-      uncertainRecordIds: uncertain,
-      warnings: uncertain.length > 0 ? ["Some events have no extracted time field."] : [],
-    },
-    outputRecords: records,
-    answerFacts: timeline.length > 0 ? [{
-      text: `${operation.outputName}: ${timeline.map((entry) => `${entry.time ?? "unknown"} ${entry.event}`).join("; ")}`,
-      recordIds: timeline.map((entry) => entry.recordId),
-      evidenceChunkIds: uniqueStrings(timeline.flatMap((entry) => entry.evidenceChunkIds)),
-    }] : [],
-    status: uncertain.length > 0 ? "partial" : "complete",
-  };
-}
-
-export async function executeDemandOperations(input: DemandOperationExecutionInput): Promise<DemandOperationResult> {
-  const recordSets = new Map<string, EvidenceRecord[]>();
-  for (const record of input.records) {
-    recordSets.set(record.recordName, [...(recordSets.get(record.recordName) ?? []), record]);
-  }
-  const operationResults: DemandOperationResult["operationResults"] = [];
-  const answerFacts: DemandOperationResult["answerFacts"] = [];
-  const statuses: DemandOperationResult["status"][] = [];
-  for (const operation of input.plan.operations) {
-    const records = recordSets.get(operation.inputRecord) ?? [];
-    const outcome = operation.type === "filter"
-      ? runFilter(input.question, operation, records)
-      : operation.type === "sum"
-        ? runSum(operation, records)
-        : operation.type === "count"
-          ? runCount(operation, records)
-          : operation.type === "list" || operation.type === "group_by" || operation.type === "compare"
-            ? runList(operation, records)
-            : operation.type === "timeline"
-              ? runTimeline(operation, records)
-              : runDirect(operation, records);
-    operationResults.push(outcome.result);
-    answerFacts.push(...outcome.answerFacts);
-    statuses.push(outcome.status);
-    recordSets.set(operation.outputName, outcome.outputRecords);
-  }
-  if (operationResults.length === 0) {
-    const operation = {
-      type: "direct_answer",
-      inputRecord: input.records[0]?.recordName ?? "records",
-      outputName: "answer",
-      reason: "No operations were supplied.",
-    } satisfies DemandAnswerPlan["operations"][number];
-    const outcome = runDirect(operation, input.records);
-    operationResults.push(outcome.result);
-    answerFacts.push(...outcome.answerFacts);
-    statuses.push(outcome.status);
-  }
-  const warnings = uniqueStrings(operationResults.flatMap((result) => result.warnings));
-  const status = statuses.length === 0 || statuses.every((entry) => entry === "insufficient")
-    ? "insufficient"
-    : statuses.some((entry) => entry !== "complete") || warnings.length > 0
-      ? "partial"
-      : "complete";
-  return {
-    operationResults,
-    answerFacts,
-    status,
-    warnings,
-  };
-}
-
-function buildEvidenceRows(records: EvidenceRecord[], facts: DemandOperationResult["answerFacts"], chunks: Chunk[]): PulseEvidenceRow[] {
+function buildEvidenceRows(records: EvidenceRecord[], chunks: Chunk[]): PulseEvidenceRow[] {
   const chunksById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
-  return facts.flatMap((fact, factIndex) => {
-    const chunkIds = uniqueStrings(fact.evidenceChunkIds);
-    return chunkIds.slice(0, 4).flatMap((chunkId, chunkIndex): PulseEvidenceRow[] => {
+  return records.flatMap((record, recordIndex) => {
+    const fieldRows = Object.entries(record.fields).flatMap(([fieldName, field], fieldIndex): PulseEvidenceRow[] => {
+      const chunkId = field.chunkId || field.evidenceChunkIds.find((id) => chunksById.has(id));
+      if (!chunkId) return [];
       const chunk = chunksById.get(chunkId);
       if (!chunk) return [];
-      const record = records.find((candidate) => candidate.evidenceChunkIds.includes(chunkId));
-      const quote = fieldQuote(record!, chunkId) ?? chunk.text.slice(0, 220);
+      const value = fieldValueText(field.value);
+      const claimText = value
+        ? `${record.recordName}.${fieldName}: ${value}`
+        : `${record.recordName}.${fieldName}: no extracted value`;
       return [{
-        rowId: `aori-demand-row-${factIndex + 1}-${chunkIndex + 1}`,
+        rowId: `aori-demand-row-${recordIndex + 1}-${fieldIndex + 1}`,
         evidenceType: "fact",
-        claimText: truncateText(fact.text, 900),
+        claimText: truncateText(claimText, 900),
         evidenceChunkId: chunkId,
         treeNodeId: chunk.documentTreeNodeId ?? null,
-        evidenceQuote: truncateText(quote, 900),
+        evidenceQuote: truncateText(field.quote || chunk.text.slice(0, 220), 900),
         role: "direct_fact",
         authority: "documentary_record",
         usage: "answer_core",
-        classificationRationale: "AORI Demand Answer Engine used source-bound EvidenceRecord fields and operation results.",
-        confidence: 0.78,
+        classificationRationale: "AORI Demand Answer Engine stored a source-bound EvidenceRecord field with a validated chunk citation.",
+        confidence: field.confidence,
+        ...(chunk.versionId ? { versionId: chunk.versionId } : {}),
+        ...(chunk.headingPath ? { headingPath: [chunk.headingPath] } : {}),
+        countedInAnswer: true,
+      }];
+    });
+    if (fieldRows.length > 0) return fieldRows;
+    return record.evidenceChunkIds.slice(0, 2).flatMap((chunkId, chunkIndex): PulseEvidenceRow[] => {
+      const chunk = chunksById.get(chunkId);
+      if (!chunk) return [];
+      return [{
+        rowId: `aori-demand-row-${recordIndex + 1}-fallback-${chunkIndex + 1}`,
+        evidenceType: "quote",
+        claimText: truncateText(`${record.recordName}: source chunk selected for evidence extraction`, 900),
+        evidenceChunkId: chunkId,
+        treeNodeId: chunk.documentTreeNodeId ?? null,
+        evidenceQuote: truncateText(chunk.text.slice(0, 220), 900),
+        role: "direct_fact",
+        authority: "documentary_record",
+        usage: "answer_core",
+        classificationRationale: "AORI Demand Answer Engine selected this source chunk, but the model did not return field-level values.",
+        confidence: 0.35,
         ...(chunk.versionId ? { versionId: chunk.versionId } : {}),
         ...(chunk.headingPath ? { headingPath: [chunk.headingPath] } : {}),
         countedInAnswer: true,
@@ -803,7 +432,7 @@ export async function extractEvidenceRecords(input: {
     requiredRecordCount: input.plan.requiredRecords.length,
   });
   for (const recordSpec of input.plan.requiredRecords) {
-    const sourceItems = sourceItemsForRecord(input.question, input.map, input.plan, recordSpec);
+    const sourceItems = sourceItemsForRecord(input.map, input.plan, recordSpec);
     for (const sourceItem of sourceItems) {
       const chunks = sourceItem.chunkIds.flatMap((chunkId) => input.chunksById.get(chunkId) ?? []);
       if (chunks.length === 0) continue;
@@ -817,13 +446,13 @@ export async function extractEvidenceRecords(input: {
         },
         chunks: chunks.map((chunk) => ({ id: chunk.id, text: chunk.text })),
       });
-      const normalized: EvidenceRecord = {
+      const normalized = validateEvidenceRecordCitations({
         ...record,
         ...(sourceItem.sourceNodeId ? { sourceNodeId: sourceItem.sourceNodeId } : {}),
         ...(sourceItem.sourceAspectId ? { sourceAspectId: sourceItem.sourceAspectId } : {}),
         ...(sourceItem.sourceItemId ? { sourceItemId: sourceItem.sourceItemId } : {}),
         evidenceChunkIds: uniqueStrings(record.evidenceChunkIds.filter((chunkId) => input.chunksById.has(chunkId))),
-      };
+      }, input.chunksById);
       records.push(normalized);
       await emitDemand(input.eventSink, "demand_record_extracted", `Extracted ${recordSpec.recordName}.`, {
         record: normalized,
@@ -851,7 +480,7 @@ export async function extractEvidenceRecords(input: {
   return records;
 }
 
-function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[], operationResult: DemandOperationResult): RetrievalTrace[] {
+function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[]): RetrievalTrace[] {
   return [{
     stepIndex: 1,
     tool: "planDemandAnswer",
@@ -870,20 +499,12 @@ function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[], opera
     status: records.length > 0 ? "success" : "empty",
   }, {
     stepIndex: 3,
-    tool: "executeDemandOperations",
-    purpose: "Run generic filter/list/count/sum/timeline/direct operations with program logic.",
-    inputIds: records.map((record) => record.recordId),
-    outputIds: operationResult.operationResults.map((result) => result.outputName),
-    newEvidenceRowCount: operationResult.answerFacts.length,
-    status: operationResult.status === "insufficient" ? "empty" : "success",
-  }, {
-    stepIndex: 4,
     tool: "synthesizeDemandAnswer",
-    purpose: "Synthesize final answer from EvidenceRecords and operation results only.",
-    inputIds: operationResult.operationResults.map((result) => result.outputName),
+    purpose: "Synthesize the final answer from the user question, demand plan, EvidenceRecords, and field-level source quotes.",
+    inputIds: records.map((record) => record.recordId),
     outputIds: ["final_answer"],
-    newEvidenceRowCount: operationResult.answerFacts.length,
-    status: operationResult.status === "insufficient" ? "empty" : "success",
+    newEvidenceRowCount: records.length,
+    status: records.length > 0 ? "success" : "empty",
   }];
 }
 
@@ -892,11 +513,10 @@ function buildStorageEvidencePack(input: {
   modelName: string;
   chunkEvidencePack: ChunkEvidencePack;
   records: EvidenceRecord[];
-  operationResult: DemandOperationResult;
   chunks: Chunk[];
   plan: DemandAnswerPlan;
 }): EvidencePack {
-  const evidenceRows = buildEvidenceRows(input.records, input.operationResult.answerFacts, input.chunks);
+  const evidenceRows = buildEvidenceRows(input.records, input.chunks);
   return {
     id: `aori-demand-pack-${Date.now()}`,
     question: input.question,
@@ -917,7 +537,7 @@ function buildStorageEvidencePack(input: {
       promptVersion: "aori-demand-v1",
     },
     answerMode: "citation_supported",
-    answerModeReason: "AORI Demand Answer Engine planned source-bound records, extracted fields from raw chunks, executed operations, then synthesized the answer.",
+    answerModeReason: "AORI Demand Answer Engine planned source-bound records, extracted fields from raw chunks, validated citations, then let the model synthesize the answer.",
     chunkEvidencePack: input.chunkEvidencePack,
     chunkSummaries: [],
     treeNodes: [],
@@ -927,18 +547,17 @@ function buildStorageEvidencePack(input: {
     summaryNodes: [],
     evidenceRows,
     citations: buildCitations(evidenceRows, input.chunks),
-    gaps: input.operationResult.status === "insufficient" ? [{
+    gaps: input.records.length === 0 || evidenceRows.length === 0 ? [{
       type: "missing_itemized_evidence",
-      description: input.operationResult.warnings.join("; ") || input.plan.answerPolicy.whatCountsAsInsufficient,
+      description: input.plan.answerPolicy.whatCountsAsInsufficient,
       suggestedQueries: [input.question],
       severity: "medium",
     }] : [],
-    retrievalTrace: retrievalTrace(input.plan, input.records, input.operationResult),
+    retrievalTrace: retrievalTrace(input.plan, input.records),
     diagnostics: {
       answerPipeline: "aori_demand",
       demandPlan: input.plan,
       evidenceRecords: input.records,
-      demandOperationResult: input.operationResult,
       fallbackTraversalUsed: false,
     },
   };
@@ -975,20 +594,11 @@ export class AoriDemandAnswerEngine {
       model: this.model,
       ...(input.eventSink ? { eventSink: input.eventSink } : {}),
     });
-    const operationResult = await executeDemandOperations({
-      question: input.question,
-      plan,
-      records,
-    });
-    await emitDemand(input.eventSink, "demand_operations_finished", `Demand operations finished with ${operationResult.status}.`, {
-      operationResult,
-    });
     await emitPulse(input.eventSink, { type: "stage", message: "正在合成 AORI Demand Answer" });
     const answerDraft = await this.model.synthesizeDemandAnswer({
       question: input.question,
       plan,
       records,
-      operationResult,
     });
     const answer = {
       ...answerDraft,
@@ -997,7 +607,6 @@ export class AoriDemandAnswerEngine {
         answerPipeline: "aori_demand",
         demandPlan: plan,
         evidenceRecords: records,
-        demandOperationResult: operationResult,
         sourceChunkIds: allRecordChunkIds(records),
         fallbackTraversalUsed: false,
         skillRouteFallback: this.model.name === "fake",
@@ -1011,7 +620,6 @@ export class AoriDemandAnswerEngine {
       modelName: this.model.name,
       chunkEvidencePack: evidencePack,
       records,
-      operationResult,
       chunks: usedChunks,
       plan,
     });

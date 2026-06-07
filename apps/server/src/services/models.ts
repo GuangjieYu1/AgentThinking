@@ -32,7 +32,6 @@ import type {
   FacetFactRowExtractionInput,
   FacetTimeFilterInput,
   FacetTimeFilterResult,
-  DemandOperationResult,
   GraphRuleStage,
   MappingAudit,
   MappingAuditResult,
@@ -662,7 +661,6 @@ function cleanFacetCountResult(value: unknown, input: FacetCountDedupeInput): Fa
 
 const demandRecordSources = ["aspect_items", "relations", "chunks", "document_summary"] as const;
 const demandRecordCoverage = ["single", "some", "all"] as const;
-const demandOperationTypes = ["filter", "count", "sum", "list", "group_by", "compare", "timeline", "explain", "direct_answer"] as const;
 
 function cleanDemandAnswerPlan(value: unknown, input: DemandAnswerPlanInput): DemandAnswerPlan {
   const source = normalizedUnknownObject(value);
@@ -716,28 +714,6 @@ function cleanDemandAnswerPlan(value: unknown, input: DemandAnswerPlanInput): De
     coverage: "some",
   };
   const finalRecords = requiredRecords.length > 0 ? requiredRecords : [fallbackRecord];
-  const availableRecordNames = new Set(finalRecords.map((record) => record.recordName));
-  const operations = (Array.isArray(source.operations) ? source.operations : [])
-    .slice(0, 12)
-    .flatMap((entry, index): DemandAnswerPlan["operations"] => {
-      const operation = normalizedUnknownObject(entry);
-      const type = demandOperationTypes.includes(operation.type as DemandAnswerPlan["operations"][number]["type"])
-        ? operation.type as DemandAnswerPlan["operations"][number]["type"]
-        : "direct_answer";
-      const inputRecord = typeof operation.inputRecord === "string" && availableRecordNames.has(operation.inputRecord)
-        ? operation.inputRecord
-        : finalRecords[0]?.recordName ?? "source_evidence";
-      const outputName = normalizedText(operation.outputName, `operation_${index + 1}`, 120);
-      availableRecordNames.add(outputName);
-      return [{
-        type,
-        inputRecord,
-        ...(typeof operation.field === "string" && operation.field.trim() ? { field: truncateText(operation.field.trim(), 120) } : {}),
-        ...(typeof operation.condition === "string" && operation.condition.trim() ? { condition: truncateText(operation.condition.trim(), 500) } : {}),
-        outputName,
-        reason: normalizedText(operation.reason, "Demand plan operation generated for this question.", 800),
-      }];
-    });
   const answerPolicy = normalizedUnknownObject(source.answerPolicy);
   return {
     answerGoal: normalizedText(source.answerGoal, input.question, 600),
@@ -748,12 +724,6 @@ function cleanDemandAnswerPlan(value: unknown, input: DemandAnswerPlanInput): De
       reason: normalizedText(targetScope.reason, "Demand planner selected the source scope from the AORI map.", 800),
     },
     requiredRecords: finalRecords,
-    operations: operations.length > 0 ? operations : [{
-      type: "direct_answer",
-      inputRecord: finalRecords[0]?.recordName ?? "source_evidence",
-      outputName: "answer",
-      reason: "No explicit operation returned; use source-bound direct answer.",
-    }],
     answerPolicy: {
       mustCiteSourceChunks: typeof answerPolicy.mustCiteSourceChunks === "boolean" ? answerPolicy.mustCiteSourceChunks : true,
       allowPartialAnswer: typeof answerPolicy.allowPartialAnswer === "boolean" ? answerPolicy.allowPartialAnswer : true,
@@ -764,7 +734,7 @@ function cleanDemandAnswerPlan(value: unknown, input: DemandAnswerPlanInput): De
         800,
       ),
     },
-    reason: normalizedText(source.reason, "Demand planner generated records and operations for this question.", 1200),
+    reason: normalizedText(source.reason, "Demand planner generated source records, fields, and coverage for this question.", 1200),
     confidence: safeConfidence(source.confidence),
   };
 }
@@ -783,9 +753,10 @@ function cleanEvidenceRecord(value: unknown, input: DemandEvidenceRecordExtracti
       : truncateText(fallbackQuote, 500);
     fields[fieldSpec.name] = {
       value: Object.hasOwn(rawField, "value") ? rawField.value : null,
+      chunkId: evidenceChunkIds[0] ?? input.chunks[0]?.id ?? "",
       confidence: safeConfidence(rawField.confidence),
       evidenceChunkIds: evidenceChunkIds.length > 0 ? evidenceChunkIds : input.chunks.flatMap((chunk) => chunk.id).slice(0, 1),
-      ...(quote ? { quote } : {}),
+      quote,
       ...(typeof rawField.uncertainty === "string" && rawField.uncertainty.trim()
         ? { uncertainty: truncateText(rawField.uncertainty.trim(), 500) }
         : {}),
@@ -1645,6 +1616,16 @@ export class FakeModelProvider implements ModelProvider {
     const hasTimeline = /timeline|\u65f6\u95f4\u7ebf|\u6309\u65f6\u95f4|\u54ea\u4e9b\u4e8b/.test(question);
     const hasArgument = /argument|defense|court|response|\u8fa9\u62a4|\u6cd5\u9662|\u91c7\u7eb3|\u56de\u5e94|\u4e0a\u8bc9/.test(question);
     const coverage: DemandAnswerPlan["requiredRecords"][number]["coverage"] = hasCount || hasAmount || hasTimeline || hasArgument ? "all" : "single";
+    const scoredItems = (target?.items ?? [])
+      .map((item, index) => {
+        const text = `${item.title} ${item.summary}`.normalize("NFKC").toLowerCase();
+        const score = [...question].filter((char) => /[\p{Script=Han}a-z0-9]/u.test(char) && text.includes(char)).length;
+        return { item, index, score };
+      })
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+    const selectedNodeIds = coverage === "all"
+      ? []
+      : scoredItems.filter((entry) => entry.score > 0).slice(0, coverage === "single" ? 1 : 8).map((entry) => entry.item.nodeId);
     const fields: DemandAnswerPlan["requiredRecords"][number]["fields"] = hasAmount
       ? [
         { name: "source_name", description: "Source person or organization for the value.", required: true },
@@ -1675,74 +1656,18 @@ export class FakeModelProvider implements ModelProvider {
               { name: "status", description: "Accepted/rejected/partial status.", required: false },
               { name: "evidence", description: "Source quote supporting the pair.", required: true },
             ]
-            : [
-              { name: "answer_value", description: "Direct answer value.", required: true },
-              { name: "gift", description: "Gift/payment/property if the question asks what was given.", required: false },
-              { name: "source_name", description: "Relevant source/entity.", required: false },
-              { name: "evidence", description: "Source quote supporting the answer.", required: true },
-            ];
-    const operations: DemandAnswerPlan["operations"] = [];
-    const scopedRecordName = year ? `${year}_records` : recordName;
-    if (year) {
-      operations.push({
-        type: "filter",
-        inputRecord: recordName,
-        field: "time_range",
-        condition: `time_range overlaps ${year}`,
-        outputName: `${year}_records`,
-        reason: "The question asks about a specific year, so records must be filtered before answering.",
-      });
-    }
-    if (hasAmount) {
-      operations.push({
-        type: "sum",
-        inputRecord: scopedRecordName,
-        field: "amount",
-        outputName: year ? `${year}_confirmed_amount` : "confirmed_total_amount",
-        reason: "Amounts must be summed by program arithmetic from extracted records.",
-      });
-    } else if (hasCount) {
-      operations.push({
-        type: "list",
-        inputRecord: scopedRecordName,
-        field: "source_name",
-        outputName: "source_list",
-        reason: "The answer needs the complete source list before counting.",
-      }, {
-        type: "count",
-        inputRecord: "source_list",
-        field: "source_name",
-        outputName: "source_count",
-        reason: "Count distinct source names after extraction and dedupe.",
-      });
-    } else if (hasTimeline) {
-      operations.push({
-        type: "timeline",
-        inputRecord: scopedRecordName,
-        field: "time_range",
-        outputName: "timeline",
-        reason: "The question asks for events in chronological order.",
-      });
-    } else if (hasArgument) {
-      operations.push({
-        type: "explain",
-        inputRecord: recordName,
-        outputName: "argument_response",
-        reason: "The answer should align arguments with responses and findings.",
-      });
-    } else {
-      operations.push({
-        type: "direct_answer",
-        inputRecord: recordName,
-        outputName: "answer",
-        reason: "The question can be answered from one or a few source-bound records.",
-      });
-    }
+        : [
+          { name: "answer_value", description: "Direct answer value.", required: true },
+          { name: "gift", description: "Gift/payment/property if the question asks what was given.", required: false },
+          { name: "source_name", description: "Relevant source/entity.", required: false },
+          { name: "evidence", description: "Source quote supporting the answer.", required: true },
+        ];
     return {
       answerGoal: input.question,
       targetScope: {
         ...(target ? { aspectIds: [target.aspectId] } : {}),
-        reason: "Fake provider demand planner selected the largest source-bound AORI aspect for this question.",
+        ...(selectedNodeIds.length > 0 ? { nodeIds: selectedNodeIds } : {}),
+        reason: "Fake provider demand planner selected source-bound AORI scope for this question.",
       },
       requiredRecords: [{
         recordName,
@@ -1751,7 +1676,6 @@ export class FakeModelProvider implements ModelProvider {
         fields,
         coverage,
       }],
-      operations,
       answerPolicy: {
         mustCiteSourceChunks: true,
         allowPartialAnswer: true,
@@ -1792,6 +1716,7 @@ export class FakeModelProvider implements ModelProvider {
       if (/response|court|回应|法院/.test(normalized)) return readLabel(["response", "court_response"]) ?? null;
       if (/finding|认定/.test(normalized)) return readLabel(["finding"]) ?? null;
       if (/status|采纳/.test(normalized)) return readLabel(["status"]) ?? null;
+      if (/answer_value|answer|答案/.test(normalized)) return readLabel(["answer_value", "answer"]) ?? (quote || input.sourceItem.summary);
       if (/evidence|quote|证据/.test(normalized)) return quote || null;
       return readLabel([field]) ?? null;
     };
@@ -1799,9 +1724,10 @@ export class FakeModelProvider implements ModelProvider {
       const value = fieldValue(fieldSpec.name);
       return [fieldSpec.name, {
         value,
+        chunkId: chunkIds[0] ?? "",
         confidence: value === null || value === undefined || (Array.isArray(value) && value.length === 0) ? 0.25 : 0.78,
         evidenceChunkIds: chunkIds,
-        ...(quote ? { quote } : {}),
+        quote,
         ...(value === null || value === undefined ? { uncertainty: `Field ${fieldSpec.name} was not explicit in the source chunks.` } : {}),
       } satisfies EvidenceRecordField];
     }));
@@ -1815,32 +1741,81 @@ export class FakeModelProvider implements ModelProvider {
   }
 
   async synthesizeDemandAnswer(input: DemandAnswerSynthesisInput): Promise<PulseAnswerOutput> {
-    const operationLines = input.operationResult.operationResults.map((operation) => {
-      const included = operation.includedRecordIds.length;
-      const excluded = operation.excludedRecordIds.length;
-      const uncertain = operation.uncertainRecordIds.length;
-      return `${operation.outputName}: ${JSON.stringify(operation.result)} (included=${included}, excluded=${excluded}, uncertain=${uncertain})`;
+    const question = input.question.normalize("NFKC").toLowerCase();
+    const year = question.match(/\b(19|20)\d{2}\b/u)?.[0];
+    const valueText = (value: unknown): string => {
+      if (value === null || value === undefined) return "";
+      if (Array.isArray(value)) return value.map(valueText).filter(Boolean).join(", ");
+      if (typeof value === "object") return JSON.stringify(value);
+      return String(value).trim();
+    };
+    const fieldValue = (record: EvidenceRecord, patterns: RegExp[]): string => {
+      const entry = Object.entries(record.fields).find(([name, field]) =>
+        patterns.some((pattern) => pattern.test(name)) && valueText(field.value)
+      );
+      return entry ? valueText(entry[1].value) : "";
+    };
+    const sourceName = (record: EvidenceRecord): string =>
+      fieldValue(record, [/source/i, /name/i, /来源/u, /姓名/u]) || record.sourceItemId || record.recordId;
+    const cited = (record: EvidenceRecord): string => `[${record.evidenceChunkIds.join(", ")}]`;
+    const timeValue = (record: EvidenceRecord): string => fieldValue(record, [/time/i, /date/i, /year/i, /时间/u, /日期/u]);
+    const exactYearRecords = (records: EvidenceRecord[]): EvidenceRecord[] => records.filter((record) => year && timeValue(record) === year);
+    const uncertainYearRecords = (records: EvidenceRecord[]): EvidenceRecord[] => records.filter((record) => {
+      if (!year) return false;
+      const time = timeValue(record);
+      return !time || (time.includes(year) && time !== year);
     });
-    const facts = input.operationResult.answerFacts.map((fact) => `- ${fact.text} [${fact.evidenceChunkIds.join(", ")}]`);
-    const insufficient = input.operationResult.status === "insufficient";
+    const uniqueNames = (records: EvidenceRecord[]): string[] => uniqueStrings(records.map(sourceName));
+    const hasCount = /how many|count|list|\u591a\u5c11\u4eba|\u51e0\u4eba|\u603b\u5171|\u5217\u51fa|\u540d\u5b57|\u540d\u5355/.test(question);
+    const hasTimeline = /timeline|\u65f6\u95f4\u7ebf|\u6309\u65f6\u95f4|\u54ea\u4e9b\u4e8b/.test(question);
+    const hasAmount = /amount|money|sum|total|\u91d1\u989d|\u94b1|\u603b\u989d|\u52a0\u8d77\u6765|\u53d7\u8d3f\u591a\u5c11/.test(question);
+    const hasArgument = /argument|defense|court|response|\u8fa9\u62a4|\u6cd5\u9662|\u91c7\u7eb3|\u56de\u5e94|\u4e0a\u8bc9/.test(question);
+    const includedByYear = year ? exactYearRecords(input.records) : input.records;
+    const uncertainByYear = year ? uncertainYearRecords(input.records) : [];
+    const answerLines: string[] = [`Answer goal: ${input.plan.answerGoal}`];
+    if (input.records.length === 0) {
+      answerLines.push(`Evidence is insufficient: ${input.plan.answerPolicy.whatCountsAsInsufficient}`);
+    } else if (hasCount) {
+      const names = uniqueNames(includedByYear);
+      answerLines.push(JSON.stringify({ count: names.length, values: names }));
+      if (uncertainByYear.length > 0) answerLines.push(`Uncertain records: ${uniqueNames(uncertainByYear).join(", ")}`);
+    } else if (hasTimeline) {
+      const events = includedByYear.map((record) => `${timeValue(record) || "unknown"} ${fieldValue(record, [/event/i, /事件/u]) || sourceName(record)} ${cited(record)}`);
+      answerLines.push(events.length > 0 ? events.join("\n") : "No exact timeline events could be determined from the extracted records.");
+      if (uncertainByYear.length > 0) answerLines.push(`Uncertain records: ${uniqueNames(uncertainByYear).join(", ")}`);
+    } else if (hasAmount) {
+      const amountRows = includedByYear
+        .map((record) => ({ record, amount: fieldValue(record, [/amount/i, /money/i, /金额/u, /总额/u]) }))
+        .filter((entry) => entry.amount);
+      if (year && amountRows.length === 0) {
+        answerLines.push(`${year} amount: null`);
+        if (uncertainByYear.length > 0) answerLines.push(`Uncertain records: ${uniqueNames(uncertainByYear).join(", ")}`);
+      } else {
+        answerLines.push(amountRows.map((entry) => `${sourceName(entry.record)}: ${entry.amount} ${cited(entry.record)}`).join("\n") || "No source-bound amount value was extracted.");
+      }
+    } else if (hasArgument) {
+      answerLines.push(input.records.map((record) => [
+        fieldValue(record, [/argument/i, /defense/i, /辩护/u, /意见/u]),
+        fieldValue(record, [/response/i, /court/i, /回应/u, /法院/u]),
+        fieldValue(record, [/finding/i, /认定/u]),
+        fieldValue(record, [/status/i, /采纳/u]),
+        cited(record),
+      ].filter(Boolean).join("; ")).join("\n"));
+    } else {
+      answerLines.push(input.records.map((record) => {
+        const fields = Object.entries(record.fields)
+          .map(([name, field]) => `${name}: ${valueText(field.value)}`)
+          .filter((line) => !line.endsWith(": "));
+        return `${sourceName(record)}: ${fields.join("; ")} ${cited(record)}`;
+      }).join("\n"));
+    }
     return {
-      answer: [
-        `Answer goal: ${input.plan.answerGoal}`,
-        insufficient
-          ? `Evidence is insufficient: ${input.operationResult.warnings.join("; ") || input.plan.answerPolicy.whatCountsAsInsufficient}`
-          : `Status: ${input.operationResult.status}`,
-        "Operations:",
-        ...operationLines,
-        "Answer facts:",
-        ...(facts.length > 0 ? facts : ["- No source-bound answer facts were produced."]),
-        input.operationResult.warnings.length > 0 ? `Warnings: ${input.operationResult.warnings.join("; ")}` : "Warnings: none",
-      ].join("\n"),
-      summary: `Demand answer ${input.operationResult.status} with ${input.records.length} record(s) and ${input.operationResult.operationResults.length} operation(s).`,
+      answer: answerLines.join("\n"),
+      summary: `Demand answer synthesized from ${input.records.length} EvidenceRecord(s).`,
       diagnostics: {
         answerPipeline: "aori_demand",
         demandPlan: input.plan,
         evidenceRecords: input.records,
-        demandOperationResult: input.operationResult,
         sourceChunkIds: uniqueStrings(input.records.flatMap((record) => record.evidenceChunkIds)),
         fallbackTraversalUsed: false,
         skillRouteFallback: this.name === "fake",
@@ -3129,12 +3104,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
           content:
             "You are the AORI Demand Answer Planner. Generate a temporary answer plan for this single user question. " +
             "Do not choose a fixed skill name. Use the AORI map only as navigation. " +
-            "Decide which source-bound records, fields, coverage, and operations are needed. " +
+            "Decide which source-bound records to extract, which fields each record needs, and whether coverage is single, some, or all. " +
             "AORI summaries and document cards are navigation hints, never final evidence. " +
             "Prefer full aspect item coverage for exhaustive count/list/sum questions, and narrow coverage for single fact lookup. " +
-            "If an operation filters by a field, include that field in requiredRecords.fields. Later operations should consume prior operation outputName when appropriate. " +
-            "Operations may consume either a requiredRecords recordName or a previous operation outputName. " +
-            'Return JSON only matching: {"answerGoal":"...","targetScope":{"documentIds":[],"aspectIds":[],"nodeIds":[],"reason":"..."},"requiredRecords":[{"recordName":"...","source":"aspect_items|relations|chunks|document_summary","aspectId":"...","fields":[{"name":"...","description":"...","required":true}],"coverage":"single|some|all"}],"operations":[{"type":"filter|count|sum|list|group_by|compare|timeline|explain|direct_answer","inputRecord":"...","field":"...","condition":"...","outputName":"...","reason":"..."}],"answerPolicy":{"mustCiteSourceChunks":true,"allowPartialAnswer":true,"exposeUncertainty":true,"whatCountsAsInsufficient":"..."},"reason":"...","confidence":0.8}.',
+            "If the final answer will need filtering, counting, listing, summing, grouping, comparison, chronology, or uncertainty judgments, request the raw fields the synthesizer needs to make those judgments later. " +
+            "For single/some coverage, put specific AORI item node ids in targetScope.nodeIds when the item cards make that possible; otherwise choose broader coverage rather than guessing. " +
+            'Return JSON only matching: {"answerGoal":"...","targetScope":{"documentIds":[],"aspectIds":[],"nodeIds":[],"reason":"..."},"requiredRecords":[{"recordName":"...","source":"aspect_items|relations|chunks|document_summary","aspectId":"...","fields":[{"name":"...","description":"...","required":true}],"coverage":"single|some|all"}],"answerPolicy":{"mustCiteSourceChunks":true,"allowPartialAnswer":true,"exposeUncertainty":true,"whatCountsAsInsufficient":"..."},"reason":"...","confidence":0.8}.',
         },
         { role: "user", content: JSON.stringify(input) },
       ],
@@ -3192,8 +3167,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
           role: "system",
           content:
             "Write the final answer for the AORI Demand Answer Engine. " +
-            "Use only EvidenceRecord fields and DemandOperationResult. Do not use AORI summaries as evidence. " +
-            "State the answer scope/policy. State included, excluded, and uncertain records. " +
+            "Use only the user question, Demand Plan, EvidenceRecords, and each field's chunk id plus source quote. Do not use AORI summaries as evidence. " +
+            "You, not program code, must perform any filtering, counting, listing, summing, grouping, comparison, chronology, explanation, and uncertainty judgment required by the question. " +
+            "State the answer scope/policy. State included, excluded, and uncertain records when that matters. " +
             "If evidence is insufficient, say it is insufficient. Never convert empty records or missing numeric fields into 0. " +
             "Cite chunk ids and source quotes from EvidenceRecord fields when making factual claims. " +
             'Return JSON only: {"answer":"...","summary":"...","diagnostics":{"warnings":[]}}.',
@@ -3217,7 +3193,6 @@ export class OpenAICompatibleProvider implements ModelProvider {
         answerPipeline: "aori_demand",
         demandPlan: input.plan,
         evidenceRecords: input.records,
-        demandOperationResult: input.operationResult,
         sourceChunkIds: uniqueStrings(input.records.flatMap((record) => record.evidenceChunkIds)),
         fallbackTraversalUsed: false,
       },

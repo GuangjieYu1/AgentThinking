@@ -1121,23 +1121,6 @@ export interface DemandAnswerPlan {
     }>;
     coverage: "single" | "some" | "all";
   }>;
-  operations: Array<{
-    type:
-      | "filter"
-      | "count"
-      | "sum"
-      | "list"
-      | "group_by"
-      | "compare"
-      | "timeline"
-      | "explain"
-      | "direct_answer";
-    inputRecord: string;
-    field?: string | undefined;
-    condition?: string | undefined;
-    outputName: string;
-    reason: string;
-  }>;
   answerPolicy: {
     mustCiteSourceChunks: boolean;
     allowPartialAnswer: boolean;
@@ -1159,6 +1142,13 @@ export interface DemandAnswerPlanInput {
     domainKind: string;
     summary: string;
     itemCount: number;
+    items?: Array<{
+      nodeId: string;
+      itemId?: string | undefined;
+      title: string;
+      summary: string;
+      chunkCount: number;
+    }> | undefined;
   }>;
   relationLexicon?: Array<{
     domainRelation: string;
@@ -1168,9 +1158,10 @@ export interface DemandAnswerPlanInput {
 
 export interface EvidenceRecordField {
   value: unknown;
+  chunkId: string;
   confidence: number;
   evidenceChunkIds: string[];
-  quote?: string | undefined;
+  quote: string;
   uncertainty?: string | undefined;
 }
 
@@ -1198,42 +1189,10 @@ export interface DemandEvidenceRecordExtractionInput {
   }>;
 }
 
-export interface DemandOperationResult {
-  operationResults: Array<{
-    outputName: string;
-    type: string;
-    result: unknown;
-    includedRecordIds: string[];
-    excludedRecordIds: Array<{
-      recordId: string;
-      reason: string;
-    }>;
-    uncertainRecordIds: Array<{
-      recordId: string;
-      reason: string;
-    }>;
-    warnings: string[];
-  }>;
-  answerFacts: Array<{
-    text: string;
-    recordIds: string[];
-    evidenceChunkIds: string[];
-  }>;
-  status: "complete" | "partial" | "insufficient";
-  warnings: string[];
-}
-
-export interface DemandOperationExecutionInput {
-  question: string;
-  plan: DemandAnswerPlan;
-  records: EvidenceRecord[];
-}
-
 export interface DemandAnswerSynthesisInput {
   question: string;
   plan: DemandAnswerPlan;
   records: EvidenceRecord[];
-  operationResult: DemandOperationResult;
 }
 
 export interface BfsExpansionInput {
@@ -1867,7 +1826,6 @@ export type PulseStreamEvent =
       | "demand_plan_generated"
       | "demand_records_started"
       | "demand_record_extracted"
-      | "demand_operations_finished"
       | "demand_answer_synthesized";
     message: string;
     payload?: unknown;
@@ -1958,7 +1916,6 @@ export type PulseEvidenceTool =
   | "synthesizeFacetCountAnswer"
   | "planDemandAnswer"
   | "extractEvidenceRecords"
-  | "executeDemandOperations"
   | "synthesizeDemandAnswer";
 
 export type PulseEvidenceType = "fact" | "amount" | "date" | "entity_relation" | "claim" | "quote" | "timeline_event" | "table_value" | "other";
@@ -2419,7 +2376,6 @@ export interface PulseAnswerOutput {
     targetAspects?: AoriSkillRoute["targetAspects"] | undefined;
     demandPlan?: DemandAnswerPlan | undefined;
     evidenceRecords?: EvidenceRecord[] | undefined;
-    demandOperationResult?: DemandOperationResult | undefined;
     facetFactTable?: FacetFactTable | undefined;
     facetOperation?: unknown;
     facetResult?: unknown;
@@ -2881,7 +2837,6 @@ export const pulseEvidenceToolValues = [
   "getGraphContext",
   "planDemandAnswer",
   "extractEvidenceRecords",
-  "executeDemandOperations",
   "synthesizeDemandAnswer",
 ] as const;
 

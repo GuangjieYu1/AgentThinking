@@ -2701,7 +2701,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         },
         { role: "user", content: JSON.stringify({ question, mode }) },
       ],
-      max_tokens: 900,
+      max_tokens: 90_000,
     };
     if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
     try {
@@ -2813,7 +2813,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         },
         { role: "user", content: JSON.stringify(input) },
       ],
-      max_tokens: 1200,
+      max_tokens: 120_000,
     };
     if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
     try {
@@ -2856,7 +2856,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         },
         { role: "user", content: JSON.stringify(input) },
       ],
-      max_tokens: 1600,
+      max_tokens: 160_000,
     };
     if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
     try {
@@ -2938,7 +2938,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         },
         { role: "user", content: JSON.stringify(input) },
       ],
-      max_tokens: 1200,
+      max_tokens: 120_000,
     };
     if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
     try {
@@ -2980,7 +2980,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         },
         { role: "user", content: JSON.stringify(input) },
       ],
-      max_tokens: 1600,
+      max_tokens: 160_000,
     };
     if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
     const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);
@@ -3008,7 +3008,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         },
         { role: "user", content: JSON.stringify(input) },
       ],
-      max_tokens: 1400,
+      max_tokens: 140_000,
     };
     if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
     const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", body);

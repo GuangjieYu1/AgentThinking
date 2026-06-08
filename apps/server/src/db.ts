@@ -60,6 +60,7 @@ import type {
   PulseHit,
   PulseInputMode,
   PulseHitTargetType,
+  PulseMetrics,
   PulsePathRole,
   PulseResponse,
   PulseStats,
@@ -421,7 +422,36 @@ function mappingAuditFrom(r: Row): MappingAudit {
   };
 }
 
+function parsePulseMetrics(value: unknown): PulseMetrics | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const durationMs = Number(parsed.durationMs);
+    const modelCalls = Number(parsed.modelCalls);
+    const promptTokens = Number(parsed.promptTokens);
+    const completionTokens = Number(parsed.completionTokens);
+    const totalTokens = Number(parsed.totalTokens);
+    const startedAt = typeof parsed.startedAt === "string" ? parsed.startedAt : "";
+    const completedAt = typeof parsed.completedAt === "string" ? parsed.completedAt : "";
+    if (!Number.isFinite(durationMs) || !Number.isFinite(modelCalls) || !Number.isFinite(promptTokens) || !Number.isFinite(completionTokens) || !Number.isFinite(totalTokens)) return undefined;
+    if (!startedAt || !completedAt) return undefined;
+    return {
+      durationMs,
+      startedAt,
+      completedAt,
+      modelCalls,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function pulseFrom(r: Row): Pulse {
+  const metrics = parsePulseMetrics(r.metrics_json);
   return {
     id: String(r.id),
     libraryId: String(r.library_id),
@@ -432,6 +462,7 @@ function pulseFrom(r: Row): Pulse {
     status: String(r.status) as PulseStatus,
     createdAt: String(r.created_at),
     reviewedAt: r.reviewed_at === null ? null : String(r.reviewed_at),
+    ...(metrics ? { metrics } : {}),
   };
 }
 
@@ -1017,6 +1048,7 @@ export class AgentDatabase {
         answer TEXT NOT NULL,
         summary TEXT NOT NULL,
         evidence_pack_json TEXT,
+        metrics_json TEXT,
         input_mode TEXT NOT NULL DEFAULT 'full' CHECK (input_mode IN ('full','progressive')),
         status TEXT NOT NULL CHECK (status IN ('unreviewed','correct','wrong')),
         reviewed_at TEXT,
@@ -1089,6 +1121,7 @@ export class AgentDatabase {
     this.addColumn("analysis_statements", "precheck_content_updated_at", "TEXT");
     this.addColumn("pulses", "input_mode", "TEXT NOT NULL DEFAULT 'full'");
     this.addColumn("pulses", "evidence_pack_json", "TEXT");
+    this.addColumn("pulses", "metrics_json", "TEXT");
     this.addColumn("document_versions", "index_schema_version", "INTEGER NOT NULL DEFAULT 1");
     this.addColumn("document_versions", "latest_ready_v1_build_id", "TEXT");
     this.addColumn("document_versions", "latest_ready_v2_build_id", "TEXT");
@@ -3995,15 +4028,26 @@ export class AgentDatabase {
     inputMode: PulseInputMode,
     hits: PendingPulseHit[],
     evidencePack?: EvidencePack,
+    metrics?: PulseMetrics,
   ): Pulse {
     const id = randomUUID();
     const timestamp = now();
     this.sql.exec("BEGIN");
     try {
       this.sql.prepare(`
-        INSERT INTO pulses (id, library_id, question, answer, summary, evidence_pack_json, input_mode, status, reviewed_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
-      `).run(id, libraryId, question, answer, summary, evidencePack ? JSON.stringify(evidencePack) : null, inputMode, timestamp);
+        INSERT INTO pulses (id, library_id, question, answer, summary, evidence_pack_json, metrics_json, input_mode, status, reviewed_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unreviewed', NULL, ?)
+      `).run(
+        id,
+        libraryId,
+        question,
+        answer,
+        summary,
+        evidencePack ? JSON.stringify(evidencePack) : null,
+        metrics ? JSON.stringify(metrics) : null,
+        inputMode,
+        timestamp,
+      );
       const insertHit = this.sql.prepare(`
         INSERT INTO pulse_hits
           (id, pulse_id, library_id, target_type, target_id, score, reason, path_role, step_index, observation, rationale, label, excerpt)

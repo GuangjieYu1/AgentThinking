@@ -1724,6 +1724,27 @@ export interface Pulse {
   status: PulseStatus;
   createdAt: string;
   reviewedAt: string | null;
+  metrics?: PulseMetrics | undefined;
+}
+
+export interface PulseMetrics {
+  durationMs: number;
+  startedAt: string;
+  completedAt: string;
+  modelCalls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+export interface ModelUsageMetricsCollector {
+  onModelUsage(metrics: {
+    model: string;
+    path: string;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  }): void;
 }
 
 export interface PulseHit {

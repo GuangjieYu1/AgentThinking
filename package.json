@@ -15,6 +15,7 @@
     "debug:index-status": "npm run debug:index-status -w @agent-thinking/server --",
     "build": "npm run build -w @agent-thinking/web && npm run build -w @agent-thinking/server",
     "test:evidence": "vitest run apps/server/test/evidence-v2.test.ts apps/server/test/context-units.test.ts apps/server/test/pulse-v2-evidence.test.ts",
+    "test:aori-pulse-eval": "vitest run apps/server/test/aori-pulse-eval.test.ts",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -117,6 +117,21 @@ interface PositionedNode extends SimulationNodeDatum {
   id: string;
 }
 
+function formatPulseDuration(durationMs: number | undefined): string {
+  if (!Number.isFinite(durationMs) || !durationMs || durationMs < 0) return "-";
+  if (durationMs < 1000) return `${Math.round(durationMs)} ms`;
+  const seconds = durationMs / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds >= 10 ? 1 : 2)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainSeconds = Math.round(seconds % 60);
+  return `${minutes}m ${remainSeconds}s`;
+}
+
+function formatPulseTokens(totalTokens: number | undefined): string {
+  if (!Number.isFinite(totalTokens) || totalTokens === undefined || totalTokens < 0) return "-";
+  return new Intl.NumberFormat("en-US").format(totalTokens);
+}
+
 function PulseBezierEdge(props: EdgeProps): ReactNode {
   return <PulseOrbEdge {...props} pathKind="bezier" />;
 }
@@ -2777,7 +2792,7 @@ export function GraphWorkspace({
             <option value="">历史脉冲</option>
             {activePulseHistory.map((pulse) => (
               <option key={pulse.id} value={pulse.id}>
-                {pulse.status === "correct" ? "正确" : pulse.status === "wrong" ? "错误" : "待判定"} · {pulse.question.slice(0, 28)}
+                {pulse.status === "correct" ? "正确" : pulse.status === "wrong" ? "错误" : "待判定"} · {pulse.question.slice(0, 22)} · {formatPulseDuration(pulse.metrics?.durationMs)} · {formatPulseTokens(pulse.metrics?.totalTokens)} tok
               </option>
             ))}
           </select>
@@ -3024,6 +3039,11 @@ export function GraphWorkspace({
                 onOpenChunk={openChunkCandidate}
               />
               <small>{visibleCurrentPulse.pulse.summary}</small>
+              <div className="pulse-metrics">
+                <span>耗时 {formatPulseDuration(visibleCurrentPulse.pulse.metrics?.durationMs)}</span>
+                <span>Token {formatPulseTokens(visibleCurrentPulse.pulse.metrics?.totalTokens)}</span>
+                <span>模型调用 {visibleCurrentPulse.pulse.metrics?.modelCalls ?? 0}</span>
+              </div>
               <PulseProcessLog events={pulseProcessEvents} limit={10} />
               {pulseMode === "current" && (
                 <div className="pulse-playback">

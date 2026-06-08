@@ -9,6 +9,7 @@ import type {
   GraphRuleTrace,
   IngestJob,
   IndexStrategy,
+  JobStage,
   Library,
   LibraryStreamEvent,
   LibrarySettings,
@@ -59,6 +60,27 @@ const mappingAuditFindingStatusLabels: Record<NonNullable<MappingAuditFinding["s
   dismissed: "已忽略",
   fixed: "已修复",
 };
+
+const jobStageLabels: Record<JobStage, string> = {
+  queued: "排队中",
+  parsing: "解析",
+  ocr: "OCR",
+  chunking: "切分",
+  embedding: "向量化",
+  extracting: "抽取",
+  indexing: "建索引",
+  completed: "已完成",
+  failed: "失败",
+};
+
+function summarizeJobs(jobs: IngestJob[]): { active: number; failed: number; completed: number } {
+  return jobs.reduce((summary, job) => {
+    if (job.stage === "failed") summary.failed += 1;
+    else if (job.stage === "completed") summary.completed += 1;
+    else summary.active += 1;
+    return summary;
+  }, { active: 0, failed: 0, completed: 0 });
+}
 
 function mappingAuditSeverityCounts(findings: MappingAuditFinding[]): { high: number; medium: number; low: number } {
   return findings.reduce((counts, finding) => {
@@ -385,7 +407,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   }>();
   const [ruleGovernanceFeed, setRuleGovernanceFeed] = useState<RuleGovernanceFeed>({ traces: [] });
   const [resourcePanelCollapsed, setResourcePanelCollapsed] = useState(false);
-  const activeJobs = useMemo(() => jobs.filter((job) => !["completed", "failed"].includes(job.stage)), [jobs]);
+  const jobSummary = useMemo(() => summarizeJobs(jobs), [jobs]);
 
   const reload = async () => {
     const [nextDocuments, nextJobs, nextSettings] = await Promise.all([
@@ -458,6 +480,15 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
       await api.deleteJob(jobId);
       await reload();
       setRefreshGraph((value) => value + 1);
+    } catch (cause) {
+      onError((cause as Error).message);
+    }
+  };
+
+  const retryJob = async (jobId: string) => {
+    try {
+      const job = await api.retry(jobId);
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
     } catch (cause) {
       onError((cause as Error).message);
     }
@@ -590,7 +621,8 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
           <h1>{library.name}</h1>
           <div className="workspace-meta">
             <span>{documents.length} 个文档</span>
-            <span>{activeJobs.length} 个处理中任务</span>
+            <span>{jobSummary.active} 个处理中任务</span>
+            {jobSummary.failed > 0 && <span>{jobSummary.failed} 个失败任务</span>}
             {analysis && <span>已有发布报告</span>}
           </div>
         </div>
@@ -684,17 +716,27 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
           <div className="panel-section">
             <div className="panel-section-heading">
               <h2>后台任务</h2>
-              <span>{jobs.length}</span>
+              <span>{jobSummary.active} 进行中 · {jobSummary.failed} 失败 · {jobSummary.completed} 完成</span>
             </div>
+            {jobSummary.failed > 0 && (
+              <div className="job-alert">
+                <strong>{jobSummary.failed} 个导入任务失败</strong>
+                <span>可在下方重试，或删除失败任务及对应导入版本。</span>
+              </div>
+            )}
             <div className="job-list">
               {jobs.slice(0, 8).map((job) => (
-                <div className="job" key={job.id}>
-                  <div><span>{job.stage}</span><small>{Math.round(job.progress * 100)}%</small></div>
+                <div className={`job ${job.stage}`} key={job.id}>
+                  <div>
+                    <span>{jobStageLabels[job.stage]}</span>
+                    <small>{Math.round(job.progress * 100)}%</small>
+                  </div>
                   <progress max={1} value={job.progress} />
+                  <small className="job-updated">{new Date(job.updatedAt).toLocaleString()}</small>
                   {job.error && <p>{job.error}</p>}
                   {job.stage === "failed" && (
                     <div className="job-actions">
-                      <button onClick={() => void api.retry(job.id).catch((cause: Error) => onError(cause.message))}>重试</button>
+                      <button onClick={() => void retryJob(job.id)}>重试</button>
                       <button className="danger" onClick={() => void deleteFailedJob(job.id)}>删除</button>
                     </div>
                   )}
@@ -970,13 +1012,11 @@ function MappingFindingComment({
 }
 
 function SourcePreview({ view, onClose }: { view: { structure: SourceStructure; text?: string; focus?: Citation; aori?: AoriDocumentResponse }; onClose: () => void }) {
-  const [activeTab, setActiveTab] = useState<"source" | "aori">("source");
   const chunkBodyRef = useRef<HTMLDivElement | null>(null);
   const textBodyRef = useRef<HTMLPreElement | null>(null);
   const { metadata, links, chunks } = view.structure;
   const lines = view.text?.replace(/\r\n?/g, "\n").split("\n") ?? [];
   useEffect(() => {
-    if (activeTab !== "source") return;
     const frame = window.requestAnimationFrame(() => {
       const body = view.text === undefined ? chunkBodyRef.current : textBodyRef.current;
       const target = body?.querySelector(".focused");
@@ -984,7 +1024,7 @@ function SourcePreview({ view, onClose }: { view: { structure: SourceStructure; 
       target.scrollIntoView({ block: "center", inline: "nearest" });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [activeTab, view.focus?.chunkId, view.focus?.startLine, view.focus?.endLine, view.text]);
+  }, [view.focus?.chunkId, view.focus?.startLine, view.focus?.endLine, view.text]);
   const sourceBody = view.text === undefined ? (
     <div className="source-chunks" ref={chunkBodyRef}>{chunks.map((chunk) => (
       <p className={view.focus?.chunkId === chunk.id ? "focused" : ""} key={chunk.id}>
@@ -1003,28 +1043,19 @@ function SourcePreview({ view, onClose }: { view: { structure: SourceStructure; 
       <section className="source-preview card">
         <header><h2>{metadata?.documentName ?? "来源预览"}</h2><button onClick={onClose}>关闭</button></header>
         {metadata?.title && <p className="source-title">解析标题：{metadata.title}</p>}
-        <div className="source-tabs">
-          <button className={activeTab === "source" ? "selected" : ""} type="button" onClick={() => setActiveTab("source")}>原文</button>
-          <button className={activeTab === "aori" ? "selected" : ""} type="button" onClick={() => setActiveTab("aori")}>AORI</button>
+        <div className="source-split">
+          <div className="source-main">
+            {metadata?.frontmatterRaw && <><h3>Frontmatter</h3><pre>{metadata.frontmatterRaw}</pre></>}
+            {links.length > 0 && <><h3>链接与块引用</h3><ul>{links.map((link) => <li key={link.id}>L{link.line} / {link.type}: {link.raw}</li>)}</ul></>}
+            {sourceBody}
+          </div>
+          <aside className="source-side">
+            <div className="source-side-heading">
+              <h3>AORI 记录</h3>
+            </div>
+            <AoriPreview aori={view.aori} />
+          </aside>
         </div>
-        {activeTab === "source" ? <>
-        {metadata?.frontmatterRaw && <><h3>Frontmatter</h3><pre>{metadata.frontmatterRaw}</pre></>}
-        {links.length > 0 && <><h3>链接与块引用</h3><ul>{links.map((link) => <li key={link.id}>L{link.line} / {link.type}: {link.raw}</li>)}</ul></>}
-        {sourceBody}
-        {false && (view.text === undefined ? (
-          <div className="source-chunks">{chunks.map((chunk) => (
-            <p className={view.focus?.chunkId === chunk.id ? "focused" : ""} key={chunk.id}>
-              {chunk.pageNumber ? `Page ${chunk.pageNumber}` : `Chunk ${chunk.ordinal + 1}`}: {chunk.text}
-            </p>
-          ))}</div>
-        ) : (
-          <pre className="source-text">{lines.map((line, index) => {
-            const number = index + 1;
-            const focused = view.focus?.startLine != null && number >= view.focus.startLine && number <= (view.focus.endLine ?? view.focus.startLine);
-            return <span className={focused ? "focused" : ""} key={number}><b>{number}</b>{line}{"\n"}</span>;
-          })}</pre>
-        ))}
-        </> : <AoriPreview aori={view.aori} />}
       </section>
     </div>
   );

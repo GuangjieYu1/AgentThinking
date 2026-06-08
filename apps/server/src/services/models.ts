@@ -36,6 +36,7 @@ import type {
   MappingAudit,
   MappingAuditResult,
   MappingAuditStatus,
+  ModelUsageMetricsCollector,
   ModelTestResult,
   PulseAnswerContext,
   PulseAnswerOutput,
@@ -1110,6 +1111,7 @@ function isMappingAuditEnumValidationError(cause: unknown): boolean {
 export interface ModelProvider {
   readonly name: string;
   readonly configured: boolean;
+  setUsageMetricsCollector?(collector: ModelUsageMetricsCollector | undefined): void;
   embed(texts: string[]): Promise<number[][]>;
   extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>, options?: ExtractionRuleOptions): Promise<ExtractionOutput>;
   extractAoriDocument(input: {
@@ -1235,6 +1237,8 @@ function demoAspects(_text: string, kind: "concept" | "claim"): AspectKind[] {
 export class FakeModelProvider implements ModelProvider {
   readonly name = "fake";
   readonly configured = true;
+
+  setUsageMetricsCollector(): void {}
 
   async embed(texts: string[]): Promise<number[][]> {
     return texts.map((text) => hashedEmbedding(text));
@@ -2119,6 +2123,7 @@ export class FakeModelProvider implements ModelProvider {
 
 export class OpenAICompatibleProvider implements ModelProvider {
   readonly name: string;
+  private usageMetricsCollector: ModelUsageMetricsCollector | undefined;
 
   constructor(private readonly config: AppConfig) {
     this.name = config.provider === "deepseek" ? "deepseek" : "openai-compatible";
@@ -2131,6 +2136,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
       (this.config.embeddingProvider === "local" ||
         (this.config.embeddingApiKey && this.config.embeddingModel)),
     );
+  }
+
+  setUsageMetricsCollector(collector: ModelUsageMetricsCollector | undefined): void {
+    this.usageMetricsCollector = collector;
   }
 
   private async request<T>(baseUrl: string, apiKey: string | undefined, path: string, body: unknown): Promise<T> {
@@ -2147,7 +2156,26 @@ export class OpenAICompatibleProvider implements ModelProvider {
       const text = await response.text();
       throw new Error(`模型服务请求失败 (${response.status}): ${text.slice(0, 240)}`);
     }
-    return response.json() as Promise<T>;
+    const payload = await response.json() as T & {
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+      };
+    };
+    const promptTokens = Number(payload.usage?.prompt_tokens ?? 0);
+    const completionTokens = Number(payload.usage?.completion_tokens ?? 0);
+    const totalTokens = Number(payload.usage?.total_tokens ?? promptTokens + completionTokens);
+    if (this.usageMetricsCollector && (promptTokens > 0 || completionTokens > 0 || totalTokens > 0)) {
+      this.usageMetricsCollector.onModelUsage({
+        model: typeof (body as { model?: unknown })?.model === "string" ? String((body as { model?: unknown }).model) : this.name,
+        path,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+      });
+    }
+    return payload;
   }
 
   private async repairMappingAuditJson(raw: string, parseError: unknown): Promise<MappingAuditReview> {

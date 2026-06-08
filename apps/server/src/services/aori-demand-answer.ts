@@ -9,6 +9,7 @@ import type {
   EvidenceCitation,
   EvidencePack,
   EvidenceRecord,
+  PulseEvidenceGap,
   PulseAnswerOutput,
   PulseEvidenceRow,
   PulseInputMode,
@@ -508,6 +509,34 @@ function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[]): Retr
   }];
 }
 
+function emptyEvidenceValue(value: unknown): boolean {
+  return value === null || value === undefined || value === "" || (Array.isArray(value) && value.length === 0);
+}
+
+function buildDemandGaps(plan: DemandAnswerPlan, records: EvidenceRecord[], evidenceRows: PulseEvidenceRow[], question: string): PulseEvidenceGap[] {
+  if (records.length === 0 || evidenceRows.length === 0) {
+    return [{
+      type: "missing_itemized_evidence",
+      description: plan.answerPolicy.whatCountsAsInsufficient,
+      suggestedQueries: [question],
+      severity: "medium",
+    }];
+  }
+  const requiredFields = plan.requiredRecords.flatMap((recordSpec) =>
+    recordSpec.fields.filter((field) => field.required).map((field) => field.name)
+  );
+  const missing = records.flatMap((record) =>
+    requiredFields.filter((fieldName) => emptyEvidenceValue(record.fields[fieldName]?.value)).map((fieldName) => `${record.sourceItemId ?? record.recordId}.${fieldName}`)
+  );
+  if (missing.length === 0) return [];
+  return [{
+    type: "missing_itemized_evidence",
+    description: `Demand answer is missing required source fields: ${missing.join(", ")}.`,
+    suggestedQueries: [question, ...missing.slice(0, 4)],
+    severity: "high",
+  }];
+}
+
 function buildStorageEvidencePack(input: {
   question: string;
   modelName: string;
@@ -547,18 +576,15 @@ function buildStorageEvidencePack(input: {
     summaryNodes: [],
     evidenceRows,
     citations: buildCitations(evidenceRows, input.chunks),
-    gaps: input.records.length === 0 || evidenceRows.length === 0 ? [{
-      type: "missing_itemized_evidence",
-      description: input.plan.answerPolicy.whatCountsAsInsufficient,
-      suggestedQueries: [input.question],
-      severity: "medium",
-    }] : [],
+    gaps: buildDemandGaps(input.plan, input.records, evidenceRows, input.question),
     retrievalTrace: retrievalTrace(input.plan, input.records),
     diagnostics: {
       answerPipeline: "aori_demand",
       demandPlan: input.plan,
       evidenceRecords: input.records,
+      sourceChunkIds: allRecordChunkIds(input.records),
       fallbackTraversalUsed: false,
+      skillRouteFallback: input.modelName === "fake",
     },
   };
 }

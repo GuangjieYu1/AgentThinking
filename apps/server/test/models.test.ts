@@ -31,9 +31,12 @@ describe("DeepSeek model configuration", () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       new Response(JSON.stringify({
         choices: [{ message: { content: JSON.stringify({ nodes: [], relations: [] }) } }],
+        usage: { prompt_tokens: 123, completion_tokens: 45, total_tokens: 168 },
       }), { status: 200, headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
     const provider = new OpenAICompatibleProvider(config);
+    const usageCollector = { onModelUsage: vi.fn() };
+    provider.setUsageMetricsCollector(usageCollector);
     const chunk: Chunk = {
       id: "chunk-1",
       libraryId: "library-1",
@@ -58,6 +61,13 @@ describe("DeepSeek model configuration", () => {
     expect(body.thinking).toEqual({ type: "disabled" });
     expect(body.response_format).toEqual({ type: "json_object" });
     expect((body.messages as Array<{ content: string }>)[0]!.content).toContain("Relation Governance Rules");
+    expect(usageCollector.onModelUsage).toHaveBeenCalledWith({
+      model: "deepseek-v4-flash",
+      path: "/chat/completions",
+      promptTokens: 123,
+      completionTokens: 45,
+      totalTokens: 168,
+    });
   });
 
   it("keeps full source text in AORI long-context extraction requests", async () => {

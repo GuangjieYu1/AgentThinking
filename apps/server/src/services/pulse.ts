@@ -1,6 +1,8 @@
 import type {
   AbstractNode,
   Chunk,
+  ModelUsageMetricsCollector,
+  PulseMetrics,
   PulseInputMode,
   PulseNavigationCandidate,
   PulseResponse,
@@ -14,6 +16,13 @@ import { PulseEvidenceController } from "./pulse-evidence-controller.js";
 import type { VectorStore } from "./vector-store.js";
 
 type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
+
+interface PulseMetricsAccumulator {
+  modelCalls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
 
 function clampScore(value: number): number {
   if (!Number.isFinite(value)) return 0;
@@ -105,43 +114,97 @@ export class PulseEngine {
     mode: PulseInputMode = "full",
     eventSink?: PulseEventSink,
   ): Promise<PulseResponse> {
+    const startedAt = new Date().toISOString();
+    const startedAtMs = Date.now();
+    const metricsAccumulator: PulseMetricsAccumulator = {
+      modelCalls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    };
+    const usageCollector: ModelUsageMetricsCollector = {
+      onModelUsage: (metrics) => {
+        metricsAccumulator.modelCalls += 1;
+        metricsAccumulator.promptTokens += metrics.promptTokens;
+        metricsAccumulator.completionTokens += metrics.completionTokens;
+        metricsAccumulator.totalTokens += metrics.totalTokens;
+      },
+    };
+    this.model.setUsageMetricsCollector?.(usageCollector);
     await emitPulse(eventSink, { type: "start", mode, question });
-    const aoriAnswerMode = this.options.aoriAnswerMode ?? "demand";
-    if (aoriAnswerMode !== "legacy" && this.db.listAoriDocumentIndexes(libraryId).length > 0) {
-      const engine = new AoriDemandAnswerEngine(this.db, this.model);
-      const result = await engine.answer({
-        libraryId,
-        question,
-        mode,
-        ...(eventSink ? { eventSink } : {}),
-      });
-      await emitPulse(eventSink, { type: "answer", answer: result.answer.answer, summary: result.answer.summary });
-      await emitPulse(eventSink, { type: "stage", message: "正在保存 AORI answer 脉冲结果" });
-      const pulse = this.db.createPulse(
-        libraryId,
-        question,
-        result.answer.answer,
-        result.answer.summary,
-        mode,
-        result.hits,
-        result.storageEvidencePack,
-      );
-      const response = this.db.getPulseResponse(libraryId, pulse.id);
-      if (!response) throw new Error("脉冲创建后读取失败");
+    try {
+      const aoriAnswerMode = this.options.aoriAnswerMode ?? "demand";
+      if (aoriAnswerMode !== "legacy" && this.db.listAoriDocumentIndexes(libraryId).length > 0) {
+        const engine = new AoriDemandAnswerEngine(this.db, this.model);
+        const result = await engine.answer({
+          libraryId,
+          question,
+          mode,
+          ...(eventSink ? { eventSink } : {}),
+        });
+        await emitPulse(eventSink, { type: "answer", answer: result.answer.answer, summary: result.answer.summary });
+        await emitPulse(eventSink, { type: "stage", message: "正在保存 AORI answer 脉冲结果" });
+        const metrics = this.buildPulseMetrics(startedAt, startedAtMs, metricsAccumulator);
+        const pulse = this.db.createPulse(
+          libraryId,
+          question,
+          result.answer.answer,
+          result.answer.summary,
+          mode,
+          result.hits,
+          result.storageEvidencePack,
+          metrics,
+        );
+        const response = this.db.getPulseResponse(libraryId, pulse.id);
+        if (!response) throw new Error("脉冲创建后读取失败");
+        await emitPulse(eventSink, { type: "done", response });
+        return response;
+      }
+      const response = mode === "progressive"
+        ? await this.createProgressive(libraryId, question, eventSink, startedAt, startedAtMs, metricsAccumulator)
+        : await this.createFull(libraryId, question, eventSink, startedAt, startedAtMs, metricsAccumulator);
       await emitPulse(eventSink, { type: "done", response });
       return response;
+    } finally {
+      this.model.setUsageMetricsCollector?.(undefined);
     }
-    const response = mode === "progressive"
-      ? await this.createProgressive(libraryId, question, eventSink)
-      : await this.createFull(libraryId, question, eventSink);
-    await emitPulse(eventSink, { type: "done", response });
-    return response;
   }
 
-  private async createFull(libraryId: string, question: string, eventSink?: PulseEventSink): Promise<PulseResponse> {
+  private buildPulseMetrics(startedAt: string, startedAtMs: number, usage: PulseMetricsAccumulator): PulseMetrics {
+    return {
+      durationMs: Math.max(0, Date.now() - startedAtMs),
+      startedAt,
+      completedAt: new Date().toISOString(),
+      modelCalls: usage.modelCalls,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      totalTokens: usage.totalTokens,
+    };
+  }
+
+  private async createFull(
+    libraryId: string,
+    question: string,
+    eventSink?: PulseEventSink,
+    startedAt?: string,
+    startedAtMs?: number,
+    metricsAccumulator?: PulseMetricsAccumulator,
+  ): Promise<PulseResponse> {
     if (!this.model.configured) throw new Error("脉冲问答需要配置模型服务");
     if (this.db.listAoriDocumentIndexes(libraryId).length > 0) {
-      return this.finishPulse(libraryId, question, "full", new Map(), new Map(), new Map(), new Map(), eventSink);
+      return this.finishPulse(
+        libraryId,
+        question,
+        "full",
+        new Map(),
+        new Map(),
+        new Map(),
+        new Map(),
+        eventSink,
+        startedAt,
+        startedAtMs,
+        metricsAccumulator,
+      );
     }
     const hits = new Map<string, PendingPulseHit>();
     const chunks = new Map<string, Chunk>();
@@ -294,13 +357,32 @@ export class PulseEngine {
       }, eventSink);
     }
 
-    return this.finishPulse(libraryId, question, "full", hits, chunks, nodes, relations, eventSink);
+    return this.finishPulse(libraryId, question, "full", hits, chunks, nodes, relations, eventSink, startedAt, startedAtMs, metricsAccumulator);
   }
 
-  private async createProgressive(libraryId: string, question: string, eventSink?: PulseEventSink): Promise<PulseResponse> {
+  private async createProgressive(
+    libraryId: string,
+    question: string,
+    eventSink?: PulseEventSink,
+    startedAt?: string,
+    startedAtMs?: number,
+    metricsAccumulator?: PulseMetricsAccumulator,
+  ): Promise<PulseResponse> {
     if (!this.model.configured) throw new Error("脉冲问答需要配置模型服务");
     if (this.db.listAoriDocumentIndexes(libraryId).length > 0) {
-      return this.finishPulse(libraryId, question, "progressive", new Map(), new Map(), new Map(), new Map(), eventSink);
+      return this.finishPulse(
+        libraryId,
+        question,
+        "progressive",
+        new Map(),
+        new Map(),
+        new Map(),
+        new Map(),
+        eventSink,
+        startedAt,
+        startedAtMs,
+        metricsAccumulator,
+      );
     }
     const hits = new Map<string, PendingPulseHit>();
     const chunks = new Map<string, Chunk>();
@@ -312,7 +394,7 @@ export class PulseEngine {
 
     await emitPulse(eventSink, { type: "stage", message: "正在选择脉冲入口节点" });
     const rootNodes = this.db.listPulseRootNodes(libraryId, 24);
-    if (rootNodes.length === 0) return this.createFull(libraryId, question, eventSink);
+    if (rootNodes.length === 0) return this.createFull(libraryId, question, eventSink, startedAt, startedAtMs, metricsAccumulator);
 
     const rootCandidates = rootNodes.map((node) => this.nodeCandidate(node, 0.72));
     await emitPulse(eventSink, {
@@ -501,7 +583,7 @@ export class PulseEngine {
       stepIndex += 1;
     }
 
-    return this.finishPulse(libraryId, question, "progressive", hits, chunks, nodes, relations, eventSink);
+    return this.finishPulse(libraryId, question, "progressive", hits, chunks, nodes, relations, eventSink, startedAt, startedAtMs, metricsAccumulator);
   }
 
   private nodeCandidate(node: AbstractNode, score: number, relation?: Relation): PulseNavigationCandidate {
@@ -585,6 +667,9 @@ export class PulseEngine {
     nodes: Map<string, AbstractNode>,
     relations: Map<string, Relation>,
     eventSink?: PulseEventSink,
+    startedAt?: string,
+    startedAtMs?: number,
+    metricsAccumulator?: PulseMetricsAccumulator,
   ): Promise<PulseResponse> {
     const orderedHits = [...hits.values()]
       .sort((left, right) =>
@@ -626,7 +711,10 @@ export class PulseEngine {
     await emitPulse(eventSink, { type: "answer", answer: answer.answer, summary: answer.summary });
     await emitPulse(eventSink, { type: "stage", message: "正在保存脉冲结果" });
     const finalHits = orderedHits.length > 0 ? orderedHits : answer.hits;
-    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, finalHits, answer.evidencePack);
+    const metrics = startedAt && startedAtMs && metricsAccumulator
+      ? this.buildPulseMetrics(startedAt, startedAtMs, metricsAccumulator)
+      : undefined;
+    const pulse = this.db.createPulse(libraryId, question, answer.answer, answer.summary, mode, finalHits, answer.evidencePack, metrics);
     const response = this.db.getPulseResponse(libraryId, pulse.id);
     if (!response) throw new Error("脉冲创建后读取失败");
     return response;

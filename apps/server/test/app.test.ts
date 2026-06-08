@@ -389,13 +389,21 @@ describe("HTTP application", () => {
       url: `/api/libraries/${library.id}/pulses`,
       payload: { question: "claim follows" },
     })).json<{
-      pulse: { id: string; status: string; answer: string };
+      pulse: {
+        id: string;
+        status: string;
+        answer: string;
+        metrics?: { durationMs: number; totalTokens: number; modelCalls: number };
+      };
       hits: Array<{ targetType: string; pathRole: string }>;
       evidencePack: { evidenceRows: unknown[]; treeNodes: unknown[]; semanticNodes: unknown[]; summaryNodes: unknown[]; retrievalTrace: unknown[] };
       graph: { nodes: Array<{ pulseRole?: string; pulseStats?: { correctCount: number; wrongCount: number } }> };
     }>();
     expect(createdPulse.pulse.status).toBe("unreviewed");
     expect(createdPulse.pulse.answer).toContain("演示脉冲回答");
+    expect(createdPulse.pulse.metrics?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(createdPulse.pulse.metrics?.modelCalls).toBeGreaterThanOrEqual(0);
+    expect(createdPulse.pulse.metrics?.totalTokens).toBeGreaterThanOrEqual(0);
     expect(createdPulse.hits.some((hit) => hit.targetType === "node" && hit.pathRole === "direct")).toBe(true);
     expect(createdPulse.evidencePack.evidenceRows.length).toBeGreaterThan(0);
     expect(createdPulse.evidencePack.treeNodes.length).toBeGreaterThan(0);
@@ -409,8 +417,9 @@ describe("HTTP application", () => {
     expect(storedPack.evidenceRows.length).toBeGreaterThan(0);
     expect(createdPulse.graph.nodes.some((node) => node.pulseRole === "direct")).toBe(true);
     const listedPulses = (await app.inject({ method: "GET", url: `/api/libraries/${library.id}/pulses` }))
-      .json<Array<{ id: string }>>();
+      .json<Array<{ id: string; metrics?: { durationMs: number; totalTokens: number } }>>();
     expect(listedPulses[0]?.id).toBe(createdPulse.pulse.id);
+    expect(listedPulses[0]?.metrics?.durationMs).toBeGreaterThanOrEqual(0);
     const streamedPulse = await app.inject({
       method: "POST",
       url: `/api/libraries/${library.id}/pulses/stream`,

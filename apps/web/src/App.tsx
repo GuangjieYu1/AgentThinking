@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type {
   AoriDocumentResponse,
   AuthSession,
@@ -93,6 +93,45 @@ function mergeRuleSummary(current: GraphRulesSummary | undefined, next: GraphRul
       semantic_coverage: next.categoryCounts.semantic_coverage,
       graph_evolution: next.categoryCounts.graph_evolution,
     },
+  };
+}
+
+function lineNumberAt(text: string, charIndex: number): number {
+  const clamped = Math.max(0, Math.min(charIndex, text.length));
+  let line = 1;
+  for (let index = 0; index < clamped; index += 1) {
+    if (text.charCodeAt(index) === 10) line += 1;
+  }
+  return line;
+}
+
+function resolveFocusChunk(structure: SourceStructure, focus: Citation | undefined) {
+  if (!focus?.chunkId) return undefined;
+  return structure.chunks.find((chunk) => chunk.id === focus.chunkId);
+}
+
+function resolveSourceFocus(
+  structure: SourceStructure,
+  text: string | undefined,
+  focus: Citation | undefined,
+): Citation | undefined {
+  if (!focus) return undefined;
+  const chunk = resolveFocusChunk(structure, focus);
+  if (!chunk) return focus;
+  const startLine = focus.startLine ?? chunk.startLine ?? (
+    text ? lineNumberAt(text, chunk.startChar) : null
+  );
+  const endLine = focus.endLine ?? chunk.endLine ?? (
+    text ? lineNumberAt(text, Math.max(chunk.startChar, chunk.endChar - 1)) : null
+  );
+  return {
+    ...focus,
+    headingPath: focus.headingPath ?? chunk.headingPath,
+    pageNumber: focus.pageNumber ?? chunk.pageNumber,
+    startLine,
+    endLine,
+    blockId: focus.blockId ?? chunk.blockId,
+    excerpt: focus.excerpt || chunk.text.slice(0, 280),
   };
 }
 
@@ -431,21 +470,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
         ? await api.sourceText(versionId)
         : undefined;
       const aori = await api.aori(versionId).catch(() => undefined);
-      let resolvedFocus = focus;
-      if (focus?.chunkId && focus.startLine == null) {
-        const chunk = structure.chunks.find((item) => item.id === focus.chunkId);
-        if (chunk) {
-          resolvedFocus = {
-            ...focus,
-            headingPath: chunk.headingPath,
-            pageNumber: chunk.pageNumber,
-            startLine: chunk.startLine,
-            endLine: chunk.endLine,
-            blockId: chunk.blockId,
-            excerpt: chunk.text.slice(0, 280),
-          };
-        }
-      }
+      const resolvedFocus = resolveSourceFocus(structure, text, focus);
       setSourceView({
         structure,
         ...(text !== undefined ? { text } : {}),
@@ -946,16 +971,28 @@ function MappingFindingComment({
 
 function SourcePreview({ view, onClose }: { view: { structure: SourceStructure; text?: string; focus?: Citation; aori?: AoriDocumentResponse }; onClose: () => void }) {
   const [activeTab, setActiveTab] = useState<"source" | "aori">("source");
+  const chunkBodyRef = useRef<HTMLDivElement | null>(null);
+  const textBodyRef = useRef<HTMLPreElement | null>(null);
   const { metadata, links, chunks } = view.structure;
   const lines = view.text?.replace(/\r\n?/g, "\n").split("\n") ?? [];
+  useEffect(() => {
+    if (activeTab !== "source") return;
+    const frame = window.requestAnimationFrame(() => {
+      const body = view.text === undefined ? chunkBodyRef.current : textBodyRef.current;
+      const target = body?.querySelector(".focused");
+      if (!(target instanceof HTMLElement)) return;
+      target.scrollIntoView({ block: "center", inline: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeTab, view.focus?.chunkId, view.focus?.startLine, view.focus?.endLine, view.text]);
   const sourceBody = view.text === undefined ? (
-    <div className="source-chunks">{chunks.map((chunk) => (
+    <div className="source-chunks" ref={chunkBodyRef}>{chunks.map((chunk) => (
       <p className={view.focus?.chunkId === chunk.id ? "focused" : ""} key={chunk.id}>
         {chunk.pageNumber ? `Page ${chunk.pageNumber}` : `Chunk ${chunk.ordinal + 1}`}: {chunk.text}
       </p>
     ))}</div>
   ) : (
-    <pre className="source-text">{lines.map((line, index) => {
+    <pre className="source-text" ref={textBodyRef}>{lines.map((line, index) => {
       const number = index + 1;
       const focused = view.focus?.startLine != null && number >= view.focus.startLine && number <= (view.focus.endLine ?? view.focus.startLine);
       return <span className={focused ? "focused" : ""} key={number}><b>{number}</b>{line}{"\n"}</span>;

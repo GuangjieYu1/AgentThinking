@@ -57,7 +57,7 @@ import {
 import { api } from "./api";
 
 type VisualNode = Node<{ label: ReactNode; entity?: GraphNode; aori?: AoriGraphNode }>;
-type VisualEdge = Edge<{ entity?: GraphEdge; aori?: AoriGraphEdge }>;
+type VisualEdge = Edge<{ entity?: GraphEdge; aori?: AoriGraphEdge; pulse?: PulseDecorated }>;
 type LayoutMode = "layered" | "network" | "tree";
 type PulseLayerMode = "normal" | "current" | "stats" | "wrong" | "correct";
 type WorkspaceViewMode = "graph" | "evidence" | "document" | "retrieval" | "governance";
@@ -76,6 +76,20 @@ type PulseDecorated = { pulseActive?: boolean; pulseReverse?: boolean; pulseTran
 type PulseVisualHit = Pick<PulseHitRecord, "targetType" | "targetId">;
 type PulseDisplayHit = Pick<PulseStreamHitRecord, "targetType" | "targetId" | "score" | "pathRole">;
 type PulseHitListRecord = Pick<PulseStreamHitRecord, "label" | "reason" | "rationale" | "observation" | "excerpt" | "pathRole" | "score">;
+type AoriFocusPath = { rootNodeId?: string; nodeId: string };
+type ChunkCitationCandidate = {
+  chunkId: string;
+  versionId?: string;
+  documentName?: string;
+  mediaType?: string;
+  label?: string;
+  excerpt?: string;
+  headingPath?: string[] | string | null;
+  pageNumber?: number | null;
+  startLine?: number | null;
+  endLine?: number | null;
+  blockId?: string | null;
+};
 type DemandRecordEventPayload = {
   record?: EvidenceRecord;
   recordSpec?: DemandAnswerPlan["requiredRecords"][number];
@@ -130,7 +144,8 @@ function PulseOrbEdge({
   const [edgePath, labelX, labelY] = pathKind === "smoothstep"
     ? getSmoothStepPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
     : getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
-  const pulseMeta = (data as { entity?: PulseDecorated } | undefined)?.entity;
+  const pulseMeta = (data as { entity?: PulseDecorated; pulse?: PulseDecorated } | undefined)?.pulse ??
+    (data as { entity?: PulseDecorated } | undefined)?.entity;
   const reverse = Boolean(pulseMeta?.pulseReverse);
   const transitKey = pulseMeta?.pulseTransitKey ?? id;
   const edgeProps = {
@@ -577,6 +592,263 @@ function pulseProcessTitle(type: PulseProcessEvent["type"]): string {
 function compactText(value: string, max = 140): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 1)).trimEnd()}...` : normalized;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mergeChunkCandidate(
+  current: ChunkCitationCandidate | undefined,
+  next: ChunkCitationCandidate,
+): ChunkCitationCandidate {
+  const versionId = current?.versionId ?? next.versionId;
+  const documentName = current?.documentName ?? next.documentName;
+  const mediaType = current?.mediaType ?? next.mediaType;
+  const label = current?.label ?? next.label;
+  const excerpt = current?.excerpt ?? next.excerpt;
+  const headingPath = current?.headingPath ?? next.headingPath;
+  const pageNumber = current?.pageNumber ?? next.pageNumber;
+  const startLine = current?.startLine ?? next.startLine;
+  const endLine = current?.endLine ?? next.endLine;
+  const blockId = current?.blockId ?? next.blockId;
+  return {
+    chunkId: current?.chunkId ?? next.chunkId,
+    ...(versionId !== undefined ? { versionId } : {}),
+    ...(documentName !== undefined ? { documentName } : {}),
+    ...(mediaType !== undefined ? { mediaType } : {}),
+    ...(label !== undefined ? { label } : {}),
+    ...(excerpt !== undefined ? { excerpt } : {}),
+    ...(headingPath !== undefined ? { headingPath } : {}),
+    ...(pageNumber !== undefined ? { pageNumber } : {}),
+    ...(startLine !== undefined ? { startLine } : {}),
+    ...(endLine !== undefined ? { endLine } : {}),
+    ...(blockId !== undefined ? { blockId } : {}),
+  };
+}
+
+function normalizeCitationHeadingPath(value: ChunkCitationCandidate["headingPath"]): string | null {
+  if (Array.isArray(value)) return value.join(" / ") || null;
+  return value ?? null;
+}
+
+function documentLookupByVersion(documents: Document[]): Map<string, Document> {
+  return new Map(documents.flatMap((document) =>
+    document.latestVersion ? [[document.latestVersion.id, document] as const] : [],
+  ));
+}
+
+function documentFieldsForVersion(
+  versionId: string | undefined,
+  documentsByVersionId: ReadonlyMap<string, Document>,
+): Pick<ChunkCitationCandidate, "documentName" | "mediaType"> {
+  const document = versionId ? documentsByVersionId.get(versionId) : undefined;
+  return {
+    ...(document ? { documentName: document.name, mediaType: document.mediaType } : {}),
+  };
+}
+
+function addDocumentAoriChunkCandidates(
+  candidates: Map<string, ChunkCitationCandidate>,
+  index: NonNullable<EvidencePack["selectedDocumentAori"]>[number],
+  documentsByVersionId: ReadonlyMap<string, Document>,
+): void {
+  const put = (chunkId: string, label: string, excerpt?: string | undefined) => {
+    candidates.set(chunkId, mergeChunkCandidate(candidates.get(chunkId), {
+      chunkId,
+      versionId: index.versionId,
+      ...documentFieldsForVersion(index.versionId, documentsByVersionId),
+      label,
+      ...(excerpt ? { excerpt } : {}),
+    }));
+  };
+
+  for (const chunkId of index.understanding.evidenceChunkIds) {
+    put(chunkId, index.understanding.centralNodeTitle ?? index.documentName, index.understanding.summary);
+  }
+  for (const aspect of index.aspects) {
+    for (const item of aspect.items) {
+      for (const chunkId of item.evidenceChunkIds) put(chunkId, item.title, item.summary);
+    }
+    for (const relation of aspect.relations) {
+      for (const chunkId of relation.evidenceChunkIds) {
+        put(chunkId, relation.domainRelation || relation.normalizedRelation || aspect.title, relation.reason);
+      }
+    }
+    for (const gap of aspect.closureReport.gaps) {
+      for (const chunkId of gap.evidenceChunkIds ?? []) put(chunkId, gap.description);
+    }
+  }
+  for (const question of index.selfQuestions) {
+    for (const chunkId of question.evidenceChunkIds) put(chunkId, question.question, question.answer);
+  }
+}
+
+function buildChunkCitationCandidates(
+  evidencePack: EvidencePack | undefined,
+  hits: Array<Pick<PulseStreamHitRecord, "targetType" | "targetId" | "label" | "excerpt">>,
+  graph: AoriGraphView | undefined,
+  documents: Document[],
+  fallbackDocument?: Document | undefined,
+): Map<string, ChunkCitationCandidate> {
+  const candidates = new Map<string, ChunkCitationCandidate>();
+  const documentsByVersionId = documentLookupByVersion(documents);
+  const put = (candidate: ChunkCitationCandidate) => {
+    candidates.set(candidate.chunkId, mergeChunkCandidate(candidates.get(candidate.chunkId), {
+      ...candidate,
+      ...documentFieldsForVersion(candidate.versionId, documentsByVersionId),
+    }));
+  };
+
+  for (const index of evidencePack?.selectedDocumentAori ?? []) {
+    addDocumentAoriChunkCandidates(candidates, index, documentsByVersionId);
+  }
+  for (const row of evidencePack?.evidenceRows ?? []) {
+    const versionId = row.versionId ?? row.citation?.versionId;
+    put({
+      chunkId: row.evidenceChunkId,
+      ...(versionId ? { versionId } : {}),
+      label: row.claimText || row.sourceEntity || row.evidenceType,
+      excerpt: row.evidenceQuote,
+      ...(row.headingPath ? { headingPath: row.headingPath } : {}),
+      pageNumber: row.citation?.pageNumber ?? null,
+      startLine: row.citation?.startLine ?? null,
+      endLine: row.citation?.endLine ?? null,
+    });
+  }
+  for (const citation of evidencePack?.citations ?? []) {
+    const label = Array.isArray(citation.headingPath) ? citation.headingPath.at(-1) : citation.headingPath ?? undefined;
+    put({
+      chunkId: citation.chunkId,
+      ...(label ? { label } : {}),
+      excerpt: citation.quote,
+      headingPath: citation.headingPath,
+      pageNumber: citation.pageNumber,
+    });
+  }
+  for (const selected of evidencePack?.chunkEvidencePack?.selectedChunks ?? []) {
+    const label = selected.path.at(-1)?.title ?? selected.retrievalSummary;
+    put({
+      chunkId: selected.chunkId,
+      ...(selected.versionId ? { versionId: selected.versionId } : {}),
+      ...(label ? { label } : {}),
+      excerpt: selected.relevanceReason,
+    });
+  }
+  for (const summary of evidencePack?.chunkSummaries ?? []) {
+    put({
+      chunkId: summary.chunkId,
+      label: summary.usage ? summary.usage.replaceAll("_", " ") : "chunk summary",
+      excerpt: summary.shortSummary,
+    });
+  }
+  for (const assertion of evidencePack?.selectedAssertions ?? []) {
+    for (const chunkId of assertion.evidenceChunkIds) {
+      put({
+        chunkId,
+        versionId: assertion.versionId,
+        label: assertion.domainRelation || assertion.assertionText,
+        ...(assertion.quote ? { excerpt: assertion.quote } : { excerpt: assertion.assertionText }),
+      });
+    }
+  }
+  for (const aspect of evidencePack?.selectedLibraryAspects ?? []) {
+    for (const ref of aspect.evidenceRefs) {
+      if (!ref.chunkId) continue;
+      put({
+        chunkId: ref.chunkId,
+        ...(ref.versionId ? { versionId: ref.versionId } : {}),
+        label: aspect.title,
+        ...(ref.quote ? { excerpt: ref.quote } : { excerpt: aspect.summary }),
+        ...(ref.headingPath ? { headingPath: ref.headingPath } : {}),
+        ...(ref.pageNumber !== undefined ? { pageNumber: ref.pageNumber } : {}),
+      });
+    }
+  }
+  for (const hit of hits) {
+    if (hit.targetType !== "chunk") continue;
+    put({
+      chunkId: hit.targetId,
+      label: hit.label,
+      ...(hit.excerpt ? { excerpt: hit.excerpt } : {}),
+    });
+  }
+  if (graph) {
+    for (const node of graph.nodes) {
+      if (!node.chunkId) continue;
+      put({
+        chunkId: node.chunkId,
+        ...(graph.layoutHints.scope === "library" ? {} : { versionId: graph.versionId }),
+        ...(fallbackDocument ? { documentName: fallbackDocument.name, mediaType: fallbackDocument.mediaType } : {}),
+        label: node.label,
+        ...(node.summary ? { excerpt: node.summary } : {}),
+      });
+    }
+  }
+
+  return candidates;
+}
+
+function chunkLinkLabel(candidate: ChunkCitationCandidate): string {
+  const raw = candidate.label?.trim();
+  const label = raw && raw !== candidate.chunkId ? compactText(raw, 26) : "";
+  return label ? `原文：${label}` : "原文片段";
+}
+
+function chunkCitationFromCandidate(
+  candidate: ChunkCitationCandidate,
+  fallbackDocument?: Document | undefined,
+): Citation | undefined {
+  const versionId = candidate.versionId ?? fallbackDocument?.latestVersion?.id;
+  if (!versionId) return undefined;
+  return {
+    versionId,
+    chunkId: candidate.chunkId,
+    documentName: candidate.documentName ?? fallbackDocument?.name ?? "原文",
+    mediaType: candidate.mediaType ?? fallbackDocument?.mediaType ?? "text/plain",
+    headingPath: normalizeCitationHeadingPath(candidate.headingPath),
+    pageNumber: candidate.pageNumber ?? null,
+    startLine: candidate.startLine ?? null,
+    endLine: candidate.endLine ?? null,
+    blockId: candidate.blockId ?? null,
+    excerpt: candidate.excerpt ?? candidate.label ?? candidate.chunkId,
+  };
+}
+
+function PulseAnswerText({
+  text,
+  chunkCandidates,
+  onOpenChunk,
+}: {
+  text: string;
+  chunkCandidates: ReadonlyMap<string, ChunkCitationCandidate>;
+  onOpenChunk: (candidate: ChunkCitationCandidate) => void;
+}): ReactNode {
+  const matchingChunkIds = [...chunkCandidates.keys()]
+    .filter((chunkId) => chunkId && text.includes(chunkId))
+    .sort((left, right) => right.length - left.length);
+  if (matchingChunkIds.length === 0) return <p>{text}</p>;
+
+  const chunkIdPattern = new RegExp(`(${matchingChunkIds.map(escapeRegExp).join("|")})`, "g");
+  const parts = text.split(chunkIdPattern);
+  return (
+    <p className="pulse-answer-text">
+      {parts.map((part, index) => {
+        const candidate = chunkCandidates.get(part);
+        return candidate ? (
+          <button
+            type="button"
+            className="chunk-inline-link"
+            key={`${candidate.chunkId}-${index}`}
+            title={candidate.chunkId}
+            onClick={() => onOpenChunk(candidate)}
+          >
+            {chunkLinkLabel(candidate)}
+          </button>
+        ) : <span key={`${part}-${index}`}>{part}</span>;
+      })}
+    </p>
+  );
 }
 
 function valuePreview(value: unknown): string {
@@ -1115,21 +1387,191 @@ function uniquePulseKeys(values: Array<string | undefined>): string[] {
 }
 
 function aoriNodePulseKeys(record: AoriGraphNode): string[] {
+  const documentVersionId = record.id.startsWith("aori-document-") ? record.id.slice("aori-document-".length) : undefined;
   return uniquePulseKeys([
     `node:${record.id}`,
+    documentVersionId ? `node:document:${documentVersionId}` : undefined,
+    record.aspectId ? `node:aspect:${record.aspectId}` : undefined,
     record.itemId ? `node:item:${record.itemId}` : undefined,
     record.chunkId ? `chunk:${record.chunkId}` : undefined,
     record.relationId ? `node:relation:${record.relationId}` : undefined,
+    record.assertionId ? `node:relation:${record.assertionId}` : undefined,
     record.assertionId ? `relation:${record.assertionId}` : undefined,
     record.documentId ? `node:document:${record.documentId}` : undefined,
   ]);
 }
 
+function aoriEdgeSemanticIds(record: AoriGraphEdge): string[] {
+  const prefixes = [
+    "aori-edge-relation-",
+    "library-edge-aggregate-",
+    "library-edge-center-aggregate-",
+    "library-edge-aggregate-assertion-",
+    "library-edge-document-assertion-",
+  ];
+  return prefixes.flatMap((prefix) => record.id.startsWith(prefix) ? [record.id.slice(prefix.length)] : []);
+}
+
 function aoriEdgePulseKeys(record: AoriGraphEdge): string[] {
+  const semanticIds = aoriEdgeSemanticIds(record);
   return uniquePulseKeys([
     `relation:${record.id}`,
+    ...semanticIds.flatMap((id) => [`relation:${id}`, `relation:edge:${id}`]),
     ...((record.assertionIds ?? []).map((id) => `relation:${id}`)),
   ]);
+}
+
+function aoriConnectedNodeIds(graph: AoriGraphView, nodeId: string): Set<string> {
+  const result = new Set([nodeId]);
+  for (const edge of graph.edges) {
+    if (edge.source === nodeId) result.add(edge.target);
+    if (edge.target === nodeId) result.add(edge.source);
+  }
+  return result;
+}
+
+function aoriParentNodeId(graph: AoriGraphView, nodeId: string): string | undefined {
+  const nodeLayer = graph.layoutHints.layers[nodeId] ?? 0;
+  return graph.edges
+    .filter((edge) => edge.target === nodeId)
+    .map((edge) => ({ edge, layer: graph.layoutHints.layers[edge.source] ?? 0 }))
+    .filter((entry) => entry.layer < nodeLayer)
+    .sort((left, right) => right.layer - left.layer || left.edge.source.localeCompare(right.edge.source))
+    .at(0)?.edge.source;
+}
+
+function aoriAncestorNodeIds(graph: AoriGraphView, nodeId: string): Set<string> {
+  const result = new Set<string>();
+  let cursor: string | undefined = nodeId;
+  while (cursor && !result.has(cursor)) {
+    result.add(cursor);
+    if (cursor === graph.centerNode.id) break;
+    cursor = aoriParentNodeId(graph, cursor);
+  }
+  result.add(graph.centerNode.id);
+  return result;
+}
+
+function aoriFocusedNodeIds(graph: AoriGraphView, nodeId: string): Set<string> {
+  const result = aoriAncestorNodeIds(graph, nodeId);
+  for (const connectedId of aoriConnectedNodeIds(graph, nodeId)) result.add(connectedId);
+  return result;
+}
+
+function aoriNodeIdsForHit(graph: AoriGraphView, hit: PulseVisualHit | undefined): Set<string> {
+  if (!hit) return new Set();
+  const key = pulseHitKey(hit);
+  return new Set(graph.nodes.flatMap((node) => aoriNodePulseKeys(node).includes(key) ? [node.id] : []));
+}
+
+function aoriPreviousNodeIdsForPulse(graph: AoriGraphView, hits: PulseVisualHit[], beforeIndex: number): Set<string> {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    const nodeIds = aoriNodeIdsForHit(graph, hits[index]);
+    if (nodeIds.size > 0) return nodeIds;
+  }
+  return new Set();
+}
+
+function aoriPulseConnectedNodeIds(graph: AoriGraphView, hitByKey: ReadonlyMap<string, PulseDisplayHit>): Set<string> {
+  const pulseNodeIds = new Set(graph.nodes.flatMap((node) =>
+    pulseHitForKeys(aoriNodePulseKeys(node), hitByKey) ? [node.id] : [],
+  ));
+  const result = new Set(pulseNodeIds);
+  for (const edge of graph.edges) {
+    if (pulseNodeIds.has(edge.source) || pulseNodeIds.has(edge.target)) {
+      result.add(edge.source);
+      result.add(edge.target);
+    }
+  }
+  return result;
+}
+
+function aoriActiveEdgeState(
+  record: AoriGraphEdge,
+  graph: AoriGraphView,
+  hits: PulseDisplayHit[],
+): { active: boolean; reverse: boolean; transitKey: string } {
+  const activeIndex = hits.length - 1;
+  const activeHit = hits[activeIndex];
+  if (!activeHit) return { active: false, reverse: false, transitKey: "" };
+  const activeKey = pulseHitKey(activeHit);
+  const edgeKeys = aoriEdgePulseKeys(record);
+
+  if (activeHit.targetType === "relation" && edgeKeys.includes(activeKey)) {
+    const previousNodeId = [...aoriPreviousNodeIdsForPulse(graph, hits, activeIndex)]
+      .find((nodeId) => nodeId === record.source || nodeId === record.target);
+    return {
+      active: true,
+      reverse: previousNodeId === record.target,
+      transitKey: `${activeKey}:${previousNodeId ?? "relation"}`,
+    };
+  }
+
+  const activeNodeId = [...aoriNodeIdsForHit(graph, activeHit)]
+    .find((nodeId) => nodeId === record.source || nodeId === record.target);
+  if (!activeNodeId) return { active: false, reverse: false, transitKey: "" };
+
+  const previousNodeId = [...aoriPreviousNodeIdsForPulse(graph, hits, activeIndex)]
+    .find((nodeId) => nodeId !== activeNodeId && (nodeId === record.source || nodeId === record.target));
+  if (previousNodeId) {
+    return {
+      active: true,
+      reverse: activeNodeId === record.source,
+      transitKey: `${activeKey}:${previousNodeId}`,
+    };
+  }
+
+  const hitByKey = new Map(hits.slice(0, activeIndex).map((hit) => [pulseHitKey(hit), hit]));
+  const oppositeNodeId = activeNodeId === record.source ? record.target : record.source;
+  const oppositeNode = graph.nodes.find((node) => node.id === oppositeNodeId);
+  if (oppositeNode && pulseHitForKeys(aoriNodePulseKeys(oppositeNode), hitByKey)) {
+    return {
+      active: true,
+      reverse: activeNodeId === record.source,
+      transitKey: `${activeKey}:${oppositeNodeId}`,
+    };
+  }
+
+  return { active: false, reverse: false, transitKey: "" };
+}
+
+function aoriRootNeighborId(graph: AoriGraphView, nodeId: string): string | undefined {
+  const node = graph.nodes.find((record) => record.id === nodeId);
+  if (!node) return undefined;
+  const layers = graph.layoutHints.layers;
+  let cursor = node;
+  const visited = new Set<string>();
+
+  while (cursor.id !== graph.centerNode.id && !visited.has(cursor.id)) {
+    visited.add(cursor.id);
+    const cursorLayer = layers[cursor.id] ?? 0;
+    const parentEdge = graph.edges
+      .filter((edge) => edge.target === cursor.id)
+      .map((edge) => graph.nodes.find((candidate) => candidate.id === edge.source))
+      .find((candidate): candidate is AoriGraphNode => {
+        if (!candidate) return false;
+        return (layers[candidate.id] ?? 0) < cursorLayer;
+      });
+    if (!parentEdge || parentEdge.id === graph.centerNode.id) return cursor.id;
+    cursor = parentEdge;
+  }
+
+  return cursor.id === graph.centerNode.id ? undefined : cursor.id;
+}
+
+function aoriFocusPathForNode(graph: AoriGraphView, nodeId: string): AoriFocusPath | undefined {
+  if (!graph.nodes.some((node) => node.id === nodeId)) return undefined;
+  const rootNodeId = aoriRootNeighborId(graph, nodeId);
+  return rootNodeId ? { rootNodeId, nodeId } : { nodeId };
+}
+
+function aoriFocusBackTarget(graph: AoriGraphView, path: AoriFocusPath): AoriFocusPath | undefined {
+  if (path.rootNodeId && path.nodeId !== path.rootNodeId) return { nodeId: path.rootNodeId };
+  return aoriFocusPathForNode(graph, graph.centerNode.id);
+}
+
+function aoriNodeMatchesFocus(node: AoriGraphNode, focus: AoriFocusPath): boolean {
+  return node.id === focus.nodeId || node.id === focus.rootNodeId;
 }
 
 function pulseHitForKeys(keys: string[], hitByKey: ReadonlyMap<string, PulseDisplayHit>): PulseDisplayHit | undefined {
@@ -1195,11 +1637,23 @@ function aoriNodeOrder(record: AoriGraphNode, graph: AoriGraphView): string {
   ].join(":");
 }
 
-function aoriVisibleNodes(graph: AoriGraphView, viewMode: AoriGraphViewMode, selectedNodeId?: string): AoriGraphNode[] {
+function aoriVisibleNodes(
+  graph: AoriGraphView,
+  viewMode: AoriGraphViewMode,
+  selectedNodeId?: string,
+  pulseHits: PulseDisplayHit[] = [],
+): AoriGraphNode[] {
   if (viewMode !== "network") return graph.nodes;
   const collapsedNodeIds = new Set(graph.layoutHints.collapsedNodeIds);
+  const hitByKey = new Map(pulseHits.map((hit) => [pulseHitKey(hit), hit]));
+  const selectedPath = selectedNodeId ? aoriFocusPathForNode(graph, selectedNodeId) : undefined;
+  const selectedConnectedNodeIds = selectedPath ? aoriFocusedNodeIds(graph, selectedPath.nodeId) : undefined;
+  const pulseConnectedNodeIds = aoriPulseConnectedNodeIds(graph, hitByKey);
+  if (selectedConnectedNodeIds) {
+    return graph.nodes.filter((node) => selectedConnectedNodeIds.has(node.id));
+  }
   return graph.nodes.filter((node) =>
-    node.id === selectedNodeId ||
+    pulseConnectedNodeIds.has(node.id) ||
     !collapsedNodeIds.has(node.id) ||
     (node.type !== "source_chunk" && node.type !== "evidence")
   );
@@ -1213,7 +1667,7 @@ function aoriVisualNodes(
 ): VisualNode[] {
   const viewMode = requestedViewMode ?? graph.layoutHints.viewMode ?? (graph.layoutHints.mode === "overview" ? "layer" : "layer");
   const collapsedNodeIds = new Set(graph.layoutHints.collapsedNodeIds);
-  const visibleNodes = aoriVisibleNodes(graph, viewMode, selectedNodeId);
+  const visibleNodes = aoriVisibleNodes(graph, viewMode, selectedNodeId, pulseHits);
   const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
   const visibleEdges = graph.edges.filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target));
   const hitByKey = new Map(pulseHits.map((hit) => [pulseHitKey(hit), hit]));
@@ -1366,11 +1820,10 @@ function displayAoriEdges(
   pulseHits: PulseDisplayHit[] = [],
 ): VisualEdge[] {
   const viewMode = requestedViewMode ?? graph.layoutHints.viewMode ?? (graph.layoutHints.mode === "overview" ? "layer" : "layer");
-  const visibleNodeIds = new Set(aoriVisibleNodes(graph, viewMode, selectedNodeId).map((node) => node.id));
+  const visibleNodeIds = new Set(aoriVisibleNodes(graph, viewMode, selectedNodeId, pulseHits).map((node) => node.id));
   const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
+  const focusNodeIds = selectedNodeId && viewMode === "network" ? aoriFocusedNodeIds(graph, selectedNodeId) : undefined;
   const hitByKey = new Map(pulseHits.map((hit) => [pulseHitKey(hit), hit]));
-  const activeHit = pulseHits.at(-1);
-  const activeKey = activeHit ? pulseHitKey(activeHit) : "";
   const nodeHasHit = (nodeId: string) => {
     const node = nodeById.get(nodeId);
     return node ? Boolean(pulseHitForKeys(aoriNodePulseKeys(node), hitByKey)) : hitByKey.has(`node:${nodeId}`);
@@ -1380,32 +1833,37 @@ function displayAoriEdges(
     const selected = selectedEdgeId === record.id;
     const edgeHit = pulseHitForKeys(aoriEdgePulseKeys(record), hitByKey);
     const endpointHit = !edgeHit && nodeHasHit(record.source) && nodeHasHit(record.target);
-    const targetChunkId = nodeById.get(record.target)?.chunkId;
-    const active = Boolean(edgeHit && aoriEdgePulseKeys(record).includes(activeKey)) ||
-      (endpointHit && (activeKey === `node:${record.source}` || activeKey === `node:${record.target}` || activeKey === `chunk:${targetChunkId ?? ""}`));
+    const activeState = aoriActiveEdgeState(record, graph, pulseHits);
+    const activePulse: PulseDecorated | undefined = activeState.active ? {
+      pulseActive: true,
+      ...(activeState.reverse ? { pulseReverse: true } : {}),
+      pulseTransitKey: activeState.transitKey || record.id,
+    } : undefined;
     const pulseColor = edgeHit ? pulseRoleColor(edgeHit.pathRole) : endpointHit ? pulseRoleColor("expanded") : undefined;
+    const focusLine = Boolean(focusNodeIds?.has(record.source) && focusNodeIds.has(record.target));
     const edge: VisualEdge = {
       id: record.id,
       source: record.source,
       target: record.target,
-      type: active
+      type: activeState.active
         ? viewMode === "network" || graph.layoutHints.mode === "overview" ? "pulseBezier" : "pulseSmoothStep"
         : viewMode === "network" || graph.layoutHints.mode === "overview" ? "default" : "smoothstep",
-      data: { aori: record },
+      data: { aori: record, ...(activePulse ? { pulse: activePulse } : {}) },
       label: record.domainRelation || record.label,
       animated: warning,
       className: [
         "flow-aori-edge",
         `flow-aori-edge-${record.type.replaceAll("_", "-")}`,
         selected ? "flow-aori-edge-selected" : "",
-        active ? "flow-pulse-active-edge" : "",
+        focusLine ? "flow-aori-edge-focus" : "",
+        activeState.active ? "flow-pulse-active-edge" : "",
       ].filter(Boolean).join(" "),
       style: {
         stroke: pulseColor ?? aoriEdgeColor(record),
-        strokeWidth: active ? 4.8 : edgeHit || endpointHit ? 3.3 : selected ? 4.2 : record.type === "relates" || record.type === "aggregate_relation" ? 2.8 : record.type === "evidence" ? 1.5 : 2.2,
-        opacity: selected ? 1 : record.type === "evidence" ? 0.72 : 0.95,
+        strokeWidth: activeState.active ? 4.8 : edgeHit || endpointHit ? 3.3 : selected ? 4.2 : focusLine ? 3.4 : record.type === "relates" || record.type === "aggregate_relation" ? 2.8 : record.type === "evidence" ? 1.5 : 2.2,
+        opacity: selected || focusLine ? 1 : record.type === "evidence" ? 0.72 : 0.95,
         ...(warning || record.type === "evidence" ? { strokeDasharray: "5 4" } : {}),
-        ...(active ? { filter: "drop-shadow(0 0 7px #f8d26a)" } : {}),
+        ...(activeState.active ? { filter: "drop-shadow(0 0 7px #f8d26a)" } : {}),
       },
       labelStyle: { fill: "#c7d4e7", fontSize: 12, fontWeight: 700 },
     };
@@ -1465,6 +1923,7 @@ export function GraphWorkspace({
   );
   const [aoriGraph, setAoriGraph] = useState<AoriGraphView>();
   const [aoriGraphMessage, setAoriGraphMessage] = useState("");
+  const [aoriFocusStack, setAoriFocusStack] = useState<AoriFocusPath[]>([]);
   const [layout, setLayout] = useState<LayoutMode>("layered");
   const [focusedNodeId, setFocusedNodeId] = useState<string>();
   const [status, setStatus] = useState<RelationStatus | "">("");
@@ -1539,6 +1998,19 @@ export function GraphWorkspace({
     () => visibleCurrentPulse && pulseMode === "current" ? currentAoriPulseHits : pulsing ? pulseStreamHits : [],
     [currentAoriPulseHits, pulseMode, pulseStreamHits, pulsing, visibleCurrentPulse],
   );
+  const activeAoriFocus = aoriViewMode === "network" ? aoriFocusStack.at(-1) : undefined;
+  const activeAoriFocusNodeId = activeAoriFocus?.nodeId ?? selectedAoriNode?.id;
+  const pulseAnswerChunkCandidates = useMemo(
+    () => buildChunkCitationCandidates(visibleCurrentPulse?.evidencePack, currentPulseHits, aoriGraph, documents, activeAoriDocument),
+    [activeAoriDocument, aoriGraph, currentPulseHits, documents, visibleCurrentPulse?.evidencePack],
+  );
+  const pulseDraftChunkCandidates = useMemo(
+    () => buildChunkCitationCandidates(undefined, pulseStreamHits, aoriGraph, documents, activeAoriDocument),
+    [activeAoriDocument, aoriGraph, documents, pulseStreamHits],
+  );
+  const activeAoriFocusLabel = activeAoriFocusNodeId
+    ? aoriGraph?.nodes.find((node) => node.id === activeAoriFocusNodeId)?.label
+    : undefined;
   const searchFocus = useMemo(() => searchFocusFrom(results, activeSearchChunkId), [results, activeSearchChunkId]);
 
   const applyGraph = (
@@ -1595,6 +2067,7 @@ export function GraphWorkspace({
   const applyAoriGraph = (graph: AoriGraphView) => {
     setAoriGraph(graph);
     setAoriGraphMessage("");
+    setAoriFocusStack((stack) => stack.filter((path) => graph.nodes.some((node) => node.id === path.nodeId)));
     setRecords([]);
     setEdgeRecords([]);
     setAspectFilter(undefined);
@@ -1603,8 +2076,11 @@ export function GraphWorkspace({
     setSelectedAggregate(undefined);
     setSelectedAoriNode((current) => current ? graph.nodes.find((node) => node.id === current.id) : undefined);
     setSelectedAoriEdge((current) => current ? graph.edges.find((edge) => edge.id === current.id) : undefined);
-    setNodes(aoriVisualNodes(graph, aoriViewMode, selectedAoriNode?.id));
-    setEdges(displayAoriEdges(graph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+    const focusNodeId = activeAoriFocusNodeId && graph.nodes.some((node) => node.id === activeAoriFocusNodeId)
+      ? activeAoriFocusNodeId
+      : undefined;
+    setNodes(aoriVisualNodes(graph, aoriViewMode, focusNodeId, aoriPulseHits));
+    setEdges(displayAoriEdges(graph, aoriViewMode, focusNodeId, selectedAoriEdge?.id, aoriPulseHits));
   };
 
   const loadAoriGraph = async (mode: AoriGraphMode = activeAoriMode ?? "overview") => {
@@ -1704,9 +2180,9 @@ export function GraphWorkspace({
 
   useEffect(() => {
     if (!isAoriMode || !aoriGraph) return;
-    setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id, aoriPulseHits));
-    setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id, aoriPulseHits));
-  }, [isAoriMode, aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id, aoriPulseHits]);
+    setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, activeAoriFocusNodeId, aoriPulseHits));
+    setEdges(displayAoriEdges(aoriGraph, aoriViewMode, activeAoriFocusNodeId, selectedAoriEdge?.id, aoriPulseHits));
+  }, [isAoriMode, aoriGraph, aoriViewMode, activeAoriFocusNodeId, selectedAoriEdge?.id, aoriPulseHits]);
 
   useEffect(() => {
     if (viewMode !== "document" || documentTree.length > 0 || documentTreeLoading) return;
@@ -1751,6 +2227,7 @@ export function GraphWorkspace({
     setSelectedAggregate(undefined);
     setSelectedAoriNode(undefined);
     setSelectedAoriEdge(undefined);
+    setAoriFocusStack([]);
     setResults([]);
     setActiveSearchChunkId(undefined);
     setRecords([]);
@@ -1758,6 +2235,7 @@ export function GraphWorkspace({
     setAspectFilter(undefined);
     setAoriGraph(undefined);
     setAoriGraphMessage("");
+    setAoriFocusStack([]);
     setNodes([]);
     setEdges([]);
     void api.pulses(requestLibraryId)
@@ -1780,6 +2258,7 @@ export function GraphWorkspace({
     setSelectedAggregate(undefined);
     setSelectedAoriNode(undefined);
     setSelectedAoriEdge(undefined);
+    setAoriFocusStack([]);
     setResults([]);
     setActiveSearchChunkId(undefined);
     if (isAoriMode) {
@@ -1912,8 +2391,8 @@ export function GraphWorkspace({
           setPulseDraftAnswer("");
           if (startedInAoriMode) {
             if (aoriGraph) {
-              setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
-              setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+              setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, activeAoriFocusNodeId));
+              setEdges(displayAoriEdges(aoriGraph, aoriViewMode, activeAoriFocusNodeId, selectedAoriEdge?.id));
             }
           } else {
             applyGraph(response.graph, layout, "current", 0, response);
@@ -1958,8 +2437,8 @@ export function GraphWorkspace({
       setPulsePlaying(true);
       if (isAoriMode) {
         if (aoriGraph) {
-          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
-          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, activeAoriFocusNodeId));
+          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, activeAoriFocusNodeId, selectedAoriEdge?.id));
         }
       } else {
         applyGraph(response.graph, layout, "current", 0, response);
@@ -1983,8 +2462,8 @@ export function GraphWorkspace({
       setPulseProcessEvents([]);
       if (isAoriMode) {
         if (aoriGraph) {
-          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
-          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, activeAoriFocusNodeId));
+          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, activeAoriFocusNodeId, selectedAoriEdge?.id));
         }
         return;
       }
@@ -2020,8 +2499,8 @@ export function GraphWorkspace({
       setPulsePlaying(false);
       if (isAoriMode) {
         if (aoriGraph) {
-          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
-          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+          setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, activeAoriFocusNodeId));
+          setEdges(displayAoriEdges(aoriGraph, aoriViewMode, activeAoriFocusNodeId, selectedAoriEdge?.id));
         }
       } else {
         applyGraph(response.graph, layout, nextMode, nextRevealCount, response);
@@ -2073,6 +2552,7 @@ export function GraphWorkspace({
     setSelectedAggregate(undefined);
     setSelectedAoriNode(undefined);
     setSelectedAoriEdge(undefined);
+    setAoriFocusStack([]);
     setResults([]);
     setActiveSearchChunkId(undefined);
     if (nextMode !== "legacy") {
@@ -2086,8 +2566,8 @@ export function GraphWorkspace({
     setLayout(nextLayout);
     if (isAoriMode) {
       if (aoriGraph) {
-        setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, selectedAoriNode?.id));
-        setEdges(displayAoriEdges(aoriGraph, aoriViewMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+        setNodes(aoriVisualNodes(aoriGraph, aoriViewMode, activeAoriFocusNodeId));
+        setEdges(displayAoriEdges(aoriGraph, aoriViewMode, activeAoriFocusNodeId, selectedAoriEdge?.id));
       }
       return;
     }
@@ -2099,16 +2579,54 @@ export function GraphWorkspace({
   const changeAoriScope = (nextScope: AoriGraphScope) => {
     setSelectedAoriNode(undefined);
     setSelectedAoriEdge(undefined);
+    setAoriFocusStack([]);
     setAoriScope(nextScope);
   };
 
   const changeAoriViewMode = (nextMode: AoriGraphViewMode) => {
     setAoriViewMode(nextMode);
     setLayout(layoutFromAoriViewMode(nextMode));
+    if (nextMode !== "network") setAoriFocusStack([]);
     if (aoriGraph) {
-      setNodes(aoriVisualNodes(aoriGraph, nextMode, selectedAoriNode?.id));
-      setEdges(displayAoriEdges(aoriGraph, nextMode, selectedAoriNode?.id, selectedAoriEdge?.id));
+      const nextFocusNodeId = nextMode === "network" ? activeAoriFocusNodeId : undefined;
+      setNodes(aoriVisualNodes(aoriGraph, nextMode, nextFocusNodeId));
+      setEdges(displayAoriEdges(aoriGraph, nextMode, nextFocusNodeId, selectedAoriEdge?.id));
     }
+  };
+
+  const openChunkCandidate = (candidate: ChunkCitationCandidate) => {
+    const citation = chunkCitationFromCandidate(candidate, activeAoriDocument);
+    if (!citation) {
+      onError(`没有找到 ${candidate.chunkId} 对应的原文版本`);
+      return;
+    }
+    onOpenCitation(citation);
+  };
+
+  const focusAoriNode = (node: AoriGraphNode) => {
+    setSelectedAoriNode(node);
+    setSelectedAoriEdge(undefined);
+    setSelected(undefined);
+    setSelectedRelation(undefined);
+    setSelectedAggregate(undefined);
+    if (!aoriGraph || aoriViewMode !== "network") return;
+    const focusPath = aoriFocusPathForNode(aoriGraph, node.id);
+    if (!focusPath) return;
+    setAoriFocusStack((stack) => {
+      const current = stack.at(-1);
+      if (current?.nodeId === focusPath.nodeId) return stack;
+      return [...stack, focusPath].slice(-16);
+    });
+    pendingFocusNodeIdRef.current = node.id;
+  };
+
+  const returnAoriFocus = () => {
+    const nextStack = aoriFocusStack.slice(0, -1);
+    const nextFocusNodeId = nextStack.at(-1)?.nodeId;
+    setAoriFocusStack(nextStack);
+    setSelectedAoriEdge(undefined);
+    setSelectedAoriNode(nextFocusNodeId && aoriGraph ? aoriGraph.nodes.find((node) => node.id === nextFocusNodeId) : undefined);
+    pendingFocusNodeIdRef.current = nextFocusNodeId;
   };
 
   const changePulseMode = (nextMode: PulseLayerMode) => {
@@ -2149,11 +2667,7 @@ export function GraphWorkspace({
         record.documentId === hit.targetId
       );
       if (node) {
-        setSelectedAoriNode(node);
-        setSelectedAoriEdge(undefined);
-        setSelected(undefined);
-        setSelectedRelation(undefined);
-        setSelectedAggregate(undefined);
+        focusAoriNode(node);
         pendingFocusNodeIdRef.current = node.id;
         return;
       }
@@ -2297,11 +2811,7 @@ export function GraphWorkspace({
             onConnect={(connection) => void onConnect(connection)}
             onNodeClick={(_event, node) => {
               if (node.data.aori) {
-                setSelectedAoriNode(node.data.aori);
-                setSelectedAoriEdge(undefined);
-                setSelected(undefined);
-                setSelectedRelation(undefined);
-                setSelectedAggregate(undefined);
+                focusAoriNode(node.data.aori);
                 return;
               }
               const entity = node.data.entity;
@@ -2358,6 +2868,14 @@ export function GraphWorkspace({
               )}
             </Controls>
           </ReactFlow>
+          {isAoriMode && aoriViewMode === "network" && aoriFocusStack.length > 0 && (
+            <div className="aori-network-nav">
+              <button type="button" onClick={returnAoriFocus} title="返回上一层" aria-label="返回上一层">
+                ←
+              </button>
+              <span>{activeAoriFocusLabel ?? "AORI focus"}</span>
+            </div>
+          )}
           {!isAoriMode && aspect && records.length === 0 && (
             <div className="graph-empty">
               {aspectFilter?.anyLabeled
@@ -2468,7 +2986,11 @@ export function GraphWorkspace({
               {pulseDraftAnswer && (
                 <div className="pulse-draft-answer">
                   <strong>已生成回答草稿</strong>
-                  <p>{pulseDraftAnswer}</p>
+                  <PulseAnswerText
+                    text={pulseDraftAnswer}
+                    chunkCandidates={pulseDraftChunkCandidates}
+                    onOpenChunk={openChunkCandidate}
+                  />
                 </div>
               )}
               <div className="pulse-hit-summary">
@@ -2496,7 +3018,11 @@ export function GraphWorkspace({
                 </small>
               </div>
               <p className="pulse-question">{visibleCurrentPulse.pulse.question}</p>
-              <p>{visibleCurrentPulse.pulse.answer}</p>
+              <PulseAnswerText
+                text={visibleCurrentPulse.pulse.answer}
+                chunkCandidates={pulseAnswerChunkCandidates}
+                onOpenChunk={openChunkCandidate}
+              />
               <small>{visibleCurrentPulse.pulse.summary}</small>
               <PulseProcessLog events={pulseProcessEvents} limit={10} />
               {pulseMode === "current" && (

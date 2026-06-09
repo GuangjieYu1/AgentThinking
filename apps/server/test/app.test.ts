@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -511,6 +512,114 @@ describe("HTTP application", () => {
     const abstractId = refreshedGraph.nodes.find((node) => node.nodeType === "abstract")!.id;
     const deletedNode = await app.inject({ method: "DELETE", url: `/api/nodes/${abstractId}` });
     expect(deletedNode.statusCode).toBe(204);
+    await app.close();
+    db.close();
+  });
+
+  it("lists all completed AORI document versions, not only latest document versions", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-aori-documents-"));
+    dirs.push(dir);
+    const config = getConfig({
+      dataDir: dir,
+      filesDir: join(dir, "files"),
+      ocrCacheDir: join(dir, "ocr"),
+      provider: "fake",
+    });
+    const db = new AgentDatabase(dir);
+    const vectors = new VectorStore(db);
+    const model = new FakeModelProvider();
+    const queue = new IngestionQueue(db, vectors, model, config);
+    const app = await createApp({ config, db, vectors, model, queue });
+    const library = db.createLibrary("AORI Versions");
+
+    const first = db.createDocumentVersion(library.id, "novel.md", "text/markdown", "chapter-1", join(dir, "chapter-1.md"), {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    db.updateVersionStatus(first.id, "completed");
+    db.saveAoriDocumentIndex({
+      available: true,
+      versionId: first.id,
+      libraryId: library.id,
+      documentId: first.documentId,
+      documentName: "novel.md",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      understanding: { versionId: first.id, summary: "chapter 1", centralQuestion: "?", evidenceChunkIds: [] },
+      aspects: [],
+      relationLexicon: { versionId: first.id, entries: [] },
+      closureReports: [],
+      selfQuestions: [],
+      reflectiveReport: { summary: "ok", completenessRisk: "none", warnings: [], truncationCount: 0 },
+      rationaleTrace: [],
+      rationaleDebug: { rationaleRequested: false, rationaleGenerated: false, rationaleSaved: false, rationaleCount: 0, rationaleMissingReason: "用户未勾选生成索引理由" },
+    });
+
+    const second = db.createDocumentVersion(library.id, "novel.md", "text/markdown", "chapter-2", join(dir, "chapter-2.md"), {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    db.updateVersionStatus(second.id, "completed");
+    db.saveAoriDocumentIndex({
+      available: true,
+      versionId: second.id,
+      libraryId: library.id,
+      documentId: second.documentId,
+      documentName: "novel.md",
+      createdAt: "2026-01-02T00:00:00.000Z",
+      understanding: { versionId: second.id, summary: "chapter 2", centralQuestion: "?", evidenceChunkIds: [] },
+      aspects: [],
+      relationLexicon: { versionId: second.id, entries: [] },
+      closureReports: [],
+      selfQuestions: [],
+      reflectiveReport: { summary: "ok", completenessRisk: "none", warnings: [], truncationCount: 0 },
+      rationaleTrace: [],
+      rationaleDebug: { rationaleRequested: false, rationaleGenerated: false, rationaleSaved: false, rationaleCount: 0, rationaleMissingReason: "用户未勾选生成索引理由" },
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/libraries/${library.id}/aori/documents`,
+    });
+    expect(response.statusCode).toBe(200);
+    const entries = response.json<Array<{ versionId: string; documentId: string; documentName: string }>>();
+    expect(entries.map((entry) => entry.versionId)).toEqual([second.id, first.id]);
+    expect(new Set(entries.map((entry) => entry.documentId)).size).toBe(1);
+    expect(entries.every((entry) => entry.documentName === "novel.md")).toBe(true);
+
+    await app.close();
+    db.close();
+  });
+
+  it("deletes library analysis artifacts together with the library", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-thinking-delete-library-"));
+    dirs.push(dir);
+    const config = getConfig({
+      dataDir: dir,
+      filesDir: join(dir, "files"),
+      analysisDir: join(dir, "analysis"),
+      ocrCacheDir: join(dir, "ocr"),
+      provider: "fake",
+    });
+    const db = new AgentDatabase(dir);
+    const vectors = new VectorStore(db);
+    const model = new FakeModelProvider();
+    const queue = new IngestionQueue(db, vectors, model, config);
+    const app = await createApp({ config, db, vectors, model, queue });
+    const library = db.createLibrary("Cleanup Library");
+    const analysisDir = join(config.analysisDir, library.id);
+    const analysisPath = join(analysisDir, "analysis.md");
+
+    await mkdir(analysisDir, { recursive: true });
+    await writeFile(analysisPath, "draft analysis");
+    expect(existsSync(analysisPath)).toBe(true);
+
+    const response = await app.inject({
+      method: "DELETE",
+      url: `/api/libraries/${library.id}`,
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(db.getLibrary(library.id)).toBeUndefined();
+    expect(existsSync(analysisDir)).toBe(false);
+
     await app.close();
     db.close();
   });

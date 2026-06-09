@@ -2796,6 +2796,37 @@ export class AgentDatabase {
     });
   }
 
+  listAoriDocumentCatalog(libraryId: string): Array<{
+    versionId: string;
+    documentId: string;
+    documentName: string;
+    createdAt: string;
+    indexStrategy: IndexStrategy;
+    rationaleRequested: boolean;
+  }> {
+    return rows(this.sql.prepare(`
+      SELECT
+        v.id AS version_id,
+        d.id AS document_id,
+        d.name AS document_name,
+        v.created_at AS version_created_at,
+        v.index_strategy,
+        v.record_indexing_rationale
+      FROM aori_documents a
+      JOIN document_versions v ON v.id = a.version_id
+      JOIN documents d ON d.id = v.document_id
+      WHERE a.library_id = ?
+      ORDER BY v.created_at DESC
+    `), libraryId).map((entry) => ({
+      versionId: String(entry.version_id),
+      documentId: String(entry.document_id),
+      documentName: String(entry.document_name),
+      createdAt: String(entry.version_created_at),
+      indexStrategy: normalizeIndexStrategy(entry.index_strategy),
+      rationaleRequested: sqliteBoolean(entry.record_indexing_rationale),
+    }));
+  }
+
   upsertLibraryAoriProfile(libraryId: string, summary: string): void {
     const timestamp = now();
     const existing = row(this.sql.prepare("SELECT library_id FROM library_aori_profiles WHERE library_id = ?"), libraryId);

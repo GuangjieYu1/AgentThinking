@@ -31,6 +31,7 @@ import {
   type RelationStatus,
   type RelationType,
   type AspectKind,
+  type AoriDocumentCatalogEntry,
   type IndexStrategy,
   type PulseStreamEvent,
   type SearchResult,
@@ -254,6 +255,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     requireLibrary(db, request.params.libraryId, request.user);
     if (!db.deleteLibrary(request.params.libraryId)) return reply.status(404).send({ error: "知识库不存在" });
     await rm(join(config.filesDir, request.params.libraryId), { recursive: true, force: true });
+    await rm(join(config.analysisDir, request.params.libraryId), { recursive: true, force: true });
     return reply.status(204).send();
   });
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/settings", async (request) => {
@@ -276,6 +278,10 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/aori", async (request) => {
     requireLibrary(db, request.params.libraryId, request.user);
     return db.getLibraryAoriProfile(request.params.libraryId);
+  });
+  app.get<{ Params: { libraryId: string } }>("/api/libraries/:libraryId/aori/documents", async (request) => {
+    requireLibrary(db, request.params.libraryId, request.user);
+    return db.listAoriDocumentCatalog(request.params.libraryId) satisfies AoriDocumentCatalogEntry[];
   });
   app.get<{ Params: { libraryId: string }; Querystring: { view?: string } }>("/api/libraries/:libraryId/aori/graph", async (request, reply) => {
     requireLibrary(db, request.params.libraryId, request.user);

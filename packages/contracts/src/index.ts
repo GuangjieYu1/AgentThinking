@@ -714,6 +714,15 @@ export interface AoriUnavailable {
 
 export type AoriDocumentResponse = AoriDocumentIndex | AoriUnavailable;
 
+export interface AoriDocumentCatalogEntry {
+  versionId: string;
+  documentId: string;
+  documentName: string;
+  createdAt: string;
+  indexStrategy: IndexStrategy;
+  rationaleRequested: boolean;
+}
+
 export interface LibraryEntity {
   id: string;
   libraryId: string;

@@ -101,3 +101,8 @@ npm run build        # Production assets and server bundle
 ## Boundaries
 
 This first release does not include collaboration, watched folders, or full-graph rendering for large libraries. The default graph is an abstract overview and loads evidence chunks on demand.
+
+## 技术文档
+
+- [项目技术文档（通用版）](docs/AgentThinking_项目技术文档_通用版.md)
+- [技术人员文档：架构与流程](docs/AgentThinking_技术人员文档_架构与流程.md)

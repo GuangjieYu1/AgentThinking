@@ -27,6 +27,7 @@ import {
   type AoriGraphEdge,
   type AoriGraphNode,
   type AoriGraphScope,
+  type AoriDocumentCatalogEntry,
   type AoriGraphViewMode,
   type AoriGraphView,
   type AbstractNode,
@@ -109,6 +110,13 @@ type SearchFocus = { matchIds: ReadonlySet<string>; activeId?: string };
 type PulsePlaybackStep =
   | { kind: "hit"; hit: PulseHitRecord }
   | { kind: "backtrack"; fromNodeId: string; toNodeId: string; edgeId: string; label: string; transitKey: string };
+type AoriVersionSelection = {
+  versionId: string;
+  documentId: string;
+  documentName: string;
+  createdAt: string;
+  rationaleRequested: boolean;
+};
 interface LayoutLink {
   source: string;
   target: string;
@@ -1933,6 +1941,7 @@ export function GraphWorkspace({
   );
   const [aoriScope, setAoriScope] = useState<AoriGraphScope>("document");
   const [aoriViewMode, setAoriViewMode] = useState<AoriGraphViewMode>("layer");
+  const [aoriVersions, setAoriVersions] = useState<AoriVersionSelection[]>([]);
   const [aoriVersionId, setAoriVersionId] = useState<string | undefined>(() =>
     documents.find((document) => document.latestVersion?.status === "completed" && document.latestVersion.indexStrategy === "aspect_oriented_reflective")?.latestVersion?.id,
   );
@@ -1978,17 +1987,19 @@ export function GraphWorkspace({
       ? aoriViewMode === "layer" ? "overview" : "detail"
       : aoriViewMode === "layer" ? "overview" : "detail"
     : undefined;
-  const aoriDocuments = useMemo(
-    () => documents.filter((document) =>
-      document.libraryId === libraryId &&
-      document.latestVersion?.status === "completed" &&
-      document.latestVersion.indexStrategy === "aspect_oriented_reflective",
-    ),
-    [documents, libraryId],
-  );
+  const aoriDocumentAvailable = aoriVersions.length > 0;
   const activeAoriDocument = useMemo(
-    () => aoriDocuments.find((document) => document.latestVersion?.id === aoriVersionId) ?? aoriDocuments[0],
-    [aoriDocuments, aoriVersionId],
+    () => {
+      const activeVersion = aoriVersions.find((entry) => entry.versionId === aoriVersionId) ?? aoriVersions[0];
+      return activeVersion
+        ? documents.find((document) => document.id === activeVersion.documentId)
+        : undefined;
+    },
+    [aoriVersionId, aoriVersions, documents],
+  );
+  const activeAoriVersion = useMemo(
+    () => aoriVersions.find((entry) => entry.versionId === aoriVersionId) ?? aoriVersions[0],
+    [aoriVersionId, aoriVersions],
   );
   const activePulseHistory = useMemo(
     () => pulseHistory.filter((pulse) => pulse.libraryId === libraryId),
@@ -2023,6 +2034,19 @@ export function GraphWorkspace({
     () => buildChunkCitationCandidates(undefined, pulseStreamHits, aoriGraph, documents, activeAoriDocument),
     [activeAoriDocument, aoriGraph, documents, pulseStreamHits],
   );
+  const currentPulseAoriVersionId = useMemo(() => {
+    const evidencePack = visibleCurrentPulse?.evidencePack;
+    const selectedVersionId = evidencePack?.selectedDocumentAori?.[0]?.versionId;
+    if (selectedVersionId) return selectedVersionId;
+    const chunkVersionCounts = new Map<string, number>();
+    for (const chunk of evidencePack?.chunkEvidencePack?.selectedChunks ?? []) {
+      if (!chunk.versionId) continue;
+      chunkVersionCounts.set(chunk.versionId, (chunkVersionCounts.get(chunk.versionId) ?? 0) + 1);
+    }
+    return [...chunkVersionCounts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+      .at(0)?.[0];
+  }, [visibleCurrentPulse?.evidencePack]);
   const activeAoriFocusLabel = activeAoriFocusNodeId
     ? aoriGraph?.nodes.find((node) => node.id === activeAoriFocusNodeId)?.label
     : undefined;
@@ -2129,7 +2153,7 @@ export function GraphWorkspace({
   };
 
   useEffect(() => {
-    const firstAoriVersionId = aoriDocuments[0]?.latestVersion?.id;
+    const firstAoriVersionId = aoriVersions[0]?.versionId;
     if (!firstAoriVersionId) {
       aoriDefaultAppliedRef.current = false;
       setAoriVersionId(undefined);
@@ -2138,13 +2162,43 @@ export function GraphWorkspace({
       return;
     }
     setAoriVersionId((current) =>
-      current && aoriDocuments.some((document) => document.latestVersion?.id === current) ? current : firstAoriVersionId,
+      current && aoriVersions.some((entry) => entry.versionId === current) ? current : firstAoriVersionId,
     );
     if (!aoriDefaultAppliedRef.current) {
       aoriDefaultAppliedRef.current = true;
       if (graphMode === "legacy") setGraphMode("aori_overview");
     }
-  }, [aoriDocuments, graphMode, isAoriMode]);
+  }, [aoriVersions, graphMode, isAoriMode]);
+
+  useEffect(() => {
+    const requestLibraryId = libraryId;
+    let cancelled = false;
+    void api.aoriDocuments(requestLibraryId)
+      .then((entries) => {
+        if (cancelled || activeLibraryIdRef.current !== requestLibraryId) return;
+        setAoriVersions(entries.map((entry: AoriDocumentCatalogEntry) => ({
+          versionId: entry.versionId,
+          documentId: entry.documentId,
+          documentName: entry.documentName,
+          createdAt: entry.createdAt,
+          rationaleRequested: entry.rationaleRequested,
+        })));
+      })
+      .catch((cause: Error) => {
+        if (cancelled || activeLibraryIdRef.current !== requestLibraryId) return;
+        setAoriVersions([]);
+        onError(cause.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [libraryId, refreshKey, onError]);
+
+  useEffect(() => {
+    if (!isAoriMode || aoriScope !== "document" || !currentPulseAoriVersionId) return;
+    if (!aoriVersions.some((entry) => entry.versionId === currentPulseAoriVersionId)) return;
+    setAoriVersionId((current) => current === currentPulseAoriVersionId ? current : currentPulseAoriVersionId);
+  }, [isAoriMode, aoriScope, currentPulseAoriVersionId, aoriVersions]);
 
   useEffect(() => {
     if (!flowInstance || nodes.length === 0) return;
@@ -2243,6 +2297,7 @@ export function GraphWorkspace({
     setSelectedAoriNode(undefined);
     setSelectedAoriEdge(undefined);
     setAoriFocusStack([]);
+    setAoriVersions([]);
     setResults([]);
     setActiveSearchChunkId(undefined);
     setRecords([]);
@@ -2559,7 +2614,7 @@ export function GraphWorkspace({
   };
 
   const changeGraphMode = (nextMode: GraphSurfaceMode) => {
-    if (nextMode !== "legacy" && !aoriVersionId) return;
+    if (nextMode !== "legacy" && !aoriDocumentAvailable) return;
     setGraphMode(nextMode);
     setFocusedNodeId(undefined);
     setSelected(undefined);
@@ -2759,7 +2814,7 @@ export function GraphWorkspace({
               <button className={view === "detail" ? "selected" : ""} onClick={() => { setFocusedNodeId(undefined); setView("detail"); }}>细节</button>
             </div>
           )}
-          {isAoriMode && aoriScope === "document" && aoriDocuments.length > 0 && (
+          {isAoriMode && aoriScope === "document" && aoriVersions.length > 0 && (
             <select
               className="aori-version-select"
               value={aoriVersionId ?? ""}
@@ -2767,8 +2822,10 @@ export function GraphWorkspace({
                 setAoriVersionId(event.target.value || undefined);
               }}
             >
-              {aoriDocuments.map((document) => (
-                <option key={document.latestVersion!.id} value={document.latestVersion!.id}>{document.name}</option>
+              {aoriVersions.map((entry) => (
+                <option key={entry.versionId} value={entry.versionId}>
+                  {entry.documentName} · {new Date(entry.createdAt).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                </option>
               ))}
             </select>
           )}

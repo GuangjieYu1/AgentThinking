@@ -1619,6 +1619,7 @@ export class FakeModelProvider implements ModelProvider {
     const hasCount = /how many|count|list|\u591a\u5c11\u4eba|\u51e0\u4eba|\u603b\u5171|\u5217\u51fa|\u540d\u5b57|\u540d\u5355/.test(question);
     const hasTimeline = /timeline|\u65f6\u95f4\u7ebf|\u6309\u65f6\u95f4|\u54ea\u4e9b\u4e8b/.test(question);
     const hasArgument = /argument|defense|court|response|\u8fa9\u62a4|\u6cd5\u9662|\u91c7\u7eb3|\u56de\u5e94|\u4e0a\u8bc9/.test(question);
+    const preferTimeline = hasTimeline;
     const coverage: DemandAnswerPlan["requiredRecords"][number]["coverage"] = hasCount || hasAmount || hasTimeline || hasArgument ? "all" : "single";
     const scoredItems = (target?.items ?? [])
       .map((item, index) => {
@@ -1637,7 +1638,14 @@ export class FakeModelProvider implements ModelProvider {
         { name: "time_range", description: "Time or period for the amount.", required: Boolean(year) },
         { name: "evidence", description: "Source quote supporting this value.", required: true },
       ]
-      : hasCount
+      : preferTimeline
+        ? [
+          { name: "event", description: "Timeline event.", required: true },
+          { name: "time_range", description: "Event time or period.", required: true },
+          { name: "source_name", description: "Event source/entity.", required: false },
+          { name: "evidence", description: "Source quote supporting the event.", required: true },
+        ]
+        : hasCount
         ? [
           { name: "source_name", description: "Person or organization to count/list.", required: true },
           { name: "person_names", description: "Natural person names when present.", required: false },
@@ -1774,18 +1782,19 @@ export class FakeModelProvider implements ModelProvider {
     const hasTimeline = /timeline|\u65f6\u95f4\u7ebf|\u6309\u65f6\u95f4|\u54ea\u4e9b\u4e8b/.test(question);
     const hasAmount = /amount|money|sum|total|\u91d1\u989d|\u94b1|\u603b\u989d|\u52a0\u8d77\u6765|\u53d7\u8d3f\u591a\u5c11/.test(question);
     const hasArgument = /argument|defense|court|response|\u8fa9\u62a4|\u6cd5\u9662|\u91c7\u7eb3|\u56de\u5e94|\u4e0a\u8bc9/.test(question);
+    const preferTimeline = hasTimeline;
     const includedByYear = year ? exactYearRecords(input.records) : input.records;
     const uncertainByYear = year ? uncertainYearRecords(input.records) : [];
     const answerLines: string[] = [`Answer goal: ${input.plan.answerGoal}`];
     if (input.records.length === 0) {
       answerLines.push(`Evidence is insufficient: ${input.plan.answerPolicy.whatCountsAsInsufficient}`);
+    } else if (preferTimeline) {
+      const events = includedByYear.map((record) => `${timeValue(record) || "unknown"} ${fieldValue(record, [/event/i, /事件/u]) || sourceName(record)} ${cited(record)}`);
+      answerLines.push(events.length > 0 ? events.join("\n") : "No exact timeline events could be determined from the extracted records.");
+      if (uncertainByYear.length > 0) answerLines.push(`Uncertain records: ${uniqueNames(uncertainByYear).join(", ")}`);
     } else if (hasCount) {
       const names = uniqueNames(includedByYear);
       answerLines.push(JSON.stringify({ count: names.length, values: names }));
-      if (uncertainByYear.length > 0) answerLines.push(`Uncertain records: ${uniqueNames(uncertainByYear).join(", ")}`);
-    } else if (hasTimeline) {
-      const events = includedByYear.map((record) => `${timeValue(record) || "unknown"} ${fieldValue(record, [/event/i, /事件/u]) || sourceName(record)} ${cited(record)}`);
-      answerLines.push(events.length > 0 ? events.join("\n") : "No exact timeline events could be determined from the extracted records.");
       if (uncertainByYear.length > 0) answerLines.push(`Uncertain records: ${uniqueNames(uncertainByYear).join(", ")}`);
     } else if (hasAmount) {
       const amountRows = includedByYear
@@ -1834,15 +1843,15 @@ export class FakeModelProvider implements ModelProvider {
     const hasSumIntent = /sum|amount|money|total amount|\u52a0\u8d77\u6765|\u591a\u5c11\u94b1|\u603b\u989d|\u5408\u8ba1|\u91d1\u989d/.test(question);
     const hasArgumentIntent = /defense|argument|response|court|\u8fa9\u62a4|\u610f\u89c1|\u91c7\u7eb3|\u6cd5\u9662|\u56de\u5e94|\u4e0a\u8bc9/.test(question);
     const hasTimelineIntent = /timeline|chronology|\u65f6\u95f4\u7ebf|\u6309\u65f6\u95f4|\u67d0\u5e74|\u54ea\u4e9b\u4e8b/.test(question);
-    const skill: AoriSkillRoute["skill"] = hasCountIntent && hasCountObject
+    const skill: AoriSkillRoute["skill"] = hasTimelineIntent
+      ? "timeline"
+      : hasCountIntent && hasCountObject
       ? "facet_count"
       : hasSumIntent
         ? "facet_sum"
         : hasArgumentIntent
           ? "argument_response"
-          : hasTimelineIntent
-            ? "timeline"
-            : "normal_traversal";
+          : "normal_traversal";
     const target = input.aspects
       .filter((aspect) => aspect.itemCount > 0)
       .sort((left, right) => right.itemCount - left.itemCount)[0];

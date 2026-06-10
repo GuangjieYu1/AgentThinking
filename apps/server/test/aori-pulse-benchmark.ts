@@ -1,43 +1,20 @@
 import { inspect } from "node:util";
-import { getConfig } from "../src/config.js";
-import { createModelProvider } from "../src/services/models.js";
-import type { ModelProvider } from "../src/services/models.js";
 import {
-  aoriPulseEvalScenarios,
-  assessEvalScenario,
-  cleanupEvalDatabases,
-  EvalModelProvider,
-  runEvalScenario,
-  type EvalScenario,
+  aoriPulseBenchmarkSuites,
+  type BenchmarkSuite,
 } from "./helpers/aori-pulse-eval-fixtures.js";
+import { runBenchmarkSuite } from "../src/services/benchmark-runner.js";
+import type { BenchmarkRunRecord, BenchmarkScenarioSummary, BenchmarkSuiteSummary, PulseInputMode } from "@agent-thinking/contracts";
 
 type ProviderMode = "configured" | "fake";
 
 interface BenchmarkArgs {
   iterations: number;
   provider: ProviderMode;
-  mode: "full" | "progressive";
+  mode: PulseInputMode;
   scenarioNames: string[];
+  suites: BenchmarkSuite[];
   json: boolean;
-}
-
-interface BenchmarkRunRecord {
-  scenario: string;
-  iteration: number;
-  strictPass: boolean;
-  structuralPass: boolean;
-  answerCoverage: number;
-  answerMisses: string[];
-  answerExcludesViolated: string[];
-  durationMs: number;
-  wallClockMs: number;
-  modelCalls: number;
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  promptCacheHitTokens: number;
-  promptCacheMissTokens: number;
-  promptCacheHitRate?: number | undefined;
 }
 
 function parseArgs(argv: string[]): BenchmarkArgs {
@@ -46,6 +23,7 @@ function parseArgs(argv: string[]): BenchmarkArgs {
     provider: "configured",
     mode: "full",
     scenarioNames: [],
+    suites: [],
     json: false,
   };
 
@@ -94,6 +72,16 @@ function parseArgs(argv: string[]): BenchmarkArgs {
       args.scenarioNames.push(token.slice("--scenario=".length));
       continue;
     }
+    if (token === "--suite" && next) {
+      if (next in aoriPulseBenchmarkSuites) args.suites.push(next as BenchmarkSuite);
+      index += 1;
+      continue;
+    }
+    if (token.startsWith("--suite=")) {
+      const value = token.slice("--suite=".length);
+      if (value in aoriPulseBenchmarkSuites) args.suites.push(value as BenchmarkSuite);
+      continue;
+    }
   }
 
   return args;
@@ -109,132 +97,46 @@ function formatPercent(value: number | undefined): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-function scenarioFilter(names: string[], scenarios: EvalScenario[]): EvalScenario[] {
-  if (names.length === 0) return scenarios;
-  const wanted = new Set(names);
-  return scenarios.filter((scenario) => wanted.has(scenario.name));
-}
-
-async function verifyConfiguredModel(model: ModelProvider): Promise<void> {
-  if (!model.configured) throw new Error("Configured benchmark requested, but the model provider is not configured from .env.");
-  const tester = (model as { test?: () => Promise<unknown> }).test;
-  if (typeof tester === "function") await tester.call(model);
-}
-
-function summarize(records: BenchmarkRunRecord[]) {
-  const byScenario = new Map<string, BenchmarkRunRecord[]>();
-  for (const record of records) {
-    const group = byScenario.get(record.scenario) ?? [];
-    group.push(record);
-    byScenario.set(record.scenario, group);
-  }
-  return [...byScenario.entries()].map(([scenario, runs]) => {
-    const average = (pick: (record: BenchmarkRunRecord) => number) => runs.reduce((sum, record) => sum + pick(record), 0) / runs.length;
-    const averageOptional = (pick: (record: BenchmarkRunRecord) => number | undefined) => {
-      const values = runs.map(pick).filter((value): value is number => value !== undefined && Number.isFinite(value));
-      return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined;
-    };
-    return {
-      scenario,
-      runs: runs.length,
-      strictPassRate: average((record) => record.strictPass ? 1 : 0),
-      structuralPassRate: average((record) => record.structuralPass ? 1 : 0),
-      avgAnswerCoverage: average((record) => record.answerCoverage),
-      avgDurationMs: average((record) => record.durationMs),
-      avgWallClockMs: average((record) => record.wallClockMs),
-      avgModelCalls: average((record) => record.modelCalls),
-      avgPromptTokens: average((record) => record.promptTokens),
-      avgCompletionTokens: average((record) => record.completionTokens),
-      avgTotalTokens: average((record) => record.totalTokens),
-      avgPromptCacheHitTokens: average((record) => record.promptCacheHitTokens),
-      avgPromptCacheMissTokens: average((record) => record.promptCacheMissTokens),
-      avgPromptCacheHitRate: averageOptional((record) => record.promptCacheHitRate),
-      latestAnswerMisses: runs.at(-1)?.answerMisses ?? [],
-      latestAnswerExcludesViolated: runs.at(-1)?.answerExcludesViolated ?? [],
-    };
-  });
+function average(values: number[]): number {
+  if (values.length === 0) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const scenarios = scenarioFilter(args.scenarioNames, aoriPulseEvalScenarios);
-  if (scenarios.length === 0) throw new Error("No benchmark scenarios selected.");
-
-  const config = getConfig();
-  const model = args.provider === "fake" ? new EvalModelProvider() : createModelProvider(config);
-  if (args.provider === "configured") await verifyConfiguredModel(model);
-
-  const records: BenchmarkRunRecord[] = [];
-  const providerLabel = args.provider === "fake"
-    ? "fake-eval"
-    : `${config.provider}:${config.chatModel ?? model.name}`;
+  const summary = await runBenchmarkSuite({
+    iterations: args.iterations,
+    provider: args.provider,
+    mode: args.mode,
+    scenarioNames: args.scenarioNames,
+    suites: args.suites,
+  });
+  const records = summary.records;
+  const scenarioSummaries = summary.scenarioSummaries;
+  const benchmarkSummaries = summary.benchmarkSuites;
+  const providerLabel = summary.providerLabel;
 
   console.log(`AORI/Pulse benchmark`);
-  console.log(`provider=${providerLabel} mode=${args.mode} iterations=${args.iterations} scenarios=${scenarios.length}`);
+  console.log(`provider=${providerLabel} mode=${args.mode} iterations=${args.iterations} scenarios=${scenarioSummaries.length}`);
+  console.log(`suites=${args.suites.length > 0 ? args.suites.join(",") : "all_except_beir"} languages=${[...new Set(records.map((record) => record.language))].join(",")}`);
   if (args.iterations < 2) console.log(`hint=use --iterations 2 or 3 if you want cache-hit behavior to stabilize`);
-
-  try {
-    for (let iteration = 1; iteration <= args.iterations; iteration += 1) {
-      for (const scenario of scenarios) {
-        const wallStartedAt = Date.now();
-        const { db, pulse, events } = await runEvalScenario(scenario, { model, mode: args.mode });
-        const wallClockMs = Date.now() - wallStartedAt;
-        const assessment = assessEvalScenario(scenario, pulse, events);
-        const metrics = pulse.pulse.metrics;
-        const record: BenchmarkRunRecord = {
-          scenario: scenario.name,
-          iteration,
-          strictPass: assessment.strictPass,
-          structuralPass: assessment.structuralPass,
-          answerCoverage: scenario.expected.answerIncludes.length > 0
-            ? assessment.answerIncludesMatched.length / scenario.expected.answerIncludes.length
-            : 1,
-          answerMisses: assessment.answerIncludesMissed,
-          answerExcludesViolated: assessment.answerExcludesViolated,
-          durationMs: metrics?.durationMs ?? 0,
-          wallClockMs,
-          modelCalls: metrics?.modelCalls ?? 0,
-          promptTokens: metrics?.promptTokens ?? 0,
-          completionTokens: metrics?.completionTokens ?? 0,
-          totalTokens: metrics?.totalTokens ?? 0,
-          promptCacheHitTokens: metrics?.promptCacheHitTokens ?? 0,
-          promptCacheMissTokens: metrics?.promptCacheMissTokens ?? 0,
-          promptCacheHitRate: metrics?.promptCacheHitRate,
-        };
-        records.push(record);
-        console.log(
-          `[${iteration}/${args.iterations}] ${scenario.name} ` +
-          `strict=${record.strictPass ? "pass" : "fail"} structural=${record.structuralPass ? "pass" : "fail"} ` +
-          `coverage=${formatPercent(record.answerCoverage)} duration=${formatNumber(record.durationMs)}ms ` +
-          `tokens=${record.totalTokens} cache=${formatPercent(record.promptCacheHitRate)} calls=${record.modelCalls}`,
-        );
-        db.close();
-      }
-    }
-  } finally {
-    await cleanupEvalDatabases();
+  for (const record of records) {
+    console.log(
+      `[${record.iteration}/${args.iterations}] ${record.scenario} ` +
+      `strict=${record.strictPass ? "pass" : "fail"} structural=${record.structuralPass ? "pass" : "fail"} ` +
+      `coverage=${formatPercent(record.answerCoverage)} citeR=${formatPercent(record.citationRecall)} ` +
+      `faith=${formatPercent(record.ragasFaithfulness)} duration=${formatNumber(record.durationMs)}ms ` +
+      `tokens=${record.totalTokens} cache=${formatPercent(record.promptCacheHitRate)} calls=${record.modelCalls}`,
+    );
   }
-
-  const scenarioSummaries = summarize(records);
-  const overall = {
-    runs: records.length,
-    strictPassRate: records.reduce((sum, record) => sum + (record.strictPass ? 1 : 0), 0) / Math.max(1, records.length),
-    structuralPassRate: records.reduce((sum, record) => sum + (record.structuralPass ? 1 : 0), 0) / Math.max(1, records.length),
-    avgAnswerCoverage: records.reduce((sum, record) => sum + record.answerCoverage, 0) / Math.max(1, records.length),
-    avgDurationMs: records.reduce((sum, record) => sum + record.durationMs, 0) / Math.max(1, records.length),
-    avgWallClockMs: records.reduce((sum, record) => sum + record.wallClockMs, 0) / Math.max(1, records.length),
-    avgTotalTokens: records.reduce((sum, record) => sum + record.totalTokens, 0) / Math.max(1, records.length),
-    avgPromptCacheHitRate: (() => {
-      const values = records.map((record) => record.promptCacheHitRate).filter((value): value is number => value !== undefined);
-      return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined;
-    })(),
-  };
+  const overall = summary.overall;
 
   if (args.json) {
     console.log(JSON.stringify({
       provider: providerLabel,
       mode: args.mode,
       iterations: args.iterations,
+      benchmarkSuites: benchmarkSummaries,
       scenarioSummaries,
       overall,
       records,
@@ -246,11 +148,21 @@ async function main() {
   for (const summary of scenarioSummaries) {
     console.log(
       `${summary.scenario}: strict=${formatPercent(summary.strictPassRate)} structural=${formatPercent(summary.structuralPassRate)} ` +
-      `coverage=${formatPercent(summary.avgAnswerCoverage)} duration=${formatNumber(summary.avgDurationMs)}ms ` +
+      `coverage=${formatPercent(summary.avgAnswerCoverage)} citeR=${formatPercent(summary.avgCitationRecall)} ` +
+      `faith=${formatPercent(summary.avgRagasFaithfulness)} duration=${formatNumber(summary.avgDurationMs)}ms ` +
       `tokens=${formatNumber(summary.avgTotalTokens)} cache=${formatPercent(summary.avgPromptCacheHitRate)}`,
     );
     if (summary.latestAnswerMisses.length > 0) console.log(`  missed includes: ${summary.latestAnswerMisses.join(" | ")}`);
     if (summary.latestAnswerExcludesViolated.length > 0) console.log(`  violated excludes: ${summary.latestAnswerExcludesViolated.join(" | ")}`);
+  }
+
+  console.log(`\nBenchmark suites`);
+  for (const summary of benchmarkSummaries) {
+    console.log(
+      `${summary.suite} (${summary.kind}): strict=${formatPercent(summary.strictPassRate)} ` +
+      `coverage=${formatPercent(summary.avgAnswerCoverage)} citeR=${formatPercent(summary.avgCitationRecall)} ` +
+      `ragas_faith=${formatPercent(summary.avgRagasFaithfulness)} ares_rel=${formatPercent(summary.avgAresAnswerRelevance)}`,
+    );
   }
 
   console.log(`\nOverall`);

@@ -1176,6 +1176,268 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   gap: 10px;
 }
 .workspace-panel h3, .node-evidence-detail h3 { margin: 0; font-size: 14px; }
+.benchmark-workspace {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.benchmark-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+.benchmark-header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.button-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+.benchmark-header h2 { margin: 0 0 6px; }
+.benchmark-header p { margin: 0; color: #92a4bf; line-height: 1.5; }
+.benchmark-layout {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+  gap: 14px;
+}
+.benchmark-sidebar,
+.benchmark-main {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-content: start;
+  overflow: auto;
+  padding-right: 2px;
+}
+.benchmark-runner,
+.benchmark-history {
+  border: 1px solid #202d44;
+  background: #0c1628;
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+.benchmark-runner h3,
+.benchmark-history h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.benchmark-runner label,
+.benchmark-suite-option {
+  display: grid;
+  gap: 5px;
+  color: #b7c7df;
+  font-size: 12px;
+}
+.benchmark-runner input,
+.benchmark-runner select {
+  width: 100%;
+}
+.benchmark-suite-picker {
+  border: 1px solid #263750;
+  border-radius: 7px;
+  margin: 0;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+.benchmark-suite-picker legend {
+  padding: 0 6px;
+  color: #9cb0cb;
+  font-size: 12px;
+}
+.benchmark-suite-option {
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 8px;
+}
+.benchmark-suite-option strong {
+  color: #dce7f5;
+  font-size: 12px;
+}
+.benchmark-suite-option small {
+  color: #8ea0ba;
+  line-height: 1.45;
+}
+.benchmark-run-list {
+  display: grid;
+  gap: 8px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+.benchmark-run-card {
+  border: 1px solid #21304a;
+  border-radius: 8px;
+  background: #101b2f;
+  display: grid;
+}
+.benchmark-run-main {
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: #dce7f5;
+  padding: 10px;
+  display: grid;
+  gap: 4px;
+}
+.benchmark-run-main strong { font-size: 13px; }
+.benchmark-run-main small { color: #8ea0ba; line-height: 1.45; }
+.benchmark-run-actions {
+  display: flex;
+  gap: 6px;
+  padding: 0 10px 10px;
+}
+.benchmark-run-actions button {
+  font-size: 11px;
+  padding: 5px 8px;
+}
+.benchmark-run-actions button.selected {
+  background: #12342f;
+  border-color: #58d5bd;
+  color: #9ef0db;
+}
+.benchmark-summary-panel,
+.benchmark-suite-table,
+.benchmark-scenario-table {
+  min-height: 0;
+  flex: 0 0 auto;
+}
+.benchmark-summary-header {
+  display: grid;
+  gap: 8px;
+}
+.benchmark-summary-header h3 {
+  margin: 0;
+}
+.benchmark-summary-header small {
+  color: #8ea0ba;
+}
+.benchmark-methodology {
+  border-top: 1px solid #202d44;
+  padding-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+.benchmark-methodology strong {
+  color: #dce7f5;
+  font-size: 12px;
+}
+.benchmark-methodology p {
+  margin: 0;
+  color: #b7c7df;
+  line-height: 1.5;
+}
+.benchmark-methodology .muted {
+  color: #8ea0ba;
+}
+.benchmark-compare-note {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding-top: 8px;
+  border-top: 1px solid #202d44;
+  color: #b7c7df;
+  font-size: 12px;
+}
+.benchmark-compare-note small { color: #8ea0ba; }
+.benchmark-table {
+  display: grid;
+  gap: 6px;
+}
+.benchmark-table-scroll {
+  min-height: 0;
+  overflow: auto;
+  max-height: 42vh;
+  padding-right: 2px;
+}
+.benchmark-suite-grid,
+.benchmark-scenario-grid {
+  min-width: 100%;
+}
+.benchmark-table-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.5fr) repeat(7, minmax(96px, 1fr));
+  gap: 10px;
+  align-items: start;
+  padding: 9px 10px;
+  border: 1px solid #20304a;
+  background: #101b2f;
+  border-radius: 7px;
+}
+.benchmark-scenario-table .benchmark-table-row {
+  grid-template-columns: minmax(220px, 1.2fr) minmax(84px, .5fr) minmax(84px, .6fr) minmax(220px, 1.2fr) minmax(90px, .5fr) minmax(90px, .5fr);
+}
+.benchmark-table-head {
+  background: #0f182b;
+  border-color: #2a3a55;
+  color: #8ea0ba;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+.benchmark-table-row strong {
+  color: #dce7f5;
+  font-size: 12px;
+}
+.benchmark-table-row small {
+  color: #8ea0ba;
+  line-height: 1.45;
+  display: block;
+}
+.benchmark-report-card {
+  border-top: 1px solid #202d44;
+  padding-top: 12px;
+  display: grid;
+  gap: 12px;
+}
+.benchmark-report-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.benchmark-report-grid section {
+  border: 1px solid #20304a;
+  background: #101b2f;
+  border-radius: 8px;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+.benchmark-report-grid h4 {
+  margin: 0;
+  color: #dce7f5;
+  font-size: 13px;
+}
+.benchmark-report-grid pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #dbe7f6;
+  line-height: 1.6;
+  font: 12px "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+}
+.benchmark-report-grid ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+  color: #b7c7df;
+}
+.benchmark-report-grid li {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
 .document-tree-list, .evidence-table {
   display: grid;
   gap: 6px;
@@ -1341,6 +1603,21 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   padding-left: 8px;
 }
 @media (max-width: 720px) {
+  .benchmark-layout {
+    grid-template-columns: 1fr;
+  }
+  .benchmark-table-scroll {
+    max-height: none;
+    overflow: visible;
+  }
+  .benchmark-report-grid {
+    grid-template-columns: 1fr;
+  }
+  .benchmark-table-row,
+  .benchmark-scenario-table .benchmark-table-row {
+    grid-template-columns: 1fr;
+  }
+  .benchmark-table-head { display: none; }
   .source-split {
     grid-template-columns: 1fr;
   }

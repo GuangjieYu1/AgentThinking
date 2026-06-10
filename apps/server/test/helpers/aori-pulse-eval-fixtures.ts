@@ -111,8 +111,49 @@ interface EvalItem {
   summary?: string | undefined;
 }
 
+export type BenchmarkSuite = "kilt" | "crag" | "ragbench" | "crud_rag" | "ragas" | "ares";
+
+export const aoriPulseBenchmarkSuites = {
+  kilt: {
+    label: "KILT-style provenance QA",
+    kind: "dataset",
+    focus: ["answer correctness", "provenance", "source-bound evidence"],
+  },
+  crag: {
+    label: "CRAG-style robustness QA",
+    kind: "dataset",
+    focus: ["abstention", "uncertainty exposure", "retrieval robustness"],
+  },
+  ragbench: {
+    label: "RAGBench-style end-to-end QA",
+    kind: "dataset",
+    focus: ["grounded answer quality", "multi-step evidence use", "pipeline stability"],
+  },
+  crud_rag: {
+    label: "CRUD-RAG-style Chinese QA",
+    kind: "dataset",
+    focus: ["Chinese source handling", "citation support", "faithful structured answers"],
+  },
+  ragas: {
+    label: "RAGAS-style automatic scoring",
+    kind: "scoring",
+    focus: ["faithfulness", "answer relevancy", "context precision", "context recall"],
+  },
+  ares: {
+    label: "ARES-style automatic scoring",
+    kind: "scoring",
+    focus: ["answer faithfulness", "answer relevance", "context relevance"],
+  },
+} satisfies Record<BenchmarkSuite, {
+  label: string;
+  kind: "dataset" | "scoring";
+  focus: string[];
+}>;
+
 export interface EvalScenario {
   name: string;
+  benchmarkSuites: BenchmarkSuite[];
+  language: "en" | "zh";
   question: string;
   aspectKind: Parameters<typeof buildAoriDocumentIndex>[0]["drafts"][number]["draft"]["aspects"][number]["kind"];
   domainKind: string;
@@ -326,6 +367,8 @@ export function assessEvalScenario(
 
 export const aoriPulseEvalScenarios: EvalScenario[] = [{
   name: "count-list",
+  benchmarkSuites: ["kilt", "ragbench", "ragas", "ares"],
+  language: "en",
   question: "How many people paid Huang in 2005? list all people",
   aspectKind: "finding",
   domainKind: "count_list",
@@ -346,6 +389,8 @@ export const aoriPulseEvalScenarios: EvalScenario[] = [{
   },
 }, {
   name: "timeline",
+  benchmarkSuites: ["kilt", "ragbench", "ragas", "ares"],
+  language: "en",
   question: "timeline 2005 events",
   aspectKind: "timeline",
   domainKind: "timeline",
@@ -363,6 +408,8 @@ export const aoriPulseEvalScenarios: EvalScenario[] = [{
   },
 }, {
   name: "amount",
+  benchmarkSuites: ["kilt", "ragbench", "ragas", "ares"],
+  language: "en",
   question: "What total amount of money did Huang receive?",
   aspectKind: "amount",
   domainKind: "amount",
@@ -380,6 +427,8 @@ export const aoriPulseEvalScenarios: EvalScenario[] = [{
   },
 }, {
   name: "argument-response",
+  benchmarkSuites: ["ragbench", "ragas", "ares"],
+  language: "en",
   question: "Was the defense argument accepted and how did the court respond?",
   aspectKind: "argument",
   domainKind: "argument_response",
@@ -402,6 +451,8 @@ export const aoriPulseEvalScenarios: EvalScenario[] = [{
   },
 }, {
   name: "insufficient-evidence",
+  benchmarkSuites: ["crag", "ragbench", "ragas", "ares"],
+  language: "en",
   question: "What exact date did the unclear payment happen?",
   aspectKind: "finding",
   domainKind: "evidence_gap",
@@ -415,5 +466,129 @@ export const aoriPulseEvalScenarios: EvalScenario[] = [{
     recordCount: 1,
     selectedChunkCount: 1,
     gapCount: 1,
+  },
+}, {
+  name: "count-list-2006-overlap",
+  benchmarkSuites: ["crag", "ragbench", "ragas", "ares"],
+  language: "en",
+  question: "How many people paid Huang in 2006? list all people",
+  aspectKind: "finding",
+  domainKind: "count_list_overlap",
+  centralQuestion: "Which records are exact versus uncertain for year-specific counting?",
+  items: [
+    { title: "SourceA payment", text: "source: SourceA; person: Alice; time: 2006; evidence: Alice paid Huang in 2006." },
+    { title: "SourceB payment", text: "source: SourceB; person: Bob; time: 2005-2006; evidence: Bob paid Huang across 2005-2006." },
+    { title: "SourceC payment", text: "source: SourceC; person: Charlie; evidence: Charlie paid Huang but time is not explicit." },
+    { title: "SourceD payment", text: "source: SourceD; person: Dana; time: 2010; evidence: Dana paid Huang in 2010." },
+  ],
+  expected: {
+    answerIncludes: ['"count":1', "SourceA", "Uncertain records: SourceB, SourceC"],
+    answerExcludes: ["SourceD [", "16 chunks"],
+    recordCount: 4,
+    selectedChunkCount: 4,
+    gapCount: 1,
+  },
+}, {
+  name: "amount-2008-null",
+  benchmarkSuites: ["crag", "ragbench", "ragas", "ares"],
+  language: "en",
+  question: "What total amount of money did Huang receive in 2008?",
+  aspectKind: "amount",
+  domainKind: "amount_year_null",
+  centralQuestion: "What happens when the requested year has no exact amount record?",
+  items: [
+    { title: "AmountA", text: "source: SourceA; amount: 10 wan; time: 2005; evidence: SourceA paid 10 wan." },
+    { title: "AmountB", text: "source: SourceB; amount: 20 wan; time: 2006; evidence: SourceB paid 20 wan." },
+    { title: "AmountC", text: "source: SourceC; amount: 5 wan; time: 2007; evidence: SourceC paid 5 wan." },
+  ],
+  expected: {
+    answerIncludes: ["2008 amount: null"],
+    answerExcludes: ["SourceA:", "SourceB:", "SourceC:", "16 chunks"],
+    recordCount: 3,
+    selectedChunkCount: 3,
+  },
+}, {
+  name: "crud-rag-count-zh",
+  benchmarkSuites: ["crud_rag", "ragas", "ares"],
+  language: "zh",
+  question: "2005年向黄某付款的人有多少，列出名单",
+  aspectKind: "finding",
+  domainKind: "crud_count_zh",
+  centralQuestion: "中文语料里哪些付款记录能被准确计数？",
+  items: [
+    { title: "证据甲", text: "source: 证据甲; person: 张三; time: 2005; evidence: 张三在2005年向黄某付款。" },
+    { title: "证据乙", text: "source: 证据乙; person: 李四; time: 2005; evidence: 李四在2005年向黄某付款。" },
+    { title: "证据丙", text: "source: 证据丙; person: 王五; time: 2010; evidence: 王五在2010年向黄某付款。" },
+    { title: "证据丁", text: "source: 证据丁; person: 赵六; time: 2005-2006; evidence: 赵六在2005至2006年间向黄某付款。" },
+    { title: "证据戊", text: "source: 证据戊; person: 孙七; evidence: 孙七向黄某付款，但时间未写明。" },
+  ],
+  expected: {
+    answerIncludes: ['"count":2', "证据甲", "证据乙", "Uncertain records: 证据丁, 证据戊"],
+    answerExcludes: ["证据丙 [", "16 chunks"],
+    recordCount: 5,
+    selectedChunkCount: 5,
+    gapCount: 1,
+  },
+}, {
+  name: "crud-rag-timeline-zh",
+  benchmarkSuites: ["crud_rag", "ragas", "ares"],
+  language: "zh",
+  question: "按时间线列出2005年的付款事件",
+  aspectKind: "timeline",
+  domainKind: "crud_timeline_zh",
+  centralQuestion: "中文时间线问题能否保持出处绑定？",
+  items: [
+    { title: "事件甲", text: "source: 证据甲; event: 张三向黄某付款; time: 2005; evidence: 张三付款。" },
+    { title: "事件乙", text: "source: 证据乙; event: 李四向黄某付款; time: 2005-2006; evidence: 李四付款时间有区间。" },
+    { title: "事件丙", text: "source: 证据丙; event: 王五向黄某付款; time: 2010; evidence: 王五付款。" },
+  ],
+  expected: {
+    answerIncludes: ["张三向黄某付款", "Uncertain records: 证据乙"],
+    answerExcludes: ["王五向黄某付款 [", "16 chunks"],
+    recordCount: 3,
+    selectedChunkCount: 3,
+  },
+}, {
+  name: "crud-rag-amount-zh",
+  benchmarkSuites: ["crud_rag", "ragas", "ares"],
+  language: "zh",
+  question: "黄某一共收了多少金额？",
+  aspectKind: "amount",
+  domainKind: "crud_amount_zh",
+  centralQuestion: "中文金额问题是否能逐条给出出处？",
+  items: [
+    { title: "金额甲", text: "source: 来源甲; amount: 10万; time: 2005; evidence: 来源甲支付10万。" },
+    { title: "金额乙", text: "source: 来源乙; amount: 20万; time: 2006; evidence: 来源乙支付20万。" },
+    { title: "金额丙", text: "source: 来源丙; amount: 5万; time: 2007; evidence: 来源丙支付5万。" },
+  ],
+  expected: {
+    answerIncludes: ["来源甲: 10万", "来源乙: 20万", "来源丙: 5万"],
+    answerExcludes: ["No source-bound amount value was extracted", "16 chunks"],
+    recordCount: 3,
+    selectedChunkCount: 3,
+  },
+}, {
+  name: "crud-rag-argument-zh",
+  benchmarkSuites: ["crud_rag", "ragas", "ares"],
+  language: "zh",
+  question: "辩护意见是否被法院采纳，法院如何回应？",
+  aspectKind: "argument",
+  domainKind: "crud_argument_zh",
+  centralQuestion: "中文辩护-回应结构能否保持来源绑定？",
+  items: [
+    {
+      title: "借款辩护",
+      text: "argument: 付款属于借款; response: 法院认为该辩护不能成立; finding: 属于行贿款; status: not_accepted; evidence: 法院说明借款说法缺乏依据。",
+    },
+    {
+      title: "金额辩护",
+      text: "argument: 金额被夸大; response: 法院部分采纳该意见; finding: 对金额进行了调减; status: partially_accepted; evidence: 法院重新核算金额。",
+    },
+  ],
+  expected: {
+    answerIncludes: ["付款属于借款", "法院认为该辩护不能成立", "金额被夸大", "partially_accepted"],
+    answerExcludes: ["16 chunks"],
+    recordCount: 2,
+    selectedChunkCount: 2,
   },
 }];

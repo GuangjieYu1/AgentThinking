@@ -9,6 +9,10 @@ import type {
   AnalysisDraft,
   AnalysisStatement,
   AuthSession,
+  BenchmarkCatalog,
+  BenchmarkRunListEntry,
+  BenchmarkRunResult,
+  CreateBenchmarkRunInput,
   ContextUnit,
   Document,
   DocumentTreeNode,
@@ -353,4 +357,14 @@ export const api = {
   analysis: (libraryId: string) => request<PublishedAnalysis>(`/libraries/${libraryId}/analysis`),
   analysisDownloadUrl: (libraryId: string) => `/api/libraries/${libraryId}/analysis/download`,
   exportUrl: (libraryId: string) => `/api/libraries/${libraryId}/export`,
+  benchmarkCatalog: () => request<BenchmarkCatalog>("/benchmarks/catalog"),
+  benchmarkRuns: () => request<BenchmarkRunListEntry[]>("/benchmarks/runs"),
+  benchmarkRun: (runId: string) => request<BenchmarkRunResult>(`/benchmarks/runs/${runId}`),
+  benchmarkRunJsonUrl: (runId: string) => `/api/benchmarks/runs/${runId}/export.json`,
+  benchmarkRunMarkdownUrl: (runId: string) => `/api/benchmarks/runs/${runId}/export.md`,
+  createBenchmarkRun: (input: CreateBenchmarkRunInput) =>
+    request<BenchmarkRunResult>("/benchmarks/runs", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
 };

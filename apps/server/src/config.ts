@@ -10,6 +10,7 @@ export interface AppConfig {
   dataDir: string;
   filesDir: string;
   analysisDir: string;
+  benchmarkDir: string;
   ocrCacheDir: string;
   provider: "deepseek" | "openai" | "fake";
   aiBaseUrl: string;
@@ -66,6 +67,7 @@ export function getConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     dataDir,
     filesDir: overrides.filesDir ?? resolve(dataDir, "files"),
     analysisDir: overrides.analysisDir ?? resolve(dataDir, "analysis"),
+    benchmarkDir: overrides.benchmarkDir ?? resolve(dataDir, "benchmarks"),
     ocrCacheDir: overrides.ocrCacheDir ?? resolve(dataDir, "ocr-cache"),
     provider,
     aiBaseUrl,

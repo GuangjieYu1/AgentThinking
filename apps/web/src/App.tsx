@@ -21,6 +21,7 @@ import type {
 } from "@agent-thinking/contracts";
 import { api } from "./api";
 import { AnalysisWorkspace } from "./AnalysisWorkspace";
+import { BenchmarkWorkspace } from "./BenchmarkWorkspace";
 import { GraphWorkspace } from "./GraphWorkspace";
 import { ModelTools } from "./ModelTools";
 import { TimelineWorkspace } from "./TimelineWorkspace";
@@ -392,7 +393,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const [jobs, setJobs] = useState<IngestJob[]>([]);
   const [settings, setSettings] = useState<LibrarySettings>();
   const [refreshGraph, setRefreshGraph] = useState(0);
-  const [activeWorkspace, setActiveWorkspace] = useState<"graph" | "timeline" | "analysis">("graph");
+  const [activeWorkspace, setActiveWorkspace] = useState<"graph" | "timeline" | "analysis" | "benchmark">("graph");
   const [analysis, setAnalysis] = useState<PublishedAnalysis>();
   const [sourceView, setSourceView] = useState<{ structure: SourceStructure; text?: string; focus?: Citation; aori?: AoriDocumentResponse }>();
   const [indexStrategy, setIndexStrategy] = useState<IndexStrategy>("bottom_up_evidence");
@@ -706,6 +707,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
             </div>
             <div className="analysis-actions">
               <button onClick={() => setActiveWorkspace("analysis")}>进入分析审核</button>
+              <button onClick={() => setActiveWorkspace("benchmark")}>打开 Benchmark</button>
               {analysis && <>
                 <a href={api.analysisDownloadUrl(library.id)}>下载 Markdown</a>
                 <a href={api.exportUrl(library.id)}>导出归档</a>
@@ -752,6 +754,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
             <button className={activeWorkspace === "graph" ? "selected" : ""} onClick={() => setActiveWorkspace("graph")}>关系图谱审核</button>
             <button className={activeWorkspace === "timeline" ? "selected" : ""} onClick={() => setActiveWorkspace("timeline")}>时间脉络</button>
             <button className={activeWorkspace === "analysis" ? "selected" : ""} onClick={() => setActiveWorkspace("analysis")}>分析笔记审核</button>
+            <button className={activeWorkspace === "benchmark" ? "selected" : ""} onClick={() => setActiveWorkspace("benchmark")}>Benchmark</button>
           </nav>
           {activeWorkspace === "graph" ? (
             <GraphWorkspace
@@ -770,7 +773,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
               onError={onError}
               onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)}
             />
-          ) : (
+          ) : activeWorkspace === "analysis" ? (
             <AnalysisWorkspace
               key={`${library.id}:${refreshGraph}`}
               libraryId={library.id}
@@ -779,6 +782,8 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
               onError={onError}
               onOpenCitation={(citation) => void openSource(citation.versionId, citation.mediaType, citation)}
             />
+          ) : (
+            <BenchmarkWorkspace onError={onError} />
           )}
         </div>
       </div>

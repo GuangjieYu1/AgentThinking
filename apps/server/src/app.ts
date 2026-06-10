@@ -7,6 +7,7 @@ import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import {
   createLibrarySchema,
+  createBenchmarkRunSchema,
   createPulseSchema,
   createRelationSchema,
   addGraphEvidenceSchema,
@@ -32,6 +33,9 @@ import {
   type RelationType,
   type AspectKind,
   type AoriDocumentCatalogEntry,
+  type BenchmarkRunListEntry,
+  type BenchmarkRunResult,
+  type BenchmarkCatalog,
   type IndexStrategy,
   type PulseStreamEvent,
   type SearchResult,
@@ -44,6 +48,7 @@ import type { ModelProvider } from "./services/models.js";
 import { IngestionQueue } from "./services/ingestion.js";
 import { VectorStore } from "./services/vector-store.js";
 import { AnalysisPublisher } from "./services/analysis.js";
+import { BenchmarkService } from "./services/benchmarks.js";
 import { LibraryEventBus } from "./services/library-events.js";
 import { MappingAuditService } from "./services/mapping-audit.js";
 import { PulseEngine } from "./services/pulse.js";
@@ -149,6 +154,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   const { config, db, vectors, model, queue } = services;
   const events = services.events ?? new LibraryEventBus();
   const publisher = new AnalysisPublisher(db, config);
+  const benchmarks = new BenchmarkService(config);
   const pulseEngine = new PulseEngine(db, vectors, model, { aoriAnswerMode: config.aoriAnswerMode });
   const mappingAudit = new MappingAuditService(db, model, events);
   await app.register(cors, { origin: true, credentials: true });
@@ -189,6 +195,27 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     authRequired: config.authRequired,
     user: request.user ?? null,
   }));
+  app.get("/api/benchmarks/catalog", async (): Promise<BenchmarkCatalog> => benchmarks.catalog());
+  app.get("/api/benchmarks/runs", async (): Promise<BenchmarkRunListEntry[]> => benchmarks.listRuns());
+  app.get<{ Params: { runId: string } }>("/api/benchmarks/runs/:runId", async (request, reply): Promise<BenchmarkRunResult> => {
+    const run = await benchmarks.getRun(request.params.runId);
+    if (!run) return reply.status(404).send({ error: "Benchmark 结果不存在" }) as never;
+    return run;
+  });
+  app.get<{ Params: { runId: string } }>("/api/benchmarks/runs/:runId/export.json", async (request, reply) => {
+    reply.type("application/json; charset=utf-8");
+    reply.header("Content-Disposition", `attachment; filename="${request.params.runId}.json"`);
+    return reply.send(await benchmarks.exportJson(request.params.runId));
+  });
+  app.get<{ Params: { runId: string } }>("/api/benchmarks/runs/:runId/export.md", async (request, reply) => {
+    reply.type("text/markdown; charset=utf-8");
+    reply.header("Content-Disposition", `attachment; filename="${request.params.runId}.md"`);
+    return reply.send(await benchmarks.exportMarkdown(request.params.runId));
+  });
+  app.post("/api/benchmarks/runs", async (request, reply): Promise<BenchmarkRunResult> => {
+    const body = createBenchmarkRunSchema.parse(request.body);
+    return reply.status(201).send(await benchmarks.run(body));
+  });
   app.post("/api/auth/register", async (request, reply) => {
     if (!config.authRequired) throw new Error("当前未启用注册");
     const body = registerSchema.parse(request.body);

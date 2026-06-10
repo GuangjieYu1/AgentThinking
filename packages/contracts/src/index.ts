@@ -265,6 +265,9 @@ export const jobStages = [
   "failed",
 ] as const;
 export const ocrModes = ["local", "cloud"] as const;
+export const benchmarkSuites = ["kilt", "crag", "ragbench", "crud_rag", "ragas", "ares"] as const;
+export const benchmarkRunKinds = ["dataset", "scoring"] as const;
+export const benchmarkProviderModes = ["configured", "fake"] as const;
 
 export type AbstractNodeKind = (typeof abstractNodeKinds)[number];
 export type AspectKind = (typeof aspectKinds)[number];
@@ -323,6 +326,9 @@ export type GraphRuleAction = (typeof graphRuleActions)[number];
 export type MappingAuditFindingStatus = (typeof mappingAuditFindingStatuses)[number];
 export type JobStage = (typeof jobStages)[number];
 export type OcrMode = (typeof ocrModes)[number];
+export type BenchmarkSuite = (typeof benchmarkSuites)[number];
+export type BenchmarkRunKind = (typeof benchmarkRunKinds)[number];
+export type BenchmarkProviderMode = (typeof benchmarkProviderModes)[number];
 
 export interface Library {
   id: string;
@@ -2458,6 +2464,171 @@ export interface PublishedAnalysis {
   publishedAt: string;
 }
 
+export interface BenchmarkSuiteCatalogEntry {
+  suite: BenchmarkSuite;
+  label: string;
+  kind: BenchmarkRunKind;
+  focus: string[];
+}
+
+export interface BenchmarkScenarioCatalogEntry {
+  name: string;
+  benchmarkSuites: BenchmarkSuite[];
+  language: "en" | "zh";
+  question: string;
+}
+
+export interface BenchmarkCatalog {
+  suites: BenchmarkSuiteCatalogEntry[];
+  scenarios: BenchmarkScenarioCatalogEntry[];
+}
+
+export interface BenchmarkRunRecord {
+  scenario: string;
+  suites: BenchmarkSuite[];
+  language: "en" | "zh";
+  iteration: number;
+  question: string;
+  expectedAnswerIncludes: string[];
+  expectedAnswerExcludes: string[];
+  actualAnswer: string;
+  actualSummary: string;
+  strictPass: boolean;
+  structuralPass: boolean;
+  answerCoverage: number;
+  answerMisses: string[];
+  answerExcludesViolated: string[];
+  citationRecall: number;
+  citationPrecision: number;
+  gapPrecision: number;
+  ragasFaithfulness: number;
+  ragasAnswerRelevancy: number;
+  ragasContextPrecision: number;
+  ragasContextRecall: number;
+  aresAnswerFaithfulness: number;
+  aresAnswerRelevance: number;
+  aresContextRelevance: number;
+  durationMs: number;
+  wallClockMs: number;
+  modelCalls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  promptCacheHitTokens: number;
+  promptCacheMissTokens: number;
+  promptCacheHitRate?: number | undefined;
+}
+
+export interface BenchmarkScenarioSummary {
+  scenario: string;
+  runs: number;
+  strictPassRate: number;
+  structuralPassRate: number;
+  avgAnswerCoverage: number;
+  avgCitationRecall: number;
+  avgCitationPrecision: number;
+  avgGapPrecision: number;
+  avgRagasFaithfulness: number;
+  avgRagasAnswerRelevancy: number;
+  avgRagasContextPrecision: number;
+  avgRagasContextRecall: number;
+  avgAresAnswerFaithfulness: number;
+  avgAresAnswerRelevance: number;
+  avgAresContextRelevance: number;
+  avgDurationMs: number;
+  avgWallClockMs: number;
+  avgModelCalls: number;
+  avgPromptTokens: number;
+  avgCompletionTokens: number;
+  avgTotalTokens: number;
+  avgPromptCacheHitTokens: number;
+  avgPromptCacheMissTokens: number;
+  avgPromptCacheHitRate?: number | undefined;
+  latestAnswerMisses: string[];
+  latestAnswerExcludesViolated: string[];
+}
+
+export interface BenchmarkSuiteSummary {
+  suite: BenchmarkSuite;
+  label: string;
+  kind: BenchmarkRunKind;
+  runs: number;
+  strictPassRate: number;
+  structuralPassRate: number;
+  avgAnswerCoverage: number;
+  avgCitationRecall: number;
+  avgCitationPrecision: number;
+  avgGapPrecision: number;
+  avgRagasFaithfulness: number;
+  avgRagasAnswerRelevancy: number;
+  avgRagasContextPrecision: number;
+  avgRagasContextRecall: number;
+  avgAresAnswerFaithfulness: number;
+  avgAresAnswerRelevance: number;
+  avgAresContextRelevance: number;
+  avgDurationMs: number;
+  avgTotalTokens: number;
+}
+
+export interface BenchmarkOverallSummary {
+  runs: number;
+  strictPassRate: number;
+  structuralPassRate: number;
+  avgAnswerCoverage: number;
+  avgCitationRecall: number;
+  avgCitationPrecision: number;
+  avgGapPrecision: number;
+  avgRagasFaithfulness: number;
+  avgRagasAnswerRelevancy: number;
+  avgRagasContextPrecision: number;
+  avgRagasContextRecall: number;
+  avgAresAnswerFaithfulness: number;
+  avgAresAnswerRelevance: number;
+  avgAresContextRelevance: number;
+  avgDurationMs: number;
+  avgWallClockMs: number;
+  avgTotalTokens: number;
+  avgPromptCacheHitRate?: number | undefined;
+}
+
+export interface BenchmarkRunResult {
+  id: string;
+  path: string;
+  createdAt: string;
+  label?: string | undefined;
+  methodology: {
+    benchmarkTarget: string;
+    benchmarkAssumption: string;
+    caveat: string;
+  };
+  providerMode: BenchmarkProviderMode;
+  providerLabel: string;
+  mode: PulseInputMode;
+  iterations: number;
+  requestedSuites: BenchmarkSuite[];
+  requestedScenarios: string[];
+  benchmarkSuites: BenchmarkSuiteSummary[];
+  scenarioSummaries: BenchmarkScenarioSummary[];
+  overall: BenchmarkOverallSummary;
+  records: BenchmarkRunRecord[];
+}
+
+export interface BenchmarkRunListEntry {
+  id: string;
+  path: string;
+  createdAt: string;
+  label?: string | undefined;
+  providerMode: BenchmarkProviderMode;
+  providerLabel: string;
+  mode: PulseInputMode;
+  iterations: number;
+  requestedSuites: BenchmarkSuite[];
+  requestedScenarios: string[];
+  benchmarkSuites: BenchmarkSuite[];
+  languages: Array<"en" | "zh">;
+  overall: BenchmarkOverallSummary;
+}
+
 export interface StatementPrecheck {
   status: StatementPrecheckStatus;
   reason: string | null;
@@ -2635,6 +2806,16 @@ export type ModelStreamEvent =
 export const createLibrarySchema = z.object({
   name: z.string().trim().min(1).max(120),
 });
+
+export const createBenchmarkRunSchema = z.object({
+  label: z.string().trim().min(1).max(120).optional(),
+  provider: z.enum(benchmarkProviderModes).default("configured"),
+  mode: z.enum(pulseInputModes).default("full"),
+  iterations: z.coerce.number().int().min(1).max(5).default(1),
+  suites: z.array(z.enum(benchmarkSuites)).max(benchmarkSuites.length).default([]),
+  scenarioNames: z.array(z.string().trim().min(1).max(120)).max(40).default([]),
+});
+export type CreateBenchmarkRunInput = z.infer<typeof createBenchmarkRunSchema>;
 
 export const registerSchema = z.object({
   username: z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_-]+$/, "用户名只能包含字母、数字、下划线和连字符"),

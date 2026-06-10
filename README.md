@@ -98,6 +98,44 @@ npm test             # Domain and ingestion integration tests
 npm run build        # Production assets and server bundle
 ```
 
+## RAG Benchmark Suite
+
+The repo includes a local AORI/Pulse benchmark pack that covers benchmark styles other than BEIR:
+
+- `KILT` style: source-bound QA with provenance expectations
+- `CRAG` style: robustness, abstention, and uncertainty exposure
+- `RAGBench` style: end-to-end grounded QA
+- `CRUD-RAG` style: Chinese source-grounded QA
+- `RAGAS` style: automatic scoring proxies for faithfulness/relevancy/context
+- `ARES` style: automatic scoring proxies for answer/context relevance
+
+Quick run with local fake provider:
+
+```bash
+npm run benchmark:rag-suite -w @agent-thinking/server
+```
+
+Benchmark results are persisted as JSON files under `data/benchmarks/`. The app can read these runs and compare historical iterations directly in the Benchmark workspace.
+
+Run a specific suite:
+
+```bash
+npm run benchmark:aori-pulse -w @agent-thinking/server -- --provider fake --suite crud_rag
+```
+
+Run with the configured real model:
+
+```bash
+npm run benchmark:aori-pulse -w @agent-thinking/server -- --provider configured --iterations 2
+```
+
+Optional filters:
+
+- `--suite kilt|crag|ragbench|crud_rag|ragas|ares`
+- `--scenario <scenario-name>`
+- `--mode full|progressive`
+- `--json`
+
 ## Boundaries
 
 This first release does not include collaboration, watched folders, or full-graph rendering for large libraries. The default graph is an abstract overview and loads evidence chunks on demand.

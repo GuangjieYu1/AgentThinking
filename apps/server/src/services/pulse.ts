@@ -1,6 +1,7 @@
 import type {
   AbstractNode,
   Chunk,
+  ModelUsageCall,
   ModelUsageMetricsCollector,
   PulseMetrics,
   PulseInputMode,
@@ -22,6 +23,9 @@ interface PulseMetricsAccumulator {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  promptCacheHitTokens: number;
+  promptCacheMissTokens: number;
+  modelUsageCalls: ModelUsageCall[];
 }
 
 function clampScore(value: number): number {
@@ -75,6 +79,13 @@ function summarizeCandidates(candidates: PulseNavigationCandidate[], limit = 12)
   }));
 }
 
+function describeModelUsage(call: ModelUsageCall): string {
+  const cacheSuffix = call.promptCacheHitRate === undefined
+    ? ""
+    : ` · cache ${(call.promptCacheHitRate * 100).toFixed(1)}%`;
+  return `${call.model} ${call.path} · ${call.totalTokens} tok${cacheSuffix}`;
+}
+
 function rejectedCandidatesFor(
   decision: { rejectedCandidates?: Array<{ id: string; reason: string }> },
   candidates: PulseNavigationCandidate[],
@@ -121,13 +132,39 @@ export class PulseEngine {
       promptTokens: 0,
       completionTokens: 0,
       totalTokens: 0,
+      promptCacheHitTokens: 0,
+      promptCacheMissTokens: 0,
+      modelUsageCalls: [],
     };
     const usageCollector: ModelUsageMetricsCollector = {
       onModelUsage: (metrics) => {
+        const promptCacheHitTokens = metrics.promptCacheHitTokens ?? 0;
+        const promptCacheMissTokens = metrics.promptCacheMissTokens ?? 0;
+        const promptCacheTotal = promptCacheHitTokens + promptCacheMissTokens;
+        const call: ModelUsageCall = {
+          sequence: metricsAccumulator.modelUsageCalls.length + 1,
+          recordedAt: new Date().toISOString(),
+          model: metrics.model,
+          path: metrics.path,
+          promptTokens: metrics.promptTokens,
+          completionTokens: metrics.completionTokens,
+          totalTokens: metrics.totalTokens,
+          ...(promptCacheHitTokens > 0 ? { promptCacheHitTokens } : {}),
+          ...(promptCacheMissTokens > 0 ? { promptCacheMissTokens } : {}),
+          ...(promptCacheTotal > 0 ? { promptCacheHitRate: promptCacheHitTokens / promptCacheTotal } : {}),
+        };
         metricsAccumulator.modelCalls += 1;
         metricsAccumulator.promptTokens += metrics.promptTokens;
         metricsAccumulator.completionTokens += metrics.completionTokens;
         metricsAccumulator.totalTokens += metrics.totalTokens;
+        metricsAccumulator.promptCacheHitTokens += promptCacheHitTokens;
+        metricsAccumulator.promptCacheMissTokens += promptCacheMissTokens;
+        metricsAccumulator.modelUsageCalls.push(call);
+        void emitPulse(eventSink, {
+          type: "model_usage",
+          message: describeModelUsage(call),
+          payload: call,
+        });
       },
     };
     this.model.setUsageMetricsCollector?.(usageCollector);
@@ -171,6 +208,7 @@ export class PulseEngine {
   }
 
   private buildPulseMetrics(startedAt: string, startedAtMs: number, usage: PulseMetricsAccumulator): PulseMetrics {
+    const promptCacheTotal = usage.promptCacheHitTokens + usage.promptCacheMissTokens;
     return {
       durationMs: Math.max(0, Date.now() - startedAtMs),
       startedAt,
@@ -179,6 +217,14 @@ export class PulseEngine {
       promptTokens: usage.promptTokens,
       completionTokens: usage.completionTokens,
       totalTokens: usage.totalTokens,
+      ...(promptCacheTotal > 0
+        ? {
+          promptCacheHitTokens: usage.promptCacheHitTokens,
+          promptCacheMissTokens: usage.promptCacheMissTokens,
+          promptCacheHitRate: usage.promptCacheHitTokens / promptCacheTotal,
+        }
+        : {}),
+      ...(usage.modelUsageCalls.length > 0 ? { modelUsageCalls: usage.modelUsageCalls } : {}),
     };
   }
 

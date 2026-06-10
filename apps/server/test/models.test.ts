@@ -31,7 +31,13 @@ describe("DeepSeek model configuration", () => {
     const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
       new Response(JSON.stringify({
         choices: [{ message: { content: JSON.stringify({ nodes: [], relations: [] }) } }],
-        usage: { prompt_tokens: 123, completion_tokens: 45, total_tokens: 168 },
+        usage: {
+          prompt_tokens: 123,
+          completion_tokens: 45,
+          total_tokens: 168,
+          prompt_cache_hit_tokens: 90,
+          prompt_cache_miss_tokens: 33,
+        },
       }), { status: 200, headers: { "content-type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
     const provider = new OpenAICompatibleProvider(config);
@@ -67,6 +73,8 @@ describe("DeepSeek model configuration", () => {
       promptTokens: 123,
       completionTokens: 45,
       totalTokens: 168,
+      promptCacheHitTokens: 90,
+      promptCacheMissTokens: 33,
     });
   });
 

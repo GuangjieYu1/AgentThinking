@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { ModelUsageMetricsCollector, PulseStreamEvent } from "@agent-thinking/contracts";
 import { AgentDatabase } from "../src/db.js";
 import { FakeModelProvider } from "../src/services/models.js";
 import { PulseEngine } from "../src/services/pulse.js";
@@ -40,6 +41,27 @@ function seedPulseGraph(db: AgentDatabase) {
   return { library };
 }
 
+class InstrumentedFakeModelProvider extends FakeModelProvider {
+  private usageCollector: ModelUsageMetricsCollector | undefined;
+
+  override setUsageMetricsCollector(collector: ModelUsageMetricsCollector | undefined): void {
+    this.usageCollector = collector;
+  }
+
+  override async synthesizePulseAnswer(input: Parameters<FakeModelProvider["synthesizePulseAnswer"]>[0]) {
+    this.usageCollector?.onModelUsage({
+      model: "fake-model",
+      path: "/pulse/synthesize",
+      promptTokens: 120,
+      completionTokens: 40,
+      totalTokens: 160,
+      promptCacheHitTokens: 80,
+      promptCacheMissTokens: 40,
+    });
+    return super.synthesizePulseAnswer(input);
+  }
+}
+
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -75,6 +97,39 @@ describe("pulse activation", () => {
     expect(pulse.hits.some((hit) => hit.rationale?.length)).toBe(true);
     expect(pulse.hits.map((hit) => hit.label)).toContain("Bridge");
     expect(streamedEvents).toEqual(expect.arrayContaining(["candidates", "decision", "backtrack"]));
+    db.close();
+  });
+
+  it("emits per-call model usage events and stores them in pulse metrics", async () => {
+    const db = await database();
+    const { library } = seedPulseGraph(db);
+    const streamedEvents: PulseStreamEvent[] = [];
+
+    const pulse = await new PulseEngine(db, new VectorStore(db), new InstrumentedFakeModelProvider())
+      .create(library.id, "alpha beta", "progressive", (event) => {
+        streamedEvents.push(event);
+      });
+
+    const usageEvent = streamedEvents.find((event): event is Extract<PulseStreamEvent, { type: "model_usage" }> => event.type === "model_usage");
+    expect(usageEvent?.message).toContain("fake-model /pulse/synthesize");
+    expect(usageEvent?.payload).toMatchObject({
+      sequence: 1,
+      model: "fake-model",
+      path: "/pulse/synthesize",
+      totalTokens: 160,
+      promptCacheHitTokens: 80,
+      promptCacheMissTokens: 40,
+    });
+    expect(pulse.pulse.metrics?.modelCalls).toBe(1);
+    expect(pulse.pulse.metrics?.promptCacheHitRate).toBeCloseTo(80 / 120);
+    expect(pulse.pulse.metrics?.modelUsageCalls).toHaveLength(1);
+    expect(pulse.pulse.metrics?.modelUsageCalls?.[0]).toMatchObject({
+      sequence: 1,
+      model: "fake-model",
+      path: "/pulse/synthesize",
+      totalTokens: 160,
+      promptCacheHitRate: 80 / 120,
+    });
     db.close();
   });
 });

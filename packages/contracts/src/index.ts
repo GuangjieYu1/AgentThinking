@@ -1744,16 +1744,30 @@ export interface PulseMetrics {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  promptCacheHitTokens?: number | undefined;
+  promptCacheMissTokens?: number | undefined;
+  promptCacheHitRate?: number | undefined;
+  modelUsageCalls?: ModelUsageCall[] | undefined;
+}
+
+export interface ModelUsageMetrics {
+  model: string;
+  path: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  promptCacheHitTokens?: number | undefined;
+  promptCacheMissTokens?: number | undefined;
+}
+
+export interface ModelUsageCall extends ModelUsageMetrics {
+  sequence: number;
+  recordedAt: string;
+  promptCacheHitRate?: number | undefined;
 }
 
 export interface ModelUsageMetricsCollector {
-  onModelUsage(metrics: {
-    model: string;
-    path: string;
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-  }): void;
+  onModelUsage(metrics: ModelUsageMetrics): void;
 }
 
 export interface PulseHit {
@@ -1817,6 +1831,7 @@ export interface PulseResponse {
 export type PulseStreamEvent =
   | { type: "start"; mode: PulseInputMode; question: string }
   | { type: "stage"; message: string }
+  | { type: "model_usage"; message: string; payload: ModelUsageCall }
   | {
     type:
       | "library_route_started"

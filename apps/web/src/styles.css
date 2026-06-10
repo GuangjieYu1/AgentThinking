@@ -666,6 +666,85 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .pulse-process-detail small {
   padding: 5px 7px; border-radius: 6px; background: #0c1626; color: #aebed5;
 }
+.pulse-model-usage-shell {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid #28405c;
+  border-radius: 10px;
+  background: linear-gradient(180deg, #13233a 0%, #0d1728 100%);
+  box-shadow: inset 0 0 0 1px #28405c33;
+}
+.pulse-model-usage-title {
+  display: grid;
+  gap: 4px;
+}
+.pulse-panel-toggle {
+  padding: 5px 9px;
+  border: 1px solid #36557b;
+  border-radius: 999px;
+  background: #132135;
+  color: #8bd9c7;
+  font-size: 11px;
+  font-weight: 700;
+}
+.pulse-panel-toggle:hover { background: #18304a; color: #b9fff0; }
+.pulse-model-usage-shell > .pulse-model-usage-panel {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.pulse-model-usage-shell > .pulse-model-usage-panel > .pulse-panel-heading {
+  display: none;
+}
+.pulse-model-usage-panel {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid #28405c;
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, #13233a 0%, #0d1728 100%);
+  box-shadow: inset 0 0 0 1px #28405c33;
+}
+.pulse-model-usage-summary span {
+  background: #102035;
+  color: #8bd9c7;
+}
+.pulse-model-usage-list {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.pulse-model-usage-item {
+  display: grid;
+  gap: 5px;
+  padding: 8px 9px;
+  border-left: 3px solid #40d6b2;
+  border-radius: 8px;
+  background: #101b2c;
+}
+.pulse-model-usage-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pulse-model-usage-heading span {
+  color: #dce7f6;
+  font-size: 12px;
+  font-weight: 700;
+}
+.pulse-model-usage-heading small {
+  color: #89a0bf;
+}
+.pulse-model-usage-item > small {
+  color: #9cb0ca;
+  line-height: 1.45;
+}
 .pulse-playback {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 7px; border: 1px solid #223047;
   border-radius: 8px; background: #0d1728;

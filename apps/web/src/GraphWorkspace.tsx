@@ -45,6 +45,7 @@ import {
   type GraphRuleTrace,
   type GraphResponse,
   type GraphView,
+  type ModelUsageCall,
   type Pulse,
   type PulseInputMode,
   type PulseResponse,
@@ -138,6 +139,31 @@ function formatPulseDuration(durationMs: number | undefined): string {
 function formatPulseTokens(totalTokens: number | undefined): string {
   if (!Number.isFinite(totalTokens) || totalTokens === undefined || totalTokens < 0) return "-";
   return new Intl.NumberFormat("en-US").format(totalTokens);
+}
+
+function formatPulseCacheRate(rate: number | undefined): string {
+  if (!Number.isFinite(rate) || rate === undefined || rate < 0) return "-";
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
+function formatPulseCallTime(recordedAt: string): string {
+  const date = new Date(recordedAt);
+  if (Number.isNaN(date.getTime())) return recordedAt;
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function readModelUsageCall(value: unknown): ModelUsageCall | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const parsed = value as Partial<ModelUsageCall>;
+  if (typeof parsed.sequence !== "number" || !Number.isFinite(parsed.sequence)) return undefined;
+  if (typeof parsed.model !== "string" || typeof parsed.path !== "string" || typeof parsed.recordedAt !== "string") return undefined;
+  if (typeof parsed.promptTokens !== "number" || typeof parsed.completionTokens !== "number" || typeof parsed.totalTokens !== "number") return undefined;
+  return parsed as ModelUsageCall;
 }
 
 function PulseBezierEdge(props: EdgeProps): ReactNode {
@@ -581,6 +607,7 @@ function isPulseProcessEvent(event: PulseStreamEvent): event is PulseProcessEven
 function pulseProcessTitle(type: PulseProcessEvent["type"]): string {
   switch (type) {
     case "stage": return "阶段";
+    case "model_usage": return "模型调用";
     case "demand_plan_generated": return "生成 Demand Plan";
     case "demand_records_started": return "开始抽取 Evidence Records";
     case "demand_record_extracted": return "抽取 Evidence Record";
@@ -927,9 +954,119 @@ function DemandRecordDetails({ event }: { event: PulseProcessEvent }): ReactNode
 }
 
 function PulseProcessDetails({ event }: { event: PulseProcessEvent }): ReactNode {
+  if (event.type === "model_usage") {
+    const call = readModelUsageCall(event.payload);
+    if (!call) return null;
+    return <PulseModelUsageDetails call={call} />;
+  }
   if (event.type === "demand_plan_generated") return <DemandPlanDetails event={event} />;
   if (event.type === "demand_record_extracted") return <DemandRecordDetails event={event} />;
   return null;
+}
+
+function PulseModelUsageDetails({ call }: { call: ModelUsageCall }): ReactNode {
+  return (
+    <>
+      <small>
+        Prompt {formatPulseTokens(call.promptTokens)} · Completion {formatPulseTokens(call.completionTokens)} · Total {formatPulseTokens(call.totalTokens)}
+      </small>
+      {(call.promptCacheHitTokens !== undefined || call.promptCacheMissTokens !== undefined) && (
+        <small>
+          Cache hit {formatPulseTokens(call.promptCacheHitTokens ?? 0)} · miss {formatPulseTokens(call.promptCacheMissTokens ?? 0)} · rate {formatPulseCacheRate(call.promptCacheHitRate)}
+        </small>
+      )}
+    </>
+  );
+}
+
+function pulseProcessEventsWithoutModelUsage(events: PulseProcessEvent[]): PulseProcessEvent[] {
+  return events.filter((event) => event.type !== "model_usage");
+}
+
+function pulseModelUsageCallsFromEvents(events: PulseProcessEvent[]): ModelUsageCall[] {
+  return events.flatMap((event) => {
+    if (event.type !== "model_usage") return [];
+    const call = readModelUsageCall(event.payload);
+    return call ? [call] : [];
+  });
+}
+
+function PulseModelUsagePanel({ calls, limit = 12 }: { calls: ModelUsageCall[]; limit?: number }): ReactNode {
+  if (calls.length === 0) return null;
+  const visibleCalls = calls.slice(-limit);
+  const totalTokens = calls.reduce((sum, call) => sum + call.totalTokens, 0);
+  const totalHitTokens = calls.reduce((sum, call) => sum + (call.promptCacheHitTokens ?? 0), 0);
+  const totalMissTokens = calls.reduce((sum, call) => sum + (call.promptCacheMissTokens ?? 0), 0);
+  const totalPromptCacheTokens = totalHitTokens + totalMissTokens;
+  return (
+    <div className="pulse-model-usage-panel">
+      <div className="pulse-panel-heading">
+        <h3>模型调用明细</h3>
+        <small>{visibleCalls.length === calls.length ? `${calls.length} 次调用` : `最近 ${visibleCalls.length} / ${calls.length} 次调用`}</small>
+      </div>
+      <div className="pulse-metrics pulse-model-usage-summary">
+        <span>总 Token {formatPulseTokens(totalTokens)}</span>
+        <span>总 Cache Hit {formatPulseTokens(totalHitTokens)}</span>
+        <span>总 Cache Miss {formatPulseTokens(totalMissTokens)}</span>
+        <span>总命中率 {formatPulseCacheRate(totalPromptCacheTokens > 0 ? totalHitTokens / totalPromptCacheTokens : undefined)}</span>
+      </div>
+      <div className="pulse-model-usage-list">
+        {visibleCalls.map((call) => (
+          <div className="pulse-model-usage-item" key={`${call.sequence}-${call.recordedAt}`}>
+            <div className="pulse-model-usage-heading">
+              <span>第 {call.sequence} 次</span>
+              <small>{formatPulseCallTime(call.recordedAt)}</small>
+            </div>
+            <small>{call.model} · {call.path}</small>
+            <PulseModelUsageDetails call={call} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CollapsiblePulseModelUsagePanel(
+  { calls, expanded, onToggle, limit = 12 }: { calls: ModelUsageCall[]; expanded: boolean; onToggle: () => void; limit?: number },
+): ReactNode {
+  if (calls.length === 0) return null;
+  const totalTokens = calls.reduce((sum, call) => sum + call.totalTokens, 0);
+  const totalHitTokens = calls.reduce((sum, call) => sum + (call.promptCacheHitTokens ?? 0), 0);
+  const totalMissTokens = calls.reduce((sum, call) => sum + (call.promptCacheMissTokens ?? 0), 0);
+  const totalPromptCacheTokens = totalHitTokens + totalMissTokens;
+  const headerSummary = `${calls.length} 次调用 · ${formatPulseTokens(totalTokens)} tok${
+    totalPromptCacheTokens > 0 ? ` · cache ${formatPulseCacheRate(totalHitTokens / totalPromptCacheTokens)}` : ""
+  }`;
+  return (
+    <div className="pulse-model-usage-shell">
+      <div className="pulse-panel-heading">
+        <div className="pulse-model-usage-title">
+          <h3>模型调用明细</h3>
+          <small>{expanded ? headerSummary : `${headerSummary} · 已折叠`}</small>
+        </div>
+        <button type="button" className="pulse-panel-toggle" onClick={onToggle}>
+          {expanded ? "收起" : "展开"}
+        </button>
+      </div>
+      {expanded && <PulseModelUsagePanel calls={calls} limit={limit} />}
+    </div>
+  );
+}
+
+function PulseStoredModelUsageLog({ calls, limit = 12 }: { calls: ModelUsageCall[]; limit?: number }): ReactNode {
+  if (calls.length === 0) return null;
+  return (
+    <div className="pulse-navigation-log pulse-process-log">
+      <strong>模型调用</strong>
+      {calls.slice(-limit).map((call) => (
+        <div className="pulse-navigation-event pulse-process-model-usage" key={`${call.sequence}-${call.recordedAt}`}>
+          <span>第 {call.sequence} 次</span>
+          <small>{call.model} · {call.path}</small>
+          <PulseModelUsageDetails call={call} />
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function PulseProcessLog({ events, limit = 8 }: { events: PulseProcessEvent[]; limit?: number }): ReactNode {
@@ -1970,6 +2107,7 @@ export function GraphWorkspace({
   const [pulseStreamHits, setPulseStreamHits] = useState<PulseStreamHitRecord[]>([]);
   const [pulseNavigationEvents, setPulseNavigationEvents] = useState<PulseNavigationEvent[]>([]);
   const [pulseProcessEvents, setPulseProcessEvents] = useState<PulseProcessEvent[]>([]);
+  const [pulseModelUsageExpanded, setPulseModelUsageExpanded] = useState(true);
   const [pulseDraftAnswer, setPulseDraftAnswer] = useState("");
   const [documentTree, setDocumentTree] = useState<DocumentTreeNode[]>([]);
   const [documentTreeLoading, setDocumentTreeLoading] = useState(false);
@@ -1981,6 +2119,10 @@ export function GraphWorkspace({
   const aoriDefaultAppliedRef = useRef(false);
   activeLibraryIdRef.current = libraryId;
   const visibleCurrentPulse = currentPulse?.pulse.libraryId === libraryId ? currentPulse : undefined;
+  const livePulseModelUsageCalls = useMemo(() => pulseModelUsageCallsFromEvents(pulseProcessEvents), [pulseProcessEvents]);
+  const visiblePulseProcessEvents = useMemo(() => pulseProcessEventsWithoutModelUsage(pulseProcessEvents), [pulseProcessEvents]);
+  const visiblePulseModelUsageCalls = visibleCurrentPulse?.pulse.metrics?.modelUsageCalls ?? [];
+  const displayedPulseModelUsageCalls = livePulseModelUsageCalls.length > 0 ? livePulseModelUsageCalls : visiblePulseModelUsageCalls;
   const isAoriMode = isAoriGraphMode(graphMode);
   const activeAoriMode = isAoriMode
     ? aoriScope === "document"
@@ -2415,7 +2557,7 @@ export function GraphWorkspace({
           return;
         }
         if (isPulseProcessEvent(update)) {
-          setPulseStreamMessage(update.message);
+          if (update.type !== "model_usage") setPulseStreamMessage(update.message);
           setPulseProcessEvents((events) => [...events, update].slice(-32));
           return;
         }
@@ -3024,7 +3166,14 @@ export function GraphWorkspace({
                 <span className="pulse-live-dot" />
                 <span>{pulseStreamMessage || "正在等待首个脉冲事件..."}</span>
               </div>
-              <PulseProcessLog events={pulseProcessEvents} />
+              {livePulseModelUsageCalls.length > 0 && (
+                <CollapsiblePulseModelUsagePanel
+                  calls={livePulseModelUsageCalls}
+                  expanded={pulseModelUsageExpanded}
+                  onToggle={() => setPulseModelUsageExpanded((value) => !value)}
+                />
+              )}
+              <PulseProcessLog events={visiblePulseProcessEvents} />
               {pulseNavigationEvents.length > 0 && (
                 <div className="pulse-navigation-log">
                   <strong>模型导航过程</strong>
@@ -3099,9 +3248,22 @@ export function GraphWorkspace({
               <div className="pulse-metrics">
                 <span>耗时 {formatPulseDuration(visibleCurrentPulse.pulse.metrics?.durationMs)}</span>
                 <span>Token {formatPulseTokens(visibleCurrentPulse.pulse.metrics?.totalTokens)}</span>
+                <span>
+                  Cache {formatPulseCacheRate(visibleCurrentPulse.pulse.metrics?.promptCacheHitRate)}
+                  {visibleCurrentPulse.pulse.metrics?.promptCacheHitTokens !== undefined
+                    ? ` (${formatPulseTokens(visibleCurrentPulse.pulse.metrics?.promptCacheHitTokens)} hit)`
+                    : ""}
+                </span>
                 <span>模型调用 {visibleCurrentPulse.pulse.metrics?.modelCalls ?? 0}</span>
               </div>
-              <PulseProcessLog events={pulseProcessEvents} limit={10} />
+              {displayedPulseModelUsageCalls.length > 0 && (
+                <CollapsiblePulseModelUsagePanel
+                  calls={displayedPulseModelUsageCalls}
+                  expanded={pulseModelUsageExpanded}
+                  onToggle={() => setPulseModelUsageExpanded((value) => !value)}
+                />
+              )}
+              <PulseProcessLog events={visiblePulseProcessEvents} limit={10} />
               {pulseMode === "current" && (
                 <div className="pulse-playback">
                   <span>

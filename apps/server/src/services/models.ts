@@ -1238,7 +1238,7 @@ export class FakeModelProvider implements ModelProvider {
   readonly name = "fake";
   readonly configured = true;
 
-  setUsageMetricsCollector(): void {}
+  setUsageMetricsCollector(_collector?: ModelUsageMetricsCollector | undefined): void {}
 
   async embed(texts: string[]): Promise<number[][]> {
     return texts.map((text) => hashedEmbedding(text));
@@ -2161,18 +2161,33 @@ export class OpenAICompatibleProvider implements ModelProvider {
         prompt_tokens?: number;
         completion_tokens?: number;
         total_tokens?: number;
+        prompt_cache_hit_tokens?: number;
+        prompt_cache_miss_tokens?: number;
       };
     };
     const promptTokens = Number(payload.usage?.prompt_tokens ?? 0);
     const completionTokens = Number(payload.usage?.completion_tokens ?? 0);
     const totalTokens = Number(payload.usage?.total_tokens ?? promptTokens + completionTokens);
-    if (this.usageMetricsCollector && (promptTokens > 0 || completionTokens > 0 || totalTokens > 0)) {
+    const promptCacheHitTokens = Number(payload.usage?.prompt_cache_hit_tokens ?? 0);
+    const promptCacheMissTokens = Number(payload.usage?.prompt_cache_miss_tokens ?? 0);
+    if (
+      this.usageMetricsCollector &&
+      (
+        promptTokens > 0 ||
+        completionTokens > 0 ||
+        totalTokens > 0 ||
+        promptCacheHitTokens > 0 ||
+        promptCacheMissTokens > 0
+      )
+    ) {
       this.usageMetricsCollector.onModelUsage({
         model: typeof (body as { model?: unknown })?.model === "string" ? String((body as { model?: unknown }).model) : this.name,
         path,
         promptTokens,
         completionTokens,
         totalTokens,
+        ...(promptCacheHitTokens > 0 ? { promptCacheHitTokens } : {}),
+        ...(promptCacheMissTokens > 0 ? { promptCacheMissTokens } : {}),
       });
     }
     return payload;

@@ -55,6 +55,7 @@ import type {
   MappingAuditFinding,
   MappingAuditMetrics,
   MappingAuditResult,
+  ModelUsageCall,
   OcrMode,
   Pulse,
   PulseHit,
@@ -422,6 +423,39 @@ function mappingAuditFrom(r: Row): MappingAudit {
   };
 }
 
+function parseModelUsageCall(value: unknown): ModelUsageCall | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const parsed = value as Record<string, unknown>;
+  const sequence = Number(parsed.sequence);
+  const promptTokens = Number(parsed.promptTokens);
+  const completionTokens = Number(parsed.completionTokens);
+  const totalTokens = Number(parsed.totalTokens);
+  const promptCacheHitTokens = parsed.promptCacheHitTokens === undefined ? undefined : Number(parsed.promptCacheHitTokens);
+  const promptCacheMissTokens = parsed.promptCacheMissTokens === undefined ? undefined : Number(parsed.promptCacheMissTokens);
+  const promptCacheHitRate = parsed.promptCacheHitRate === undefined ? undefined : Number(parsed.promptCacheHitRate);
+  const model = typeof parsed.model === "string" ? parsed.model : "";
+  const path = typeof parsed.path === "string" ? parsed.path : "";
+  const recordedAt = typeof parsed.recordedAt === "string" ? parsed.recordedAt : "";
+  if (!Number.isFinite(sequence) || sequence <= 0) return undefined;
+  if (!Number.isFinite(promptTokens) || !Number.isFinite(completionTokens) || !Number.isFinite(totalTokens)) return undefined;
+  if (!model || !path || !recordedAt) return undefined;
+  if (promptCacheHitTokens !== undefined && !Number.isFinite(promptCacheHitTokens)) return undefined;
+  if (promptCacheMissTokens !== undefined && !Number.isFinite(promptCacheMissTokens)) return undefined;
+  if (promptCacheHitRate !== undefined && !Number.isFinite(promptCacheHitRate)) return undefined;
+  return {
+    sequence,
+    model,
+    path,
+    recordedAt,
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    ...(promptCacheHitTokens !== undefined ? { promptCacheHitTokens } : {}),
+    ...(promptCacheMissTokens !== undefined ? { promptCacheMissTokens } : {}),
+    ...(promptCacheHitRate !== undefined ? { promptCacheHitRate } : {}),
+  };
+}
+
 function parsePulseMetrics(value: unknown): PulseMetrics | undefined {
   if (typeof value !== "string" || !value.trim()) return undefined;
   try {
@@ -432,9 +466,21 @@ function parsePulseMetrics(value: unknown): PulseMetrics | undefined {
     const promptTokens = Number(parsed.promptTokens);
     const completionTokens = Number(parsed.completionTokens);
     const totalTokens = Number(parsed.totalTokens);
+    const promptCacheHitTokens = parsed.promptCacheHitTokens === undefined ? undefined : Number(parsed.promptCacheHitTokens);
+    const promptCacheMissTokens = parsed.promptCacheMissTokens === undefined ? undefined : Number(parsed.promptCacheMissTokens);
+    const promptCacheHitRate = parsed.promptCacheHitRate === undefined ? undefined : Number(parsed.promptCacheHitRate);
+    const modelUsageCalls = Array.isArray(parsed.modelUsageCalls)
+      ? parsed.modelUsageCalls.flatMap((entry) => {
+        const parsedEntry = parseModelUsageCall(entry);
+        return parsedEntry ? [parsedEntry] : [];
+      })
+      : undefined;
     const startedAt = typeof parsed.startedAt === "string" ? parsed.startedAt : "";
     const completedAt = typeof parsed.completedAt === "string" ? parsed.completedAt : "";
     if (!Number.isFinite(durationMs) || !Number.isFinite(modelCalls) || !Number.isFinite(promptTokens) || !Number.isFinite(completionTokens) || !Number.isFinite(totalTokens)) return undefined;
+    if (promptCacheHitTokens !== undefined && !Number.isFinite(promptCacheHitTokens)) return undefined;
+    if (promptCacheMissTokens !== undefined && !Number.isFinite(promptCacheMissTokens)) return undefined;
+    if (promptCacheHitRate !== undefined && !Number.isFinite(promptCacheHitRate)) return undefined;
     if (!startedAt || !completedAt) return undefined;
     return {
       durationMs,
@@ -444,6 +490,10 @@ function parsePulseMetrics(value: unknown): PulseMetrics | undefined {
       promptTokens,
       completionTokens,
       totalTokens,
+      ...(promptCacheHitTokens !== undefined ? { promptCacheHitTokens } : {}),
+      ...(promptCacheMissTokens !== undefined ? { promptCacheMissTokens } : {}),
+      ...(promptCacheHitRate !== undefined ? { promptCacheHitRate } : {}),
+      ...(modelUsageCalls && modelUsageCalls.length > 0 ? { modelUsageCalls } : {}),
     };
   } catch {
     return undefined;

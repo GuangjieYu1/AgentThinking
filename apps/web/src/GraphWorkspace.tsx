@@ -35,6 +35,7 @@ import {
   type Citation,
   type DemandAnswerPlan,
   type Document,
+  type DocumentVersion,
   type DocumentTreeNode,
   type EvidencePack,
   type EvidenceRecord,
@@ -682,9 +683,17 @@ function normalizeCitationHeadingPath(value: ChunkCitationCandidate["headingPath
   return value ?? null;
 }
 
+function documentVersions(document: Document): DocumentVersion[] {
+  return document.versions && document.versions.length > 0
+    ? document.versions
+    : document.latestVersion
+      ? [document.latestVersion]
+      : [];
+}
+
 function documentLookupByVersion(documents: Document[]): Map<string, Document> {
   return new Map(documents.flatMap((document) =>
-    document.latestVersion ? [[document.latestVersion.id, document] as const] : [],
+    documentVersions(document).map((version) => [version.id, document] as const),
   ));
 }
 

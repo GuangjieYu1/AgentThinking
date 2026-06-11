@@ -26,6 +26,47 @@ function percent(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+const reviewVerdictLabels = {
+  aligned: "基本一致",
+  partial: "部分一致",
+  mismatch: "差异明显",
+} as const;
+
+const reviewRoleLabels = {
+  included: "纳入",
+  excluded: "排除",
+  uncertain: "不确定",
+  background: "背景",
+  not_mentioned: "未提及",
+} as const;
+
+const legacyEnglishBenchmarkMethodology = {
+  benchmarkTarget: "AORI pulse answering over a library that has already been indexed into aspect-oriented reflective facets.",
+  benchmarkAssumption: "These scores evaluate retrieval and answering after AORI facet indexing is available for the target knowledge base.",
+  caveat: "This report does not measure the weaker baseline of answering directly from raw source documents without AORI indexing; direct raw-document answering is expected to perform worse.",
+} as const;
+
+const defaultChineseBenchmarkMethodology: BenchmarkRunResult["methodology"] = {
+  benchmarkTarget: "本基准测试面向已经完成 AORI 切面反思式索引的知识库，评估其脉冲问答能力。",
+  benchmarkAssumption: "这些分数衡量的是目标知识库在具备 AORI 切面索引之后的检索与回答表现。",
+  caveat: "本报告不衡量直接基于原始文档、未经过 AORI 索引时的弱基线回答能力；通常该原始文档直答路径的表现会更差。",
+};
+
+function normalizeMethodology(methodology: BenchmarkRunResult["methodology"] | undefined): BenchmarkRunResult["methodology"] {
+  if (!methodology) return { ...defaultChineseBenchmarkMethodology };
+  return {
+    benchmarkTarget: methodology.benchmarkTarget === legacyEnglishBenchmarkMethodology.benchmarkTarget
+      ? defaultChineseBenchmarkMethodology.benchmarkTarget
+      : methodology.benchmarkTarget,
+    benchmarkAssumption: methodology.benchmarkAssumption === legacyEnglishBenchmarkMethodology.benchmarkAssumption
+      ? defaultChineseBenchmarkMethodology.benchmarkAssumption
+      : methodology.benchmarkAssumption,
+    caveat: methodology.caveat === legacyEnglishBenchmarkMethodology.caveat
+      ? defaultChineseBenchmarkMethodology.caveat
+      : methodology.caveat,
+  };
+}
+
 export class BenchmarkService {
   readonly rootDir: string;
 
@@ -56,11 +97,7 @@ export class BenchmarkService {
       path,
       createdAt,
       ...(input.label ? { label: input.label } : {}),
-      methodology: {
-        benchmarkTarget: "AORI pulse answering over a library that has already been indexed into aspect-oriented reflective facets.",
-        benchmarkAssumption: "These scores evaluate retrieval and answering after AORI facet indexing is available for the target knowledge base.",
-        caveat: "This report does not measure the weaker baseline of answering directly from raw source documents without AORI indexing; direct raw-document answering is expected to perform worse.",
-      },
+      methodology: { ...defaultChineseBenchmarkMethodology },
       providerMode: input.provider,
       providerLabel: summary.providerLabel,
       mode: input.mode,
@@ -119,43 +156,39 @@ export class BenchmarkService {
   async exportMarkdown(id: string): Promise<string> {
     const run = await this.getRun(id);
     if (!run) throw new Error("Benchmark 结果不存在");
-    const methodology = run.methodology ?? {
-      benchmarkTarget: "AORI pulse answering over a library that has already been indexed into aspect-oriented reflective facets.",
-      benchmarkAssumption: "These scores evaluate retrieval and answering after AORI facet indexing is available for the target knowledge base.",
-      caveat: "This report does not measure the weaker baseline of answering directly from raw source documents without AORI indexing; direct raw-document answering is expected to perform worse.",
-    };
+    const methodology = normalizeMethodology(run.methodology);
     const lines = [
-      `# Benchmark Report: ${run.label ?? run.id}`,
+      `# Benchmark 报告：${run.label ?? run.id}`,
       "",
-      `- Run ID: \`${run.id}\``,
-      `- Created At: ${run.createdAt}`,
-      `- Provider: ${run.providerLabel}`,
-      `- Provider Mode: ${run.providerMode}`,
-      `- Pulse Mode: ${run.mode}`,
-      `- Iterations: ${run.iterations}`,
-      run.requestedSuites.length > 0 ? `- Requested Suites: ${run.requestedSuites.join(", ")}` : `- Requested Suites: all supported suites except BEIR`,
-      run.requestedScenarios.length > 0 ? `- Requested Scenarios: ${run.requestedScenarios.join(", ")}` : `- Requested Scenarios: all selected scenarios`,
+      `- Run ID：\`${run.id}\``,
+      `- 生成时间：${run.createdAt}`,
+      `- Provider：${run.providerLabel}`,
+      `- Provider 模式：${run.providerMode}`,
+      `- 脉冲模式：${run.mode}`,
+      `- 迭代次数：${run.iterations}`,
+      run.requestedSuites.length > 0 ? `- 指定套件：${run.requestedSuites.join(", ")}` : "- 指定套件：全部受支持套件（不含 BEIR）",
+      run.requestedScenarios.length > 0 ? `- 指定场景：${run.requestedScenarios.join(", ")}` : "- 指定场景：当前选中的全部场景",
       "",
-      "## Methodology",
+      "## 评测方法",
       "",
       methodology.benchmarkTarget,
       "",
       methodology.benchmarkAssumption,
       "",
-      `Caveat: ${methodology.caveat}`,
+      `说明：${methodology.caveat}`,
       "",
-      "## Overall",
+      "## 总览",
       "",
-      `- Strict Pass Rate: ${(run.overall.strictPassRate * 100).toFixed(1)}%`,
-      `- Answer Coverage: ${(run.overall.avgAnswerCoverage * 100).toFixed(1)}%`,
-      `- Citation Recall: ${(run.overall.avgCitationRecall * 100).toFixed(1)}%`,
-      `- Citation Precision: ${(run.overall.avgCitationPrecision * 100).toFixed(1)}%`,
-      `- RAGAS Faithfulness: ${(run.overall.avgRagasFaithfulness * 100).toFixed(1)}%`,
-      `- ARES Answer Relevance: ${(run.overall.avgAresAnswerRelevance * 100).toFixed(1)}%`,
-      `- Avg Duration: ${run.overall.avgDurationMs.toFixed(1)} ms/run`,
-      `- Avg Tokens: ${Math.round(run.overall.avgTotalTokens)} tok/run`,
+      `- 严格通过率：${(run.overall.strictPassRate * 100).toFixed(1)}%`,
+      `- 回答覆盖率：${(run.overall.avgAnswerCoverage * 100).toFixed(1)}%`,
+      `- 引用召回率：${(run.overall.avgCitationRecall * 100).toFixed(1)}%`,
+      `- 引用精确率：${(run.overall.avgCitationPrecision * 100).toFixed(1)}%`,
+      `- RAGAS 忠实度：${(run.overall.avgRagasFaithfulness * 100).toFixed(1)}%`,
+      `- ARES 回答相关性：${(run.overall.avgAresAnswerRelevance * 100).toFixed(1)}%`,
+      `- 平均耗时：${run.overall.avgDurationMs.toFixed(1)} ms/次`,
+      `- 平均 Tokens：${Math.round(run.overall.avgTotalTokens)} tok/次`,
       "",
-      "## Suite Summary",
+      "## 套件汇总",
       "",
     ];
     for (const suite of run.benchmarkSuites) {
@@ -165,113 +198,186 @@ export class BenchmarkService {
       );
       lines.push(`### ${suite.label}`);
       lines.push("");
-      lines.push(`- Kind: ${suite.kind}`);
-      lines.push(`- Strict Pass Rate: ${percent(suite.strictPassRate)}`);
-      lines.push(`- Coverage: ${percent(suite.avgAnswerCoverage)}`);
-      lines.push(`- Citation Recall: ${percent(suite.avgCitationRecall)}`);
-      lines.push(`- RAGAS Faithfulness: ${percent(suite.avgRagasFaithfulness)}`);
-      lines.push(`- ARES Relevance: ${percent(suite.avgAresAnswerRelevance)}`);
-      lines.push(`- Avg Duration: ${suite.avgDurationMs.toFixed(1)} ms`);
-      lines.push(`- Avg Tokens: ${Math.round(suite.avgTotalTokens)} tok`);
+      lines.push(`- 类型：${suite.kind}`);
+      lines.push(`- 严格通过率：${percent(suite.strictPassRate)}`);
+      lines.push(`- 覆盖率：${percent(suite.avgAnswerCoverage)}`);
+      lines.push(`- 引用召回率：${percent(suite.avgCitationRecall)}`);
+      lines.push(`- RAGAS 忠实度：${percent(suite.avgRagasFaithfulness)}`);
+      lines.push(`- ARES 相关性：${percent(suite.avgAresAnswerRelevance)}`);
+      lines.push(`- 平均耗时：${suite.avgDurationMs.toFixed(1)} ms`);
+      lines.push(`- 平均 Tokens：${Math.round(suite.avgTotalTokens)} tok`);
       lines.push("");
-      lines.push("#### Included Scenarios");
+      lines.push("#### 覆盖场景");
       lines.push("");
       for (const scenario of suiteScenarios) {
-        lines.push(`- ${scenario.scenario} · strict ${percent(scenario.strictPassRate)} · coverage ${percent(scenario.avgAnswerCoverage)} · ${Math.round(scenario.avgTotalTokens)} tok`);
+        lines.push(`- ${scenario.scenario} · 严格通过 ${percent(scenario.strictPassRate)} · 覆盖率 ${percent(scenario.avgAnswerCoverage)} · ${Math.round(scenario.avgTotalTokens)} tok`);
       }
       lines.push("");
-      lines.push("#### Suite Scenario Detail");
+      lines.push("#### 套件内场景详情");
       lines.push("");
       for (const record of suiteRecords) {
         const scenario = suiteScenarios.find((item) => item.scenario === record.scenario);
         lines.push(`##### ${record.scenario}`);
         lines.push("");
-        lines.push(`- Question: ${record.question ?? "(question not preserved in this older benchmark record)"}`);
-        lines.push(`- Strict Pass: ${record.strictPass ? "yes" : "no"}`);
-        lines.push(`- Coverage: ${percent(record.answerCoverage)}`);
-        lines.push(`- Citation Recall: ${percent(record.citationRecall)}`);
-        lines.push(`- Citation Precision: ${percent(record.citationPrecision)}`);
-        lines.push(`- Duration: ${record.durationMs} ms`);
-        lines.push(`- Total Tokens: ${record.totalTokens}`);
+        lines.push(`- 问题：${record.question ?? "（旧版 benchmark 记录未保留原问题）"}`);
+        lines.push(`- 严格通过：${record.strictPass ? "是" : "否"}`);
+        lines.push(`- 覆盖率：${percent(record.answerCoverage)}`);
+        lines.push(`- 引用召回率：${percent(record.citationRecall)}`);
+        lines.push(`- 引用精确率：${percent(record.citationPrecision)}`);
+        lines.push(`- 耗时：${record.durationMs} ms`);
+        lines.push(`- 总 Tokens：${record.totalTokens}`);
         if (scenario && scenario.latestAnswerMisses.length > 0) {
-          lines.push(`- Missed Required Points: ${scenario.latestAnswerMisses.join(" | ")}`);
+          lines.push(`- 未命中的必答点：${scenario.latestAnswerMisses.join(" | ")}`);
         } else {
-          lines.push(`- Missed Required Points: (none)`);
+          lines.push("- 未命中的必答点：无");
         }
         lines.push("");
-        lines.push("Actual Answer:");
+        lines.push("模型回答：");
         lines.push("");
         lines.push("```text");
-        lines.push(record.actualAnswer ?? "(actual answer not preserved in this older benchmark record)");
+        lines.push(record.actualAnswer ?? "（旧版 benchmark 记录未保留模型回答）");
         lines.push("```");
+        lines.push("");
+        lines.push("原文与评审：");
+        lines.push("");
+        if ((record.sourceItems?.length ?? 0) > 0) {
+          for (const source of record.sourceItems ?? []) {
+            lines.push(`- 原文 ${source.title}：${source.text}`);
+          }
+        } else {
+          lines.push("- （此旧版 benchmark 记录未保留原文片段）");
+        }
+        if (record.answerReview) {
+          lines.push("");
+          lines.push(`- AI评审结论：${reviewVerdictLabels[record.answerReview.verdict]}`);
+          lines.push(`- AI评审摘要：${record.answerReview.summary}`);
+        } else {
+          lines.push("");
+          lines.push("- AI评审：此旧版 benchmark 记录未保留结构化评审结果。");
+        }
         lines.push("");
       }
       lines.push("");
     }
-    lines.push("## Scenario Reports");
+    lines.push("## 场景报告");
     lines.push("");
     for (const record of run.records) {
       lines.push(`### ${record.scenario}`);
       lines.push("");
-      lines.push(`- Language: ${record.language}`);
-      lines.push(`- Suites: ${record.suites.join(", ")}`);
-      lines.push(`- Strict Pass: ${record.strictPass ? "yes" : "no"}`);
-      lines.push(`- Structural Pass: ${record.structuralPass ? "yes" : "no"}`);
-      lines.push(`- Coverage: ${(record.answerCoverage * 100).toFixed(1)}%`);
-      lines.push(`- Citation Recall: ${(record.citationRecall * 100).toFixed(1)}%`);
-      lines.push(`- Citation Precision: ${(record.citationPrecision * 100).toFixed(1)}%`);
-      lines.push(`- Duration: ${record.durationMs} ms`);
-      lines.push(`- Prompt Tokens: ${record.promptTokens}`);
-      lines.push(`- Completion Tokens: ${record.completionTokens}`);
-      lines.push(`- Total Tokens: ${record.totalTokens}`);
-      lines.push(`- Model Calls: ${record.modelCalls}`);
+      lines.push(`- 语言：${record.language}`);
+      lines.push(`- 所属套件：${record.suites.join(", ")}`);
+      lines.push(`- 严格通过：${record.strictPass ? "是" : "否"}`);
+      lines.push(`- 结构通过：${record.structuralPass ? "是" : "否"}`);
+      lines.push(`- 覆盖率：${(record.answerCoverage * 100).toFixed(1)}%`);
+      lines.push(`- 引用召回率：${(record.citationRecall * 100).toFixed(1)}%`);
+      lines.push(`- 引用精确率：${(record.citationPrecision * 100).toFixed(1)}%`);
+      lines.push(`- 耗时：${record.durationMs} ms`);
+      lines.push(`- Prompt Tokens：${record.promptTokens}`);
+      lines.push(`- Completion Tokens：${record.completionTokens}`);
+      lines.push(`- Total Tokens：${record.totalTokens}`);
+      lines.push(`- 模型调用次数：${record.modelCalls}`);
       lines.push("");
-      lines.push("#### Question");
+      lines.push("#### 问题");
       lines.push("");
-      lines.push(record.question ?? "(question not preserved in this older benchmark record)");
+      lines.push(record.question ?? "（旧版 benchmark 记录未保留原问题）");
       lines.push("");
-      lines.push("#### Actual Answer");
-      lines.push("");
-      lines.push("```text");
-      lines.push(record.actualAnswer ?? "(actual answer not preserved in this older benchmark record)");
-      lines.push("```");
-      lines.push("");
-      lines.push("#### Actual Summary");
+      lines.push("#### 模型回答");
       lines.push("");
       lines.push("```text");
-      lines.push(record.actualSummary ?? "(actual summary not preserved in this older benchmark record)");
+      lines.push(record.actualAnswer ?? "（旧版 benchmark 记录未保留模型回答）");
       lines.push("```");
       lines.push("");
-      lines.push("#### Expected Answer Should Include");
+      lines.push("#### 回答摘要");
+      lines.push("");
+      lines.push("```text");
+      lines.push(record.actualSummary ?? "（旧版 benchmark 记录未保留回答摘要）");
+      lines.push("```");
+      lines.push("");
+      lines.push("#### 原文证据");
+      lines.push("");
+      if ((record.sourceItems?.length ?? 0) > 0) {
+        for (const source of record.sourceItems ?? []) {
+          lines.push(`- **${source.title}**`);
+          lines.push(`  ${source.text}`);
+        }
+      } else {
+        lines.push("- （此旧版 benchmark 记录未保留原文片段）");
+      }
+      lines.push("");
+      lines.push("#### 期望答案应包含");
       lines.push("");
       if ((record.expectedAnswerIncludes ?? []).length > 0) {
         for (const item of record.expectedAnswerIncludes) lines.push(`- ${item}`);
       } else {
-        lines.push("- (expected include list not preserved in this older benchmark record)");
+        lines.push("- （旧版 benchmark 记录未保留必含清单）");
       }
       lines.push("");
-      lines.push("#### Expected Answer Should Exclude");
+      lines.push("#### 期望答案不应包含");
       lines.push("");
       if ((record.expectedAnswerExcludes ?? []).length > 0) {
         for (const item of record.expectedAnswerExcludes ?? []) lines.push(`- ${item}`);
       } else {
-        lines.push("- (none)");
+        lines.push("- 无");
       }
       lines.push("");
-      lines.push("#### Missed Required Points");
+      lines.push("#### AI评审");
+      lines.push("");
+      if (record.answerReview) {
+        lines.push(`- 结论：${reviewVerdictLabels[record.answerReview.verdict]}`);
+        lines.push(`- 摘要：${record.answerReview.summary}`);
+        lines.push(`- 预期答案概括：${record.answerReview.expectedAnswerSummary}`);
+        lines.push(`- 实际答案概括：${record.answerReview.actualAnswerSummary}`);
+        lines.push("");
+        lines.push("#### AI评审 - 差异点");
+        lines.push("");
+        if (record.answerReview.differences.length > 0) {
+          for (const difference of record.answerReview.differences) {
+            lines.push(`- ${difference.aspect}`);
+            lines.push(`  - 预期：${difference.expected}`);
+            lines.push(`  - 实际：${difference.actual}`);
+            lines.push(`  - 影响：${difference.impact}`);
+          }
+        } else {
+          lines.push("- 无明显结构化差异。");
+        }
+        lines.push("");
+        lines.push("#### AI评审 - 原文 / 预期 / 实际对应");
+        lines.push("");
+        if (record.answerReview.sourceComparisons.length > 0) {
+          for (const comparison of record.answerReview.sourceComparisons) {
+            lines.push(`- ${comparison.sourceTitle}｜预期=${reviewRoleLabels[comparison.expectedRole]}｜实际=${reviewRoleLabels[comparison.actualRole]}`);
+            lines.push(`  - 原文：${comparison.sourceTextExcerpt}`);
+            lines.push(`  - 说明：${comparison.note}`);
+          }
+        } else {
+          lines.push("- 未生成原文级比较。");
+        }
+        lines.push("");
+        lines.push("#### AI评审 - 改进建议");
+        lines.push("");
+        if (record.answerReview.improvementActions.length > 0) {
+          for (const action of record.answerReview.improvementActions) lines.push(`- ${action}`);
+        } else {
+          lines.push("- 无。");
+        }
+      } else {
+        lines.push("- （此旧版 benchmark 记录未保留结构化 AI 评审结果）");
+      }
+      lines.push("");
+      lines.push("#### 未命中的关键点");
       lines.push("");
       if (record.answerMisses.length > 0) {
         for (const item of record.answerMisses) lines.push(`- ${item}`);
       } else {
-        lines.push("- (none)");
+        lines.push("- 无");
       }
       lines.push("");
-      lines.push("#### Violated Exclusions");
+      lines.push("#### 违反排除项");
       lines.push("");
       if (record.answerExcludesViolated.length > 0) {
         for (const item of record.answerExcludesViolated) lines.push(`- ${item}`);
       } else {
-        lines.push("- (none)");
+        lines.push("- 无");
       }
       lines.push("");
     }

@@ -268,6 +268,9 @@ export const ocrModes = ["local", "cloud"] as const;
 export const benchmarkSuites = ["kilt", "crag", "ragbench", "crud_rag", "ragas", "ares"] as const;
 export const benchmarkRunKinds = ["dataset", "scoring"] as const;
 export const benchmarkProviderModes = ["configured", "fake"] as const;
+export const benchmarkReviewVerdicts = ["aligned", "partial", "mismatch"] as const;
+export const benchmarkSourceExpectationRoles = ["included", "excluded", "uncertain", "background"] as const;
+export const benchmarkSourceAnswerRoles = ["included", "excluded", "uncertain", "not_mentioned"] as const;
 
 export type AbstractNodeKind = (typeof abstractNodeKinds)[number];
 export type AspectKind = (typeof aspectKinds)[number];
@@ -329,6 +332,9 @@ export type OcrMode = (typeof ocrModes)[number];
 export type BenchmarkSuite = (typeof benchmarkSuites)[number];
 export type BenchmarkRunKind = (typeof benchmarkRunKinds)[number];
 export type BenchmarkProviderMode = (typeof benchmarkProviderModes)[number];
+export type BenchmarkReviewVerdict = (typeof benchmarkReviewVerdicts)[number];
+export type BenchmarkSourceExpectationRole = (typeof benchmarkSourceExpectationRoles)[number];
+export type BenchmarkSourceAnswerRole = (typeof benchmarkSourceAnswerRoles)[number];
 
 export interface Library {
   id: string;
@@ -359,6 +365,7 @@ export interface Document {
   name: string;
   mediaType: string;
   createdAt: string;
+  versions?: DocumentVersion[];
   latestVersion?: DocumentVersion;
 }
 
@@ -2483,16 +2490,52 @@ export interface BenchmarkCatalog {
   scenarios: BenchmarkScenarioCatalogEntry[];
 }
 
+export interface BenchmarkSourceItem {
+  title: string;
+  text: string;
+  summary?: string | undefined;
+}
+
+export interface BenchmarkAnswerReviewDifference {
+  aspect: string;
+  expected: string;
+  actual: string;
+  impact: string;
+}
+
+export interface BenchmarkAnswerReviewSourceComparison {
+  sourceTitle: string;
+  sourceTextExcerpt: string;
+  expectedRole: BenchmarkSourceExpectationRole;
+  actualRole: BenchmarkSourceAnswerRole;
+  note: string;
+}
+
+export interface BenchmarkAnswerReview {
+  verdict: BenchmarkReviewVerdict;
+  summary: string;
+  expectedAnswerSummary: string;
+  actualAnswerSummary: string;
+  matchedExpected: string[];
+  missingExpected: string[];
+  unexpectedAnswerPoints: string[];
+  differences: BenchmarkAnswerReviewDifference[];
+  sourceComparisons: BenchmarkAnswerReviewSourceComparison[];
+  improvementActions: string[];
+}
+
 export interface BenchmarkRunRecord {
   scenario: string;
   suites: BenchmarkSuite[];
   language: "en" | "zh";
   iteration: number;
   question: string;
+  sourceItems?: BenchmarkSourceItem[] | undefined;
   expectedAnswerIncludes: string[];
   expectedAnswerExcludes: string[];
   actualAnswer: string;
   actualSummary: string;
+  answerReview?: BenchmarkAnswerReview | undefined;
   strictPass: boolean;
   structuralPass: boolean;
   answerCoverage: number;
@@ -2816,6 +2859,31 @@ export const createBenchmarkRunSchema = z.object({
   scenarioNames: z.array(z.string().trim().min(1).max(120)).max(40).default([]),
 });
 export type CreateBenchmarkRunInput = z.infer<typeof createBenchmarkRunSchema>;
+
+export const benchmarkAnswerReviewSchema = z.object({
+  verdict: z.enum(benchmarkReviewVerdicts),
+  summary: z.string().trim().min(1).max(1200),
+  expectedAnswerSummary: z.string().trim().min(1).max(1200),
+  actualAnswerSummary: z.string().trim().min(1).max(1200),
+  matchedExpected: z.array(z.string().trim().min(1).max(400)).max(20),
+  missingExpected: z.array(z.string().trim().min(1).max(400)).max(20),
+  unexpectedAnswerPoints: z.array(z.string().trim().min(1).max(400)).max(20),
+  differences: z.array(z.object({
+    aspect: z.string().trim().min(1).max(120),
+    expected: z.string().trim().min(1).max(600),
+    actual: z.string().trim().min(1).max(600),
+    impact: z.string().trim().min(1).max(800),
+  })).max(12),
+  sourceComparisons: z.array(z.object({
+    sourceTitle: z.string().trim().min(1).max(200),
+    sourceTextExcerpt: z.string().trim().min(1).max(800),
+    expectedRole: z.enum(benchmarkSourceExpectationRoles),
+    actualRole: z.enum(benchmarkSourceAnswerRoles),
+    note: z.string().trim().min(1).max(800),
+  })).max(30),
+  improvementActions: z.array(z.string().trim().min(1).max(500)).max(10),
+});
+export type BenchmarkAnswerReviewOutput = z.infer<typeof benchmarkAnswerReviewSchema>;
 
 export const registerSchema = z.object({
   username: z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_-]+$/, "用户名只能包含字母、数字、下划线和连字符"),

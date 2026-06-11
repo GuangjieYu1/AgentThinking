@@ -1457,51 +1457,45 @@ export class AgentDatabase {
   }
 
   listDocuments(libraryId: string): Document[] {
-    return rows(
+    const documents = rows(
       this.sql.prepare(`
-        SELECT d.*, v.id AS v_id, v.document_id AS v_document_id, v.content_hash AS v_hash,
-          v.storage_path AS v_path, v.status AS v_status, v.index_strategy AS v_index_strategy,
-          v.record_indexing_rationale AS v_record_indexing_rationale,
-          v.index_schema_version AS v_index_schema_version,
-          v.latest_ready_v1_build_id AS v_latest_ready_v1_build_id,
-          v.latest_ready_v2_build_id AS v_latest_ready_v2_build_id,
-          v.active_index_profile AS v_active_index_profile,
-          v.index_warnings_json AS v_index_warnings_json,
-          v.created_at AS v_created
-        FROM documents d
-        LEFT JOIN document_versions v ON v.id = (
-          SELECT id FROM document_versions WHERE document_id = d.id ORDER BY created_at DESC LIMIT 1
-        )
-        WHERE d.library_id = ?
-        ORDER BY d.created_at DESC
+        SELECT *
+        FROM documents
+        WHERE library_id = ?
+        ORDER BY created_at DESC
       `),
       libraryId,
-    ).map((result) => {
-      const document: Document = {
-        id: String(result.id),
-        libraryId: String(result.library_id),
-        name: String(result.name),
-        mediaType: String(result.media_type),
-        createdAt: String(result.created_at),
+    ).map((result) => ({
+      id: String(result.id),
+      libraryId: String(result.library_id),
+      name: String(result.name),
+      mediaType: String(result.media_type),
+      createdAt: String(result.created_at),
+    } satisfies Document));
+    if (documents.length === 0) return documents;
+
+    const versionsByDocumentId = new Map<string, DocumentVersion[]>();
+    for (const result of rows(
+      this.sql.prepare(`
+        SELECT *
+        FROM document_versions
+        WHERE document_id IN (${documents.map(() => "?").join(",")})
+        ORDER BY created_at DESC, rowid DESC
+      `),
+      ...documents.map((document) => document.id),
+    )) {
+      const version: DocumentVersion = this.versionFrom(result);
+      const bucket = versionsByDocumentId.get(version.documentId) ?? [];
+      bucket.push(version);
+      versionsByDocumentId.set(version.documentId, bucket);
+    }
+
+    return documents.map((document) => {
+      const versions = versionsByDocumentId.get(document.id) ?? [];
+      return {
+        ...document,
+        ...(versions.length > 0 ? { versions, latestVersion: versions[0] } : {}),
       };
-      if (result.v_id) {
-        document.latestVersion = {
-          id: String(result.v_id),
-          documentId: String(result.v_document_id),
-          contentHash: String(result.v_hash),
-          storagePath: String(result.v_path),
-          status: String(result.v_status) as DocumentVersion["status"],
-          indexStrategy: normalizeIndexStrategy(result.v_index_strategy),
-          recordIndexingRationale: sqliteBoolean(result.v_record_indexing_rationale),
-          indexSchemaVersion: Number(result.v_index_schema_version ?? 1) === 2 ? 2 : 1,
-          latestReadyV1BuildId: result.v_latest_ready_v1_build_id === null || result.v_latest_ready_v1_build_id === undefined ? null : String(result.v_latest_ready_v1_build_id),
-          latestReadyV2BuildId: result.v_latest_ready_v2_build_id === null || result.v_latest_ready_v2_build_id === undefined ? null : String(result.v_latest_ready_v2_build_id),
-          activeIndexProfile: String(result.v_active_index_profile ?? "v1") === "v2" ? "v2" : "v1",
-          indexWarnings: parseTextList(result.v_index_warnings_json),
-          createdAt: String(result.v_created),
-        };
-      }
-      return document;
     });
   }
 
@@ -2837,7 +2831,7 @@ export class AgentDatabase {
 
   listAoriDocumentIndexes(libraryId: string): AoriDocumentIndex[] {
     const versionIds = rows(
-      this.sql.prepare("SELECT version_id FROM aori_documents WHERE library_id = ? ORDER BY created_at DESC"),
+      this.sql.prepare("SELECT version_id FROM aori_documents WHERE library_id = ? ORDER BY created_at DESC, rowid DESC"),
       libraryId,
     ).map((entry) => String(entry.version_id));
     return versionIds.flatMap((versionId) => {
@@ -2866,7 +2860,7 @@ export class AgentDatabase {
       JOIN document_versions v ON v.id = a.version_id
       JOIN documents d ON d.id = v.document_id
       WHERE a.library_id = ?
-      ORDER BY v.created_at DESC
+      ORDER BY v.created_at DESC, v.rowid DESC
     `), libraryId).map((entry) => ({
       versionId: String(entry.version_id),
       documentId: String(entry.document_id),
@@ -4682,7 +4676,7 @@ export class AgentDatabase {
   listVersionSources(libraryId: string): Array<ReturnType<AgentDatabase["getVersionSource"]> & {}> {
     const ids = rows(this.sql.prepare(`
       SELECT v.id FROM document_versions v JOIN documents d ON d.id = v.document_id
-      WHERE d.library_id = ? AND v.status = 'completed' ORDER BY d.name, v.created_at DESC
+      WHERE d.library_id = ? AND v.status = 'completed' ORDER BY d.name, v.created_at DESC, v.rowid DESC
     `), libraryId).map((item) => String(item.id));
     return ids.flatMap((id) => {
       const source = this.getVersionSource(id);

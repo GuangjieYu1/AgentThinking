@@ -85,6 +85,19 @@ describe("knowledge database", () => {
     db.close();
   });
 
+  it("lists all versions for a document while preserving the latestVersion shortcut", async () => {
+    const db = await database();
+    const library = db.createLibrary("Versions");
+    const first = db.createDocumentVersion(library.id, "novel.md", "text/markdown", "hash-1", "v1").version;
+    const second = db.createDocumentVersion(library.id, "novel.md", "text/markdown", "hash-2", "v2").version;
+
+    const documents = db.listDocuments(library.id);
+    expect(documents).toHaveLength(1);
+    expect(documents[0]?.latestVersion?.id).toBe(second.id);
+    expect(documents[0]?.versions?.map((version) => version.id)).toEqual([second.id, first.id]);
+    db.close();
+  });
+
   it("stores suggested extracted relations and expands their evidence chunks", async () => {
     const db = await database();
     const library = db.createLibrary("Graph");

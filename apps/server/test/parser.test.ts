@@ -27,6 +27,18 @@ function model(): ModelProvider {
   return {
     name: "test",
     configured: true,
+    reviewBenchmarkAnswer: async () => ({
+      verdict: "aligned",
+      summary: "test",
+      expectedAnswerSummary: "test",
+      actualAnswerSummary: "test",
+      matchedExpected: [],
+      missingExpected: [],
+      unexpectedAnswerPoints: [],
+      differences: [],
+      sourceComparisons: [],
+      improvementActions: [],
+    }),
     embed: async () => [],
     extract: async () => ({ nodes: [], relations: [] }),
     extractAoriDocument: async () => ({

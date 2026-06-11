@@ -1438,6 +1438,44 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
+.benchmark-report-grid-extended {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.benchmark-source-list {
+  display: grid;
+  gap: 8px;
+}
+.benchmark-source-item {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 7px;
+  background: #0d1526;
+  border: 1px solid #1d2940;
+}
+.benchmark-source-item strong {
+  color: #dce7f5;
+  font-size: 12px;
+}
+.benchmark-source-item small,
+.benchmark-review-block p,
+.benchmark-source-item p {
+  margin: 0;
+  color: #b7c7df;
+  line-height: 1.5;
+}
+.benchmark-source-item pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #dbe7f6;
+  line-height: 1.55;
+  font: 12px "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+}
+.benchmark-review-block {
+  display: grid;
+  gap: 6px;
+}
 .document-tree-list, .evidence-table {
   display: grid;
   gap: 6px;

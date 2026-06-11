@@ -15,6 +15,20 @@ const kindLabel = {
   scoring: "评分型",
 } as const;
 
+const reviewVerdictLabel = {
+  aligned: "基本一致",
+  partial: "部分一致",
+  mismatch: "差异明显",
+} as const;
+
+const reviewRoleLabel = {
+  included: "纳入",
+  excluded: "排除",
+  uncertain: "不确定",
+  background: "背景",
+  not_mentioned: "未提及",
+} as const;
+
 function percent(value: number | undefined): string {
   if (value === undefined || !Number.isFinite(value)) return "-";
   return `${(value * 100).toFixed(1)}%`;
@@ -418,6 +432,80 @@ export function BenchmarkWorkspace({
                           <ul>
                             {(record.answerMisses.length > 0 ? record.answerMisses : ["-"]).map((item) => <li key={item}>{item}</li>)}
                           </ul>
+                        </section>
+                      </div>
+                      <div className="benchmark-report-grid benchmark-report-grid-extended">
+                        <section>
+                          <h4>原文证据</h4>
+                          {(record.sourceItems?.length ?? 0) > 0 ? (
+                            <div className="benchmark-source-list">
+                              {record.sourceItems?.map((item) => (
+                                <article key={`${record.scenario}-${item.title}`} className="benchmark-source-item">
+                                  <strong>{item.title}</strong>
+                                  <pre>{item.text}</pre>
+                                </article>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="muted">此旧版 benchmark 记录未保留原文片段。</p>
+                          )}
+                        </section>
+                        <section>
+                          <h4>AI评审结论</h4>
+                          {record.answerReview ? (
+                            <div className="benchmark-review-block">
+                              <p><strong>{reviewVerdictLabel[record.answerReview.verdict]}</strong></p>
+                              <p>{record.answerReview.summary}</p>
+                              <p>预期答案概括：{record.answerReview.expectedAnswerSummary}</p>
+                              <p>实际答案概括：{record.answerReview.actualAnswerSummary}</p>
+                            </div>
+                          ) : (
+                            <p className="muted">此旧版 benchmark 记录未保留结构化 AI 评审结果。</p>
+                          )}
+                        </section>
+                        <section>
+                          <h4>AI评审 - 差异点</h4>
+                          {record.answerReview && record.answerReview.differences.length > 0 ? (
+                            <ul>
+                              {record.answerReview.differences.map((item, index) => (
+                                <li key={`${item.aspect}-${index}`}>
+                                  <strong>{item.aspect}</strong><br />
+                                  预期：{item.expected}<br />
+                                  实际：{item.actual}<br />
+                                  影响：{item.impact}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : (
+                            <p className="muted">{record.answerReview ? "没有额外记录到结构化差异。" : "暂无 AI 差异评审。"}</p>
+                          )}
+                        </section>
+                        <section>
+                          <h4>AI评审 - 原文 / 预期 / 实际对应</h4>
+                          {record.answerReview && record.answerReview.sourceComparisons.length > 0 ? (
+                            <div className="benchmark-source-list">
+                              {record.answerReview.sourceComparisons.map((item) => (
+                                <article key={`${record.scenario}-${item.sourceTitle}`} className="benchmark-source-item">
+                                  <strong>{item.sourceTitle}</strong>
+                                  <small>预期：{reviewRoleLabel[item.expectedRole]} ｜ 实际：{reviewRoleLabel[item.actualRole]}</small>
+                                  <pre>{item.sourceTextExcerpt}</pre>
+                                  <p>{item.note}</p>
+                                </article>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="muted">{record.answerReview ? "没有生成原文级对照。" : "暂无 AI 原文对照评审。"}</p>
+                          )}
+                        </section>
+                        <section>
+                          <h4>AI评审 - 改进建议</h4>
+                          {record.answerReview && record.answerReview.improvementActions.length > 0 ? (
+                            <ul>
+                              {record.answerReview.improvementActions.map((item) => <li key={item}>{item}</li>)}
+                            </ul>
+                          ) : (
+                            <p className="muted">{record.answerReview ? "没有额外建议。" : "暂无 AI 改进建议。"}</p>
+                          )}
                         </section>
                       </div>
                     </div>

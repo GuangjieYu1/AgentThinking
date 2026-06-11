@@ -3,6 +3,8 @@ import type {
   AoriDocumentDraft,
   AoriSkillRoute,
   AoriSkillRouterInput,
+  BenchmarkAnswerReview,
+  BenchmarkSourceItem,
   BfsExpansionDecision,
   BfsExpansionInput,
   AoriIndexingStage,
@@ -66,6 +68,7 @@ import {
   mappingAuditSeverities,
   mappingAuditStatuses,
   pulseAnswerSchema,
+  benchmarkAnswerReviewSchema,
   pulseEvidencePlanSchema,
   pulseEvidenceRowSchema,
   pulseEvidenceStatusSchema,
@@ -125,6 +128,17 @@ export interface AoriExtractionContext {
   minTruncatedContextTokens: number;
   evidenceBindingMinContextTokens: number;
   allowSmallContextOnlyForQuoteLookup: boolean;
+}
+
+export interface BenchmarkAnswerReviewInput {
+  question: string;
+  sourceItems: BenchmarkSourceItem[];
+  expectedAnswerIncludes: string[];
+  expectedAnswerExcludes: string[];
+  actualAnswer: string;
+  actualSummary?: string | undefined;
+  answerMisses: string[];
+  answerExcludesViolated: string[];
 }
 
 interface ExtractionRuleOptions {
@@ -211,6 +225,106 @@ function normalizedStringArray(value: unknown): string[] {
 
 function uniqueStrings(values: Array<string | undefined | null>): string[] {
   return [...new Set(values.map((value) => value?.trim() ?? "").filter(Boolean))];
+}
+
+function compactBenchmarkText(value: string, max = 180): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, Math.max(0, max - 3))}...`;
+}
+
+function benchmarkSourceAliases(item: BenchmarkSourceItem): string[] {
+  const aliases = new Set<string>();
+  aliases.add(item.title.trim());
+  for (const pattern of [/source:\s*([^;]+)/i, /person:\s*([^;]+)/i, /event:\s*([^;]+)/i]) {
+    const match = item.text.match(pattern);
+    if (match?.[1]) aliases.add(match[1].trim());
+  }
+  return [...aliases].filter(Boolean);
+}
+
+function expectedRoleForSource(
+  item: BenchmarkSourceItem,
+  expectedAnswerIncludes: string[],
+  expectedAnswerExcludes: string[],
+): "included" | "excluded" | "uncertain" | "background" {
+  const aliases = benchmarkSourceAliases(item);
+  const includes = expectedAnswerIncludes.join(" ");
+  const excludes = expectedAnswerExcludes.join(" ");
+  if (aliases.some((alias) => includes.includes(`Uncertain records: ${alias}`) || includes.includes(`Uncertain records:${alias}`))) {
+    return "uncertain";
+  }
+  if (aliases.some((alias) => includes.includes(alias))) return includes.includes("Uncertain records:") ? "included" : "included";
+  if (aliases.some((alias) => excludes.includes(alias))) return "excluded";
+  return "background";
+}
+
+function actualRoleForSource(item: BenchmarkSourceItem, actualAnswer: string): "included" | "excluded" | "uncertain" | "not_mentioned" {
+  const aliases = benchmarkSourceAliases(item);
+  const mentioned = aliases.find((alias) => actualAnswer.includes(alias));
+  if (!mentioned) return "not_mentioned";
+  const uncertainWindow = actualAnswer.toLowerCase();
+  if (/uncertain|不确定|存疑|may include|time range/i.test(uncertainWindow)) return "uncertain";
+  if (/exclude|excluded|not included|不计入|排除/i.test(uncertainWindow)) return "excluded";
+  return "included";
+}
+
+function fallbackBenchmarkAnswerReview(input: BenchmarkAnswerReviewInput): BenchmarkAnswerReview {
+  const matchedExpected = input.expectedAnswerIncludes.filter((entry) => !input.answerMisses.includes(entry));
+  const missingExpected = [...input.answerMisses];
+  const unexpectedAnswerPoints = [...input.answerExcludesViolated];
+  const sourceComparisons = input.sourceItems.map((item) => {
+    const expectedRole = expectedRoleForSource(item, input.expectedAnswerIncludes, input.expectedAnswerExcludes);
+    const actualRole = actualRoleForSource(item, input.actualAnswer);
+    return {
+      sourceTitle: item.title,
+      sourceTextExcerpt: compactBenchmarkText(item.text, 220),
+      expectedRole,
+      actualRole,
+      note: expectedRole === actualRole
+        ? "原文证据与实际答案的处理方向基本一致。"
+        : `预期应视为${expectedRole}，但实际答案更接近${actualRole}。`,
+    };
+  });
+  const differences = [
+    ...(missingExpected.length > 0 ? [{
+      aspect: "预期必含点",
+      expected: missingExpected.join(" | "),
+      actual: compactBenchmarkText(input.actualAnswer, 260),
+      impact: "这些预期锚点没有在实际答案中以可判分形式出现，会直接拉低 benchmark 覆盖率与严格通过率。",
+    }] : []),
+    ...(unexpectedAnswerPoints.length > 0 ? [{
+      aspect: "预期排除点",
+      expected: unexpectedAnswerPoints.join(" | "),
+      actual: compactBenchmarkText(input.actualAnswer, 260),
+      impact: "答案触及了不应出现的内容，说明过滤边界或不确定性处理还不够稳。",
+    }] : []),
+  ];
+  const verdict = missingExpected.length === 0 && unexpectedAnswerPoints.length === 0
+    ? "aligned"
+    : matchedExpected.length > 0
+      ? "partial"
+      : "mismatch";
+  return {
+    verdict,
+    summary: verdict === "aligned"
+      ? "实际答案与 benchmark 预期基本一致，原文证据的取舍也没有明显偏差。"
+      : verdict === "partial"
+        ? "实际答案命中了一部分核心信息，但仍有若干预期锚点没有按 benchmark 规则表达出来。"
+        : "实际答案与 benchmark 预期差异较大，报告需要结合原文证据重新检查纳入、排除和不确定项。",
+    expectedAnswerSummary: `预期答案至少应覆盖：${input.expectedAnswerIncludes.join("；") || "无"}。并避免出现：${input.expectedAnswerExcludes.join("；") || "无"}。`,
+    actualAnswerSummary: input.actualSummary?.trim() || compactBenchmarkText(input.actualAnswer, 220),
+    matchedExpected,
+    missingExpected,
+    unexpectedAnswerPoints,
+    differences,
+    sourceComparisons,
+    improvementActions: [
+      ...(missingExpected.length > 0 ? ["把 benchmark 预期中的必含锚点显式写进最终答案，而不是只给语义等价表达。"] : []),
+      ...(unexpectedAnswerPoints.length > 0 ? ["在最终回答里更明确地区分应排除项与不确定项，避免把它们混入主结论。"] : []),
+      "让最终回答明确标注哪些原文属于纳入项、哪些属于不确定项，并把理由写出来。",
+    ],
+  };
 }
 
 function normalizedAuditEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T | string {
@@ -1112,6 +1226,7 @@ export interface ModelProvider {
   readonly name: string;
   readonly configured: boolean;
   setUsageMetricsCollector?(collector: ModelUsageMetricsCollector | undefined): void;
+  reviewBenchmarkAnswer(input: BenchmarkAnswerReviewInput): Promise<BenchmarkAnswerReview>;
   embed(texts: string[]): Promise<number[][]>;
   extract(chunks: Chunk[], relatedChunks: Map<string, Chunk[]>, options?: ExtractionRuleOptions): Promise<ExtractionOutput>;
   extractAoriDocument(input: {
@@ -1239,6 +1354,10 @@ export class FakeModelProvider implements ModelProvider {
   readonly configured = true;
 
   setUsageMetricsCollector(_collector?: ModelUsageMetricsCollector | undefined): void {}
+
+  async reviewBenchmarkAnswer(input: BenchmarkAnswerReviewInput): Promise<BenchmarkAnswerReview> {
+    return fallbackBenchmarkAnswerReview(input);
+  }
 
   async embed(texts: string[]): Promise<number[][]> {
     return texts.map((text) => hashedEmbedding(text));
@@ -2149,6 +2268,42 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
   setUsageMetricsCollector(collector: ModelUsageMetricsCollector | undefined): void {
     this.usageMetricsCollector = collector;
+  }
+
+  async reviewBenchmarkAnswer(input: BenchmarkAnswerReviewInput): Promise<BenchmarkAnswerReview> {
+    if (!this.config.chatModel) return fallbackBenchmarkAnswerReview(input);
+    const body: Record<string, unknown> = {
+      model: this.config.chatModel,
+      temperature: 0.05,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are the benchmark answer reviewer for AORI/Pulse evaluation. " +
+            "Compare the actual answer against the benchmark's expected include/exclude anchors and the supplied source items. " +
+            "Write all human-readable fields in Simplified Chinese. " +
+            "Judge whether the answer is aligned, partial, or mismatch. " +
+            "Explain specifically which expected points were matched, which were missed, and which source items were treated as included, excluded, uncertain, or not mentioned. " +
+            "Be strict about benchmark formatting requirements: if the actual answer is semantically close but fails to expose a required anchor clearly, say so. " +
+            'Return JSON only matching: {"verdict":"aligned|partial|mismatch","summary":"...","expectedAnswerSummary":"...","actualAnswerSummary":"...","matchedExpected":["..."],"missingExpected":["..."],"unexpectedAnswerPoints":["..."],"differences":[{"aspect":"...","expected":"...","actual":"...","impact":"..."}],"sourceComparisons":[{"sourceTitle":"...","sourceTextExcerpt":"...","expectedRole":"included|excluded|uncertain|background","actualRole":"included|excluded|uncertain|not_mentioned","note":"..."}],"improvementActions":["..."]}.',
+        },
+        { role: "user", content: JSON.stringify(input) },
+      ],
+      max_tokens: 2400,
+    };
+    if (this.config.provider === "deepseek") body.thinking = { type: this.config.thinkingMode };
+    try {
+      const response = await this.request<{ choices: Array<{ message: { content: string } }> }>(
+        this.config.aiBaseUrl,
+        this.config.aiApiKey,
+        "/chat/completions",
+        body,
+      );
+      return benchmarkAnswerReviewSchema.parse(parseJsonModelObject(response.choices[0]?.message.content ?? "{}"));
+    } catch {
+      return fallbackBenchmarkAnswerReview(input);
+    }
   }
 
   private async request<T>(baseUrl: string, apiKey: string | undefined, path: string, body: unknown): Promise<T> {

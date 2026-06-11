@@ -4,6 +4,7 @@ import type {
   AuthSession,
   Citation,
   Document,
+  DocumentVersion,
   GraphRuleStage,
   GraphRulesSummary,
   GraphRuleTrace,
@@ -81,6 +82,18 @@ function summarizeJobs(jobs: IngestJob[]): { active: number; failed: number; com
     else summary.active += 1;
     return summary;
   }, { active: 0, failed: 0, completed: 0 });
+}
+
+function documentVersions(document: Document): DocumentVersion[] {
+  return document.versions && document.versions.length > 0
+    ? document.versions
+    : document.latestVersion
+      ? [document.latestVersion]
+      : [];
+}
+
+function documentForVersion(documents: Document[], versionId: string): Document | undefined {
+  return documents.find((document) => documentVersions(document).some((version) => version.id === versionId));
 }
 
 function mappingAuditSeverityCounts(findings: MappingAuditFinding[]): { high: number; medium: number; low: number } {
@@ -524,8 +537,10 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
     }
   };
 
-  const runMappingAudit = async (document: Document) => {
-    const version = document.latestVersion;
+  const runMappingAudit = async (document: Document, requestedVersionId?: string) => {
+    const version = requestedVersionId
+      ? documentVersions(document).find((candidate) => candidate.id === requestedVersionId)
+      : document.latestVersion;
     if (!version) return;
     setMappingAuditView({
       versionId: version.id,
@@ -548,8 +563,10 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
     }
   };
 
-  const openMappingAudit = async (document: Document) => {
-    const version = document.latestVersion;
+  const openMappingAudit = async (document: Document, requestedVersionId?: string) => {
+    const version = requestedVersionId
+      ? documentVersions(document).find((candidate) => candidate.id === requestedVersionId)
+      : document.latestVersion;
     if (!version) return;
     setMappingAuditView({
       versionId: version.id,
@@ -568,7 +585,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
       });
     } catch (cause) {
       if ((cause as Error).message.includes("尚未运行")) {
-        await runMappingAudit(document);
+        await runMappingAudit(document, version.id);
         return;
       }
       setMappingAuditView(undefined);
@@ -793,8 +810,8 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
           view={mappingAuditView}
           onClose={() => setMappingAuditView(undefined)}
           onRerun={() => {
-            const document = documents.find((item) => item.latestVersion?.id === mappingAuditView.versionId);
-            if (document) void runMappingAudit(document);
+            const document = documentForVersion(documents, mappingAuditView.versionId);
+            if (document) void runMappingAudit(document, mappingAuditView.versionId);
           }}
           onRebuildGraph={() => void rebuildGraphFromMappingAudit()}
           onOpenChunk={(chunkId) => openAuditChunk(mappingAuditView, chunkId)}

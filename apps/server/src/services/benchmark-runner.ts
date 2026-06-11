@@ -10,7 +10,7 @@ import type {
 } from "@agent-thinking/contracts";
 import { getConfig } from "../config.js";
 import { createModelProvider } from "./models.js";
-import type { ModelProvider } from "./models.js";
+import type { BenchmarkAnswerReviewInput, ModelProvider } from "./models.js";
 import {
   aoriPulseBenchmarkSuites,
   aoriPulseEvalScenarios,
@@ -234,16 +234,33 @@ export async function runBenchmarkSuite(input: BenchmarkRunnerArgs): Promise<Ben
         const assessment = assessEvalScenario(scenario, pulse, events);
         const metrics = pulse.pulse.metrics;
         const scores = scoreRecord(scenario, assessment, pulse);
+        const reviewInput: BenchmarkAnswerReviewInput = {
+          question: scenario.question,
+          sourceItems: scenario.items.map((item) => ({
+            title: item.title,
+            text: item.text,
+            ...(item.summary ? { summary: item.summary } : {}),
+          })),
+          expectedAnswerIncludes: scenario.expected.answerIncludes,
+          expectedAnswerExcludes: scenario.expected.answerExcludes ?? [],
+          actualAnswer: pulse.pulse.answer,
+          actualSummary: pulse.pulse.summary,
+          answerMisses: assessment.answerIncludesMissed,
+          answerExcludesViolated: assessment.answerExcludesViolated,
+        };
+        const answerReview = await model.reviewBenchmarkAnswer(reviewInput);
         records.push({
           scenario: scenario.name,
           suites: scenario.benchmarkSuites,
           language: scenario.language,
           iteration,
           question: scenario.question,
+          sourceItems: reviewInput.sourceItems,
           expectedAnswerIncludes: scenario.expected.answerIncludes,
           expectedAnswerExcludes: scenario.expected.answerExcludes ?? [],
           actualAnswer: pulse.pulse.answer,
           actualSummary: pulse.pulse.summary,
+          answerReview,
           strictPass: assessment.strictPass,
           structuralPass: assessment.structuralPass,
           answerCoverage: scores.answerCoverage,

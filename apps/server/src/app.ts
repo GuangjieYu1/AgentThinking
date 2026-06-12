@@ -26,6 +26,7 @@ import {
   updateMappingAuditFindingCommentSchema,
   updateNodeAspectsSchema,
   updateLibrarySettingsSchema,
+  updateGlobalSettingsSchema,
   updateAnalysisStatementSchema,
   updateRelationSchema,
   type AuthUser,
@@ -36,6 +37,7 @@ import {
   type BenchmarkRunListEntry,
   type BenchmarkRunResult,
   type BenchmarkCatalog,
+  type GlobalSettingsView,
   type IndexStrategy,
   type PulseStreamEvent,
   type SearchResult,
@@ -190,6 +192,50 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
     vectorEngine: vectors.usesSqliteVec ? "sqlite-vec" : "javascript-fallback",
     authRequired: config.authRequired,
   }));
+
+  const DEEPSEEK_API_KEY_SETTING = "deepseekApiKey";
+  const AI_BASE_URL_SETTING = "aiBaseUrl";
+  const AI_CHAT_MODEL_SETTING = "aiChatModel";
+
+  app.get("/api/settings", async (): Promise<GlobalSettingsView> => {
+    const deepseekApiKey = db.getGlobalSetting(DEEPSEEK_API_KEY_SETTING);
+    return {
+      deepseekApiKey: deepseekApiKey ? `${deepseekApiKey.slice(0, 4)}***${deepseekApiKey.slice(-4)}` : "",
+      aiBaseUrl: db.getGlobalSetting(AI_BASE_URL_SETTING) ?? config.aiBaseUrl,
+      aiChatModel: db.getGlobalSetting(AI_CHAT_MODEL_SETTING) ?? config.chatModel ?? "",
+    };
+  });
+
+  app.patch("/api/settings", async (request) => {
+    const body = updateGlobalSettingsSchema.parse(request.body);
+    if (body.deepseekApiKey !== undefined) {
+      if (body.deepseekApiKey.trim() === "") {
+        throw new Error("API Key 不能为空");
+      }
+      config.aiApiKey = body.deepseekApiKey.trim();
+      db.setGlobalSetting(DEEPSEEK_API_KEY_SETTING, config.aiApiKey);
+    }
+    if (body.aiBaseUrl !== undefined) {
+      if (body.aiBaseUrl.trim() === "") {
+        throw new Error("API Base URL 不能为空");
+      }
+      config.aiBaseUrl = body.aiBaseUrl.trim();
+      db.setGlobalSetting(AI_BASE_URL_SETTING, config.aiBaseUrl);
+    }
+    if (body.aiChatModel !== undefined) {
+      if (body.aiChatModel.trim() === "") {
+        throw new Error("模型名称不能为空");
+      }
+      config.chatModel = body.aiChatModel.trim();
+      db.setGlobalSetting(AI_CHAT_MODEL_SETTING, config.chatModel);
+    }
+    const deepseekApiKey = db.getGlobalSetting(DEEPSEEK_API_KEY_SETTING);
+    return {
+      deepseekApiKey: deepseekApiKey ? `${deepseekApiKey.slice(0, 4)}***${deepseekApiKey.slice(-4)}` : "",
+      aiBaseUrl: config.aiBaseUrl,
+      aiChatModel: config.chatModel ?? "",
+    };
+  });
 
   app.get("/api/auth/session", async (request) => ({
     authRequired: config.authRequired,

@@ -1689,3 +1689,69 @@ button:disabled { opacity: .48; cursor: not-allowed; }
     grid-template-columns: 1fr;
   }
 }
+
+.settings-button {
+  margin-left: auto;
+  padding: 2px 6px;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.6;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.settings-button:hover { opacity: 1; }
+
+.settings-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgba(4, 9, 18, .74);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 28px;
+}
+.settings-modal {
+  background: #0f182c;
+  border: 1px solid #27344d;
+  border-radius: 14px;
+  box-shadow: 0 16px 55px #0008;
+  width: min(390px, 100%);
+  padding: 20px;
+}
+.settings-modal h3 {
+  margin: 0 0 16px;
+  font-size: 17px;
+}
+.settings-modal label {
+  display: block;
+  margin-bottom: 14px;
+  font-size: 13px;
+  color: #94a4bd;
+}
+.settings-modal label input {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid #27344d;
+  background: #0c1327;
+  color: #e2e8f4;
+  font-size: 14px;
+}
+.settings-modal label input:focus {
+  border-color: #6a8cff;
+  outline: none;
+}
+.settings-modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+.settings-modal-actions button {
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+}

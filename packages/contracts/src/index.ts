@@ -359,6 +359,18 @@ export interface LibrarySettings {
   ocrMode: OcrMode;
 }
 
+export interface GlobalSettings {
+  deepseekApiKey: string;
+  aiBaseUrl: string;
+  aiChatModel: string;
+}
+
+export interface GlobalSettingsView {
+  deepseekApiKey: string;
+  aiBaseUrl: string;
+  aiChatModel: string;
+}
+
 export interface Document {
   id: string;
   libraryId: string;
@@ -2927,6 +2939,13 @@ export type LoginInput = z.infer<typeof loginSchema>;
 export const updateLibrarySettingsSchema = z.object({
   ocrMode: z.enum(ocrModes),
 });
+
+export const updateGlobalSettingsSchema = z.object({
+  deepseekApiKey: z.string().trim().optional(),
+  aiBaseUrl: z.string().trim().optional(),
+  aiChatModel: z.string().trim().optional(),
+});
+export type UpdateGlobalSettingsInput = z.infer<typeof updateGlobalSettingsSchema>;
 
 export const indexStrategySchema = z.enum(indexStrategies);
 

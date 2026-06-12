@@ -2381,7 +2381,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   private async request<T>(baseUrl: string, apiKey: string | undefined, path: string, body: unknown): Promise<T> {
-    if (!apiKey) throw new Error(this.config.provider === "deepseek" ? "未配置 DEEPSEEK_API_KEY" : "未配置 AI_API_KEY");
+    if (!apiKey) throw new Error("未配置模型 API Key，请在设置中填写");
     const response = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
       method: "POST",
       headers: {
@@ -2518,7 +2518,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     relatedChunks: Map<string, Chunk[]>,
     options: ExtractionRuleOptions = {},
   ): Promise<ExtractionOutput> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const aori = options.aoriContext;
     const evidence = chunks.map((chunk) => ({
       id: chunk.id,
@@ -2618,7 +2618,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     chunks: Chunk[];
     context: AoriExtractionContext;
   }): Promise<AoriDocumentDraft> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const evidence = input.chunks.map((chunk) => ({
       id: chunk.id,
       source: chunk.headingPath ?? (chunk.pageNumber ? `PDF page ${chunk.pageNumber}` : `chunk ${chunk.ordinal + 1}`),
@@ -2680,7 +2680,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         suggestions: ["补充直接支持该陈述及其关系判断的原文证据。"],
       };
     }
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const evidence = citations.map((citation) => ({
       document: citation.documentName,
       location: citation.pageNumber
@@ -2719,7 +2719,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async reconstructMapping(context: MappingAuditContext): Promise<string> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const evidence = context.chunks.map((chunk) => ({
       id: chunk.id,
       ordinal: chunk.ordinal,
@@ -2773,7 +2773,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async auditMapping(reconstruction: string, originalChunks: Chunk[], graphContext: MappingAuditContext): Promise<MappingAuditReview> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const original = originalChunks.map((chunk) => ({
       id: chunk.id,
       ordinal: chunk.ordinal,
@@ -2866,7 +2866,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     graphContext: MappingAuditContext,
     options: ExtractionRuleOptions = {},
   ): Promise<ExtractionOutput> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const original = originalChunks.map((chunk) => ({
       id: chunk.id,
       ordinal: chunk.ordinal,
@@ -3297,7 +3297,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async answerPulse(question: string, context: PulseAnswerContext): Promise<PulseAnswerOutput> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.1,
@@ -3331,7 +3331,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     step: string,
     candidates: PulseNavigationCandidate[],
   ): Promise<PulseNavigationDecision> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.1,
@@ -3374,7 +3374,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async planDemandAnswer(input: DemandAnswerPlanInput): Promise<DemandAnswerPlan> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.03,
@@ -3407,7 +3407,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async extractDemandEvidenceRecord(input: DemandEvidenceRecordExtractionInput): Promise<EvidenceRecord> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.02,
@@ -3438,7 +3438,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async synthesizeDemandAnswer(input: DemandAnswerSynthesisInput): Promise<PulseAnswerOutput> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.04,
@@ -3481,7 +3481,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async routeAoriSkill(input: AoriSkillRouterInput): Promise<AoriSkillRoute> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.05,
@@ -3512,7 +3512,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async extractFacetFactRow(input: FacetFactRowExtractionInput): Promise<FacetFactRow> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.03,
@@ -3542,7 +3542,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async planFacetCountOperation(input: FacetCountOperationPlanInput): Promise<FacetCountOperation> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.03,
@@ -3570,7 +3570,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async evaluateTimeFilter(input: FacetTimeFilterInput): Promise<FacetTimeFilterResult> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.02,
@@ -3598,7 +3598,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async dedupeFacetCountRows(input: FacetCountDedupeInput): Promise<FacetCountResult> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.02,
@@ -3628,7 +3628,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async synthesizeFacetCountAnswer(input: FacetCountAnswerInput): Promise<PulseAnswerOutput> {
-    if (!this.config.chatModel) throw new Error("AI_CHAT_MODEL is not configured");
+    if (!this.config.chatModel) throw new Error("Chat model is not configured");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.05,
@@ -3672,7 +3672,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async decideAoriBfsExpansion(input: BfsExpansionInput): Promise<BfsExpansionDecision> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.05,
@@ -3701,7 +3701,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async chooseAoriDfsNext(input: DfsStepInput): Promise<DfsStepDecision> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.05,
@@ -3730,7 +3730,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async summarizeChunkForQuestion(input: ChunkSummaryInput): Promise<ChunkAnswerSummary> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.05,
@@ -3758,7 +3758,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async synthesizeAnswerFromChunks(input: FinalAnswerFromChunksInput): Promise<PulseAnswerOutput> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
     const body: Record<string, unknown> = {
       model: this.config.chatModel,
       temperature: 0.05,
@@ -3786,8 +3786,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async *stream(prompt: string): AsyncGenerator<{ type: "reasoning" | "content"; text: string }> {
-    if (!this.config.chatModel) throw new Error("未配置 AI_CHAT_MODEL");
-    if (!this.config.aiApiKey) throw new Error(this.config.provider === "deepseek" ? "未配置 DEEPSEEK_API_KEY" : "未配置 AI_API_KEY");
+    if (!this.config.chatModel) throw new Error("未配置默认模型，请在设置中填写");
+    if (!this.config.aiApiKey) throw new Error("未配置模型 API Key，请在设置中填写");
     const response = await fetch(`${this.config.aiBaseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
@@ -3839,8 +3839,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
         ok: false,
         provider: this.name,
         message: this.config.provider === "deepseek"
-          ? "请在 .env 中填写 DEEPSEEK_API_KEY；本地 embedding 已启用。"
-          : "请在 .env 中配置 API 密钥以及聊天和 embedding 模型。",
+          ? "请在设置中填写 API Key；本地 embedding 已启用。"
+          : "请在设置中配置 API 密钥以及聊天和 embedding 模型。",
       };
     }
     await this.request(this.config.aiBaseUrl, this.config.aiApiKey, "/chat/completions", {

@@ -21,14 +21,6 @@ const reviewVerdictLabel = {
   mismatch: "差异明显",
 } as const;
 
-const reviewRoleLabel = {
-  included: "纳入",
-  excluded: "排除",
-  uncertain: "不确定",
-  background: "背景",
-  not_mentioned: "未提及",
-} as const;
-
 function percent(value: number | undefined): string {
   if (value === undefined || !Number.isFinite(value)) return "-";
   return `${(value * 100).toFixed(1)}%`;
@@ -138,6 +130,17 @@ export function BenchmarkWorkspace({
     }
   };
 
+  const deleteBenchmarkKnowledgeBase = async (run: BenchmarkRunResult | BenchmarkRunListEntry) => {
+    if (!run.libraryId) return;
+    if (!window.confirm(`删除本次 benchmark 生成的评测知识库？\n\nRun: ${run.label ?? run.id}\nLibrary: ${run.libraryId}`)) return;
+    try {
+      await api.deleteBenchmarkKnowledgeBase(run.id);
+      await load();
+    } catch (cause) {
+      onError((cause as Error).message);
+    }
+  };
+
   const visibleSuites = catalog?.suites ?? [];
   const activeSuiteRows = suiteOrder
     .map((suite) => ({
@@ -153,13 +156,18 @@ export function BenchmarkWorkspace({
       <header className="benchmark-header">
         <div>
           <h2>Benchmark 面板</h2>
-          <p>运行固定场景基准，保留每次 JSON 结果，并直接在界面对比版本迭代。</p>
+          <p>使用公开 CMRC 派生评测集运行 AORI 脉冲测试；报告默认精简，JSON 保留完整细节。</p>
         </div>
         <div className="benchmark-header-actions">
           {activeRun && (
             <>
               <a className="ghost button-link" href={api.benchmarkRunMarkdownUrl(activeRun.id)}>导出 Markdown</a>
               <a className="ghost button-link" href={api.benchmarkRunJsonUrl(activeRun.id)}>导出 JSON</a>
+              {activeRun.libraryId && (
+                <button className="ghost" type="button" onClick={() => void deleteBenchmarkKnowledgeBase(activeRun)}>
+                  删除评测知识库
+                </button>
+              )}
             </>
           )}
           <button className="ghost" type="button" onClick={() => void load()} disabled={loading || running}>刷新</button>
@@ -216,7 +224,7 @@ export function BenchmarkWorkspace({
                     />
                     <div>
                       <strong>{suite.label}</strong>
-                      <small>{kindLabel[suite.kind]} · {suite.focus.join(" / ")}</small>
+                      <small>{kindLabel[suite.kind]} | {suite.focus.join(" / ")}</small>
                     </div>
                   </label>
                 );
@@ -237,12 +245,16 @@ export function BenchmarkWorkspace({
                   <button className="benchmark-run-main" type="button" onClick={() => void openRun(run.id, "active")}>
                     <strong>{run.label ?? run.id}</strong>
                     <small>{new Date(run.createdAt).toLocaleString()}</small>
-                    <small>{run.providerLabel} · {run.mode} · {run.iterations} iter</small>
-                    <small>strict {percent(run.overall.strictPassRate)} · faith {percent(run.overall.avgRagasFaithfulness)}</small>
+                    <small>{run.providerLabel} | {run.mode} | {run.iterations} iter</small>
+                    <small>strict {percent(run.overall.strictPassRate)} | faith {percent(run.overall.avgRagasFaithfulness)}</small>
+                    <small>{run.libraryId ? `知识库 ${run.libraryId}` : "评测知识库未记录或已删除"}</small>
                   </button>
                   <div className="benchmark-run-actions">
                     <button type="button" className={activeRun?.id === run.id ? "selected" : ""} onClick={() => void openRun(run.id, "active")}>主视图</button>
                     <button type="button" className={compareRun?.id === run.id ? "selected" : ""} onClick={() => void openRun(run.id, "compare")}>对比</button>
+                    {run.libraryId && (
+                      <button type="button" onClick={() => void deleteBenchmarkKnowledgeBase(run)}>删库</button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -251,14 +263,15 @@ export function BenchmarkWorkspace({
         </aside>
 
         <main className="benchmark-main">
-          {!activeRun && !loading && <div className="workspace-panel"><p className="muted">运行一次 benchmark 后，这里会显示结果总览和历史对比。</p></div>}
+          {!activeRun && !loading && <div className="workspace-panel"><p className="muted">运行一次 benchmark 后，这里会显示总览和场景结果。</p></div>}
           {activeRun && (
             <>
               <div className="workspace-panel benchmark-summary-panel">
                 <div className="benchmark-summary-header">
                   <div>
                     <h3>{activeRun.label ?? activeRun.id}</h3>
-                    <small>{new Date(activeRun.createdAt).toLocaleString()} · {activeRun.providerLabel} · {activeRun.mode} · {activeRun.iterations} iter</small>
+                    <small>{new Date(activeRun.createdAt).toLocaleString()} | {activeRun.providerLabel} | {activeRun.mode} | {activeRun.iterations} iter</small>
+                    <small>{activeRun.libraryId ? `评测知识库：${activeRun.libraryId}` : "评测知识库未记录或已删除"}</small>
                   </div>
                   <div className="pipeline-strip">
                     <span>strict {percent(activeRun.overall.strictPassRate)}</span>
@@ -307,46 +320,13 @@ export function BenchmarkWorkspace({
                           <strong>{meta?.label}</strong>
                           <small>{kindLabel[meta!.kind]}</small>
                         </div>
-                        <div>
-                          <strong>{percent(current?.strictPassRate)}</strong>
-                          {compareRun && <small>{delta(current?.strictPassRate, previous?.strictPassRate) ?? "-"}</small>}
-                        </div>
-                        <div>
-                          <strong>{percent(current?.avgAnswerCoverage)}</strong>
-                          {compareRun && <small>{delta(current?.avgAnswerCoverage, previous?.avgAnswerCoverage) ?? "-"}</small>}
-                        </div>
-                        <div>
-                          <strong>{percent(current?.avgCitationRecall)}</strong>
-                          {compareRun && <small>{delta(current?.avgCitationRecall, previous?.avgCitationRecall) ?? "-"}</small>}
-                        </div>
-                        <div>
-                          <strong>{percent(current?.avgRagasFaithfulness)}</strong>
-                          {compareRun && <small>{delta(current?.avgRagasFaithfulness, previous?.avgRagasFaithfulness) ?? "-"}</small>}
-                        </div>
-                        <div>
-                          <strong>{percent(current?.avgAresAnswerRelevance)}</strong>
-                          {compareRun && <small>{delta(current?.avgAresAnswerRelevance, previous?.avgAresAnswerRelevance) ?? "-"}</small>}
-                        </div>
-                        <div>
-                          <strong>{decimal(current?.avgDurationMs)}ms</strong>
-                          {compareRun && (
-                            <small>
-                              {current?.avgDurationMs !== undefined && previous?.avgDurationMs !== undefined
-                                ? `${current.avgDurationMs >= previous.avgDurationMs ? "+" : ""}${decimal(current.avgDurationMs - previous.avgDurationMs)}ms`
-                                : "-"}
-                            </small>
-                          )}
-                        </div>
-                        <div>
-                          <strong>{integer(current?.avgTotalTokens)}</strong>
-                          {compareRun && (
-                            <small>
-                              {current?.avgTotalTokens !== undefined && previous?.avgTotalTokens !== undefined
-                                ? `${Math.round(current.avgTotalTokens - previous.avgTotalTokens) >= 0 ? "+" : ""}${Math.round(current.avgTotalTokens - previous.avgTotalTokens)}`
-                                : "-"}
-                            </small>
-                          )}
-                        </div>
+                        <div><strong>{percent(current?.strictPassRate)}</strong>{compareRun && <small>{delta(current?.strictPassRate, previous?.strictPassRate) ?? "-"}</small>}</div>
+                        <div><strong>{percent(current?.avgAnswerCoverage)}</strong>{compareRun && <small>{delta(current?.avgAnswerCoverage, previous?.avgAnswerCoverage) ?? "-"}</small>}</div>
+                        <div><strong>{percent(current?.avgCitationRecall)}</strong>{compareRun && <small>{delta(current?.avgCitationRecall, previous?.avgCitationRecall) ?? "-"}</small>}</div>
+                        <div><strong>{percent(current?.avgRagasFaithfulness)}</strong>{compareRun && <small>{delta(current?.avgRagasFaithfulness, previous?.avgRagasFaithfulness) ?? "-"}</small>}</div>
+                        <div><strong>{percent(current?.avgAresAnswerRelevance)}</strong>{compareRun && <small>{delta(current?.avgAresAnswerRelevance, previous?.avgAresAnswerRelevance) ?? "-"}</small>}</div>
+                        <div><strong>{decimal(current?.avgDurationMs)}ms</strong></div>
+                        <div><strong>{integer(current?.avgTotalTokens)}</strong></div>
                       </div>
                     ))}
                   </div>
@@ -400,43 +380,40 @@ export function BenchmarkWorkspace({
                     <div className="benchmark-report-card">
                       <div className="panel-section-heading">
                         <h3>{record.scenario} 报告</h3>
-                        <span>{record.language} · {record.modelCalls} calls · {integer(record.totalTokens)} tok</span>
+                        <span>{record.language} | {record.modelCalls} calls | {integer(record.totalTokens)} tok</span>
                       </div>
                       <div className="benchmark-report-grid">
                         <section>
-                          <h4>问题</h4>
+                          <h4>脉冲输入问题</h4>
                           <pre>{record.question}</pre>
                         </section>
                         <section>
-                          <h4>模型回答</h4>
+                          <h4>测试集标准答案</h4>
+                          <ul>
+                            {(record.testsetAnswers?.length ?? 0) > 0
+                              ? record.testsetAnswers?.map((item) => <li key={item}>{item}</li>)
+                              : [<li key="-">-</li>]}
+                          </ul>
+                        </section>
+                        <section>
+                          <h4>AORI 回答</h4>
                           <pre>{record.actualAnswer}</pre>
                         </section>
                         <section>
-                          <h4>回答摘要</h4>
-                          <pre>{record.actualSummary}</pre>
+                          <h4>AI评审</h4>
+                          {record.answerReview ? (
+                            <div className="benchmark-review-block">
+                              <p><strong>{reviewVerdictLabel[record.answerReview.verdict]}</strong></p>
+                              <p>{record.answerReview.summary}</p>
+                              <p>预期：{record.answerReview.expectedAnswerSummary}</p>
+                              <p>实际：{record.answerReview.actualAnswerSummary}</p>
+                            </div>
+                          ) : (
+                            <p className="muted">暂无结构化 AI 评审。</p>
+                          )}
                         </section>
                         <section>
-                          <h4>期望答案应包含</h4>
-                          <ul>
-                            {record.expectedAnswerIncludes.map((item) => <li key={item}>{item}</li>)}
-                          </ul>
-                        </section>
-                        <section>
-                          <h4>期望答案不应包含</h4>
-                          <ul>
-                            {(record.expectedAnswerExcludes.length > 0 ? record.expectedAnswerExcludes : ["-"]).map((item) => <li key={item}>{item}</li>)}
-                          </ul>
-                        </section>
-                        <section>
-                          <h4>本次未命中的关键点</h4>
-                          <ul>
-                            {(record.answerMisses.length > 0 ? record.answerMisses : ["-"]).map((item) => <li key={item}>{item}</li>)}
-                          </ul>
-                        </section>
-                      </div>
-                      <div className="benchmark-report-grid benchmark-report-grid-extended">
-                        <section>
-                          <h4>原文证据</h4>
+                          <h4>知识库原文（审计展示）</h4>
                           {(record.sourceItems?.length ?? 0) > 0 ? (
                             <div className="benchmark-source-list">
                               {record.sourceItems?.map((item) => (
@@ -447,64 +424,7 @@ export function BenchmarkWorkspace({
                               ))}
                             </div>
                           ) : (
-                            <p className="muted">此旧版 benchmark 记录未保留原文片段。</p>
-                          )}
-                        </section>
-                        <section>
-                          <h4>AI评审结论</h4>
-                          {record.answerReview ? (
-                            <div className="benchmark-review-block">
-                              <p><strong>{reviewVerdictLabel[record.answerReview.verdict]}</strong></p>
-                              <p>{record.answerReview.summary}</p>
-                              <p>预期答案概括：{record.answerReview.expectedAnswerSummary}</p>
-                              <p>实际答案概括：{record.answerReview.actualAnswerSummary}</p>
-                            </div>
-                          ) : (
-                            <p className="muted">此旧版 benchmark 记录未保留结构化 AI 评审结果。</p>
-                          )}
-                        </section>
-                        <section>
-                          <h4>AI评审 - 差异点</h4>
-                          {record.answerReview && record.answerReview.differences.length > 0 ? (
-                            <ul>
-                              {record.answerReview.differences.map((item, index) => (
-                                <li key={`${item.aspect}-${index}`}>
-                                  <strong>{item.aspect}</strong><br />
-                                  预期：{item.expected}<br />
-                                  实际：{item.actual}<br />
-                                  影响：{item.impact}
-                                </li>
-                              ))}
-                            </ul>
-                          ) : (
-                            <p className="muted">{record.answerReview ? "没有额外记录到结构化差异。" : "暂无 AI 差异评审。"}</p>
-                          )}
-                        </section>
-                        <section>
-                          <h4>AI评审 - 原文 / 预期 / 实际对应</h4>
-                          {record.answerReview && record.answerReview.sourceComparisons.length > 0 ? (
-                            <div className="benchmark-source-list">
-                              {record.answerReview.sourceComparisons.map((item) => (
-                                <article key={`${record.scenario}-${item.sourceTitle}`} className="benchmark-source-item">
-                                  <strong>{item.sourceTitle}</strong>
-                                  <small>预期：{reviewRoleLabel[item.expectedRole]} ｜ 实际：{reviewRoleLabel[item.actualRole]}</small>
-                                  <pre>{item.sourceTextExcerpt}</pre>
-                                  <p>{item.note}</p>
-                                </article>
-                              ))}
-                            </div>
-                          ) : (
-                            <p className="muted">{record.answerReview ? "没有生成原文级对照。" : "暂无 AI 原文对照评审。"}</p>
-                          )}
-                        </section>
-                        <section>
-                          <h4>AI评审 - 改进建议</h4>
-                          {record.answerReview && record.answerReview.improvementActions.length > 0 ? (
-                            <ul>
-                              {record.answerReview.improvementActions.map((item) => <li key={item}>{item}</li>)}
-                            </ul>
-                          ) : (
-                            <p className="muted">{record.answerReview ? "没有额外建议。" : "暂无 AI 改进建议。"}</p>
+                            <p className="muted">旧记录未保留原文片段。</p>
                           )}
                         </section>
                       </div>

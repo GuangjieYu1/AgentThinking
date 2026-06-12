@@ -154,7 +154,7 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   const { config, db, vectors, model, queue } = services;
   const events = services.events ?? new LibraryEventBus();
   const publisher = new AnalysisPublisher(db, config);
-  const benchmarks = new BenchmarkService(config);
+  const benchmarks = new BenchmarkService(config, db);
   const pulseEngine = new PulseEngine(db, vectors, model, { aoriAnswerMode: config.aoriAnswerMode });
   const mappingAudit = new MappingAuditService(db, model, events);
   await app.register(cors, { origin: true, credentials: true });
@@ -215,6 +215,9 @@ export async function createApp(services: AppServices): Promise<FastifyInstance>
   app.post("/api/benchmarks/runs", async (request, reply): Promise<BenchmarkRunResult> => {
     const body = createBenchmarkRunSchema.parse(request.body);
     return reply.status(201).send(await benchmarks.run(body));
+  });
+  app.delete<{ Params: { runId: string } }>("/api/benchmarks/runs/:runId/library", async (request) => {
+    return benchmarks.deleteRunKnowledgeBase(request.params.runId);
   });
   app.post("/api/auth/register", async (request, reply) => {
     if (!config.authRequired) throw new Error("当前未启用注册");

@@ -1,4 +1,5 @@
 import type {
+  BenchmarkEvidenceTrace,
   BenchmarkOverallSummary,
   BenchmarkProviderMode,
   BenchmarkRunRecord,
@@ -6,8 +7,10 @@ import type {
   BenchmarkSuite,
   BenchmarkSuiteCatalogEntry,
   BenchmarkSuiteSummary,
+  EvidenceRecord,
   PulseInputMode,
 } from "@agent-thinking/contracts";
+import type { AgentDatabase } from "../db.js";
 import { getConfig } from "../config.js";
 import { createModelProvider } from "./models.js";
 import type { BenchmarkAnswerReviewInput, ModelProvider } from "./models.js";
@@ -16,6 +19,8 @@ import {
   aoriPulseEvalScenarios,
   assessEvalScenario,
   cleanupEvalDatabases,
+  createEvalWorkspaceInDatabase,
+  createEvalWorkspace,
   EvalModelProvider,
   runEvalScenario,
   type EvalScenario,
@@ -27,10 +32,13 @@ export interface BenchmarkRunnerArgs {
   mode: PulseInputMode;
   scenarioNames: string[];
   suites: BenchmarkSuite[];
+  db?: AgentDatabase | undefined;
+  libraryName?: string | undefined;
 }
 
 export interface BenchmarkRunnerOutput {
   providerLabel: string;
+  libraryId?: string | undefined;
   scenarioSummaries: BenchmarkScenarioSummary[];
   benchmarkSuites: BenchmarkSuiteSummary[];
   overall: BenchmarkOverallSummary;
@@ -38,11 +46,12 @@ export interface BenchmarkRunnerOutput {
 }
 
 export function benchmarkSuiteCatalog(): BenchmarkSuiteCatalogEntry[] {
-  return Object.entries(aoriPulseBenchmarkSuites).map(([suite, value]) => ({
-    suite: suite as BenchmarkSuite,
-    label: value.label,
-    kind: value.kind,
-    focus: value.focus,
+  const usedSuites = new Set(aoriPulseEvalScenarios.flatMap((scenario) => scenario.benchmarkSuites));
+  return [...usedSuites].map((suite) => ({
+    suite,
+    label: aoriPulseBenchmarkSuites[suite].label,
+    kind: aoriPulseBenchmarkSuites[suite].kind,
+    focus: aoriPulseBenchmarkSuites[suite].focus,
   }));
 }
 
@@ -63,6 +72,53 @@ export function benchmarkScenarioCatalog(): Array<{
 function average(values: number[]): number {
   if (values.length === 0) return 0;
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function uniqueStrings(values: Array<string | undefined | null>): string[] {
+  return [...new Set(values.map((value) => value?.trim() ?? "").filter(Boolean))];
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isEvidenceRecord(value: unknown): value is EvidenceRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<EvidenceRecord>;
+  return typeof record.recordName === "string" && isStringArray(record.evidenceChunkIds) && Boolean(record.fields);
+}
+
+function evidenceRecordsFromDiagnostics(diagnostics: Record<string, unknown> | undefined): EvidenceRecord[] {
+  const records = diagnostics?.evidenceRecords;
+  if (!Array.isArray(records)) return [];
+  return records.filter(isEvidenceRecord);
+}
+
+function evidenceTraceFromPulse(pulse: Awaited<ReturnType<typeof runEvalScenario>>["pulse"]): BenchmarkEvidenceTrace {
+  const evidenceRecords = evidenceRecordsFromDiagnostics(pulse.evidencePack?.diagnostics);
+  const citationChunkIds = uniqueStrings(pulse.evidencePack?.citations.map((citation) => citation.chunkId) ?? []);
+  const selectedChunkIds = uniqueStrings(
+    pulse.evidencePack?.chunkEvidencePack?.selectedChunks.map((selected) => selected.chunkId) ?? [],
+  );
+  const evidenceRecordChunkIds = uniqueStrings(evidenceRecords.flatMap((record) => record.evidenceChunkIds));
+
+  return {
+    citationChunkIds,
+    selectedChunkIds,
+    evidenceRecordChunkIds,
+    citations: pulse.evidencePack?.citations ?? [],
+    evidenceRecords: evidenceRecords.map((record) => ({
+      recordName: record.recordName,
+      evidenceChunkIds: record.evidenceChunkIds,
+      fields: Object.entries(record.fields).map(([fieldName, field]) => ({
+        fieldName,
+        value: field.value,
+        ...(field.chunkId ? { chunkId: field.chunkId } : {}),
+        evidenceChunkIds: field.evidenceChunkIds,
+        ...(field.quote ? { quote: field.quote } : {}),
+      })),
+    })),
+  };
 }
 
 function scenarioFilter(names: string[], scenarios: EvalScenario[]): EvalScenario[] {
@@ -224,12 +280,18 @@ export async function runBenchmarkSuite(input: BenchmarkRunnerArgs): Promise<Ben
     ? "fake-eval"
     : `${config.provider}:${config.chatModel ?? model.name}`;
   const records: BenchmarkRunRecord[] = [];
+  let workspace: Awaited<ReturnType<typeof createEvalWorkspace>> | undefined;
+  const workspaceOptions: { libraryName?: string } = {};
+  if (input.libraryName) workspaceOptions.libraryName = input.libraryName;
 
   try {
+    workspace = input.db
+      ? await createEvalWorkspaceInDatabase(input.db, model, workspaceOptions)
+      : await createEvalWorkspace(model);
     for (let iteration = 1; iteration <= input.iterations; iteration += 1) {
       for (const scenario of scenarios) {
         const wallStartedAt = Date.now();
-        const { db, pulse, events } = await runEvalScenario(scenario, { model, mode: input.mode });
+        const { pulse, events } = await runEvalScenario(scenario, { model, mode: input.mode, workspace });
         const wallClockMs = Date.now() - wallStartedAt;
         const assessment = assessEvalScenario(scenario, pulse, events);
         const metrics = pulse.pulse.metrics;
@@ -256,6 +318,8 @@ export async function runBenchmarkSuite(input: BenchmarkRunnerArgs): Promise<Ben
           iteration,
           question: scenario.question,
           sourceItems: reviewInput.sourceItems,
+          evidenceTrace: evidenceTraceFromPulse(pulse),
+          testsetAnswers: scenario.expected.testsetAnswers,
           expectedAnswerIncludes: scenario.expected.answerIncludes,
           expectedAnswerExcludes: scenario.expected.answerExcludes ?? [],
           actualAnswer: pulse.pulse.answer,
@@ -286,11 +350,13 @@ export async function runBenchmarkSuite(input: BenchmarkRunnerArgs): Promise<Ben
           promptCacheMissTokens: metrics?.promptCacheMissTokens ?? 0,
           promptCacheHitRate: metrics?.promptCacheHitRate,
         });
-        db.close();
       }
     }
   } finally {
-    await cleanupEvalDatabases();
+    if (workspace?.closeWhenDone) {
+      workspace.db.close();
+      await cleanupEvalDatabases();
+    }
   }
 
   const scenarioSummaries = summarize(records);
@@ -321,6 +387,7 @@ export async function runBenchmarkSuite(input: BenchmarkRunnerArgs): Promise<Ben
 
   return {
     providerLabel,
+    libraryId: workspace?.libraryId,
     scenarioSummaries,
     benchmarkSuites,
     overall,

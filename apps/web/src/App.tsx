@@ -109,6 +109,12 @@ interface RuleGovernanceFeed {
   traces: GraphRuleTrace[];
 }
 
+interface ImportResult {
+  fileName: string;
+  duplicate: boolean;
+  jobId?: string;
+}
+
 function isLegacyJobEvent(value: unknown): value is IngestJob {
   return Boolean(value && typeof value === "object" && "id" in value && "stage" in value && !("type" in value));
 }
@@ -421,6 +427,7 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   }>();
   const [ruleGovernanceFeed, setRuleGovernanceFeed] = useState<RuleGovernanceFeed>({ traces: [] });
   const [resourcePanelCollapsed, setResourcePanelCollapsed] = useState(false);
+  const [lastImportResults, setLastImportResults] = useState<ImportResult[]>([]);
   const jobSummary = useMemo(() => summarizeJobs(jobs), [jobs]);
 
   const reload = async () => {
@@ -473,7 +480,8 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
   const upload = async (files: FileList | null) => {
     if (!files?.length) return;
     try {
-      await api.import(library.id, files, { indexStrategy, recordIndexingRationale });
+      const imported = await api.import(library.id, files, { indexStrategy, recordIndexingRationale });
+      setLastImportResults(imported);
       await reload();
     } catch (cause) {
       onError((cause as Error).message);
@@ -697,6 +705,23 @@ function LibraryWorkspace({ library, onError }: { library: Library; onError: (me
                 <option value="cloud">阿里云 OCR</option>
               </select>
             </label>
+            {lastImportResults.length > 0 && (
+              <div className="import-result-panel">
+                <strong>本次导入文件</strong>
+                <ul>
+                  {lastImportResults.map((item) => (
+                    <li key={`${item.fileName}-${item.jobId ?? "duplicate"}`}>
+                      <span>{item.fileName}</span>
+                      <small>
+                        {item.duplicate
+                          ? "重复文件，已跳过创建任务"
+                          : `已创建处理任务${item.jobId ? `：${item.jobId}` : ""}`}
+                      </small>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="document-list">
               {documents.map((document) => (
                 <div className="document" key={document.id}>

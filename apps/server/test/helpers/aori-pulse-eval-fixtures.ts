@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import publicCmrc2018DevSubset from "./public-cmrc2018-dev-subset.json";
 import type {
   Chunk,
   DemandAnswerPlan,
@@ -8,7 +9,6 @@ import type {
   EvidenceRecord,
   PulseAnswerOutput,
   PulseInputMode,
-  PulseResponse,
   PulseStreamEvent,
   SearchResult,
 } from "@agent-thinking/contracts";
@@ -29,6 +29,12 @@ export async function createEvalDatabase(): Promise<AgentDatabase> {
 
 export async function cleanupEvalDatabases(): Promise<void> {
   await Promise.all(temporaryDirectories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+}
+
+export interface EvalWorkspace {
+  db: AgentDatabase;
+  libraryId: string;
+  closeWhenDone: boolean;
 }
 
 export class NoLegacyRetrievalVectorStore extends VectorStore {
@@ -83,7 +89,7 @@ export class EvalModelProvider extends FakeModelProvider {
     if (!hasUsefulValue || (/exact date/i.test(input.question) && missingRequiredRecords.length > 0)) {
       return {
         answer: `Evidence is insufficient: ${input.plan.answerPolicy.whatCountsAsInsufficient}`,
-        summary: "Demand answer found an evidence gap in the fixed eval fixture.",
+        summary: "Demand answer found an evidence gap in the public dataset eval fixture.",
         diagnostics: {
           answerPipeline: "aori_demand",
           demandPlan: input.plan,
@@ -130,9 +136,9 @@ export const aoriPulseBenchmarkSuites = {
     focus: ["grounded answer quality", "multi-step evidence use", "pipeline stability"],
   },
   crud_rag: {
-    label: "CRUD-RAG-style Chinese QA",
+    label: "CMRC 2018 public subset",
     kind: "dataset",
-    focus: ["Chinese source handling", "citation support", "faithful structured answers"],
+    focus: ["public dataset subset", "Chinese source handling", "citation support", "faithful structured answers"],
   },
   ragas: {
     label: "RAGAS-style automatic scoring",
@@ -155,11 +161,9 @@ export interface EvalScenario {
   benchmarkSuites: BenchmarkSuite[];
   language: "en" | "zh";
   question: string;
-  aspectKind: Parameters<typeof buildAoriDocumentIndex>[0]["drafts"][number]["draft"]["aspects"][number]["kind"];
-  domainKind: string;
-  centralQuestion: string;
   items: EvalItem[];
   expected: {
+    testsetAnswers: string[];
     answerIncludes: string[];
     answerExcludes?: string[] | undefined;
     recordCount: number;
@@ -168,78 +172,235 @@ export interface EvalScenario {
   };
 }
 
+interface PublicDatasetQaFixture {
+  dataset: string;
+  split: string;
+  license: string;
+  sourceUrl: string;
+  articleId: string;
+  questionId: string;
+  title: string;
+  question: string;
+  contextExcerpt: string;
+  answers: string[];
+  evidence: string;
+}
+
+const PUBLIC_EVAL_SINGLE_HOP_COUNT = 80;
+const PUBLIC_EVAL_MULTI_HOP_COUNT = 20;
+const PUBLIC_EVAL_TARGET_COUNT = PUBLIC_EVAL_SINGLE_HOP_COUNT + PUBLIC_EVAL_MULTI_HOP_COUNT;
+
 function uniqueStrings(values: Array<string | undefined | null>): string[] {
   return [...new Set(values.map((value) => value?.trim() ?? "").filter(Boolean))];
 }
 
-export function saveAoriEvalIndex(db: AgentDatabase, scenario: EvalScenario): { libraryId: string; chunks: Chunk[] } {
-  const library = db.createLibrary(`Eval ${scenario.name}`);
-  const version = db.createDocumentVersion(
-    library.id,
-    `${scenario.name}.md`,
-    "text/markdown",
-    `hash-${scenario.name}`,
-    `${scenario.name}.md`,
-    { indexStrategy: "aspect_oriented_reflective" },
-  ).version;
-  const chunks = db.replaceChunks(library.id, version.id, scenario.items.map((item, index) => ({
-    ordinal: index,
-    headingPath: item.title,
-    pageNumber: null,
-    startChar: index * 100,
-    endChar: index * 100 + item.text.length,
-    text: item.text,
-  })));
+function normalizeContextExcerpt(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
 
-  db.saveAoriDocumentIndex(buildAoriDocumentIndex({
-    libraryId: library.id,
-    documentId: version.documentId,
-    documentName: `${scenario.name}.md`,
-    versionId: version.id,
-    chunks,
-    drafts: [{
-      groupId: "eval-group",
-      draft: {
-        understanding: {
-          summary: `Fixed AORI/Pulse eval fixture for ${scenario.name}.`,
-          centralQuestion: scenario.centralQuestion,
-          evidenceChunkIds: chunks.map((chunk) => chunk.id),
-          evidenceStatus: "supported",
-          closureStatus: "partial",
-          classificationRationale: "Fixed eval fixture.",
-          confidence: 0.82,
-        },
-        aspects: [{
-          kind: scenario.aspectKind,
-          domainKind: scenario.domainKind,
-          title: scenario.centralQuestion,
-          summary: `Source-bound ${scenario.domainKind} eval aspect.`,
-          centralQuestion: scenario.centralQuestion,
-          classificationRationale: "Fixed eval fixture.",
-          confidence: 0.82,
-          items: chunks.map((chunk, index) => ({
-            key: `eval-item-${index + 1}`,
-            title: scenario.items[index]?.title ?? `Eval item ${index + 1}`,
-            summary: scenario.items[index]?.summary ?? scenario.items[index]?.text ?? "",
-            evidenceChunkIds: [chunk.id],
-            evidenceStatus: "supported" as const,
-            closureStatus: "partial" as const,
-            classificationRationale: "Fixed eval fixture.",
-            confidence: 0.82,
-          })),
-          relations: [],
-          gaps: [],
-        }],
-        selfQuestions: [],
-        reflectiveReport: { summary: "complete fixture", completenessRisk: "none", warnings: [], truncationCount: 0 },
-      },
+function publicSourceText(entry: PublicDatasetQaFixture): string {
+  return normalizeContextExcerpt(entry.contextExcerpt);
+}
+
+function publicScenarioName(entry: PublicDatasetQaFixture, variantIndex = 0): string {
+  const slug = entry.questionId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return variantIndex === 0 ? `cmrc2018-${slug}` : `cmrc2018-${slug}-variant-${variantIndex}`;
+}
+
+function publicQuestion(entry: PublicDatasetQaFixture, variantIndex = 0): string {
+  const variants = [
+    entry.question,
+    `根据公开资料，${entry.question}`,
+    `请只依据知识库原文回答：${entry.question}`,
+    `从原文可以判断，${entry.question}`,
+    `关于“${entry.title}”，${entry.question}`,
+  ];
+  return variants[variantIndex % variants.length] ?? entry.question;
+}
+
+function toPublicEvalScenario(entry: PublicDatasetQaFixture, variantIndex = 0): EvalScenario {
+  return {
+    name: publicScenarioName(entry, variantIndex),
+    benchmarkSuites: ["crud_rag", "ragas", "ares"],
+    language: "zh",
+    question: publicQuestion(entry, variantIndex),
+    items: [{
+      title: entry.title,
+      text: publicSourceText(entry),
+      summary: entry.contextExcerpt,
     }],
-    rationaleTrace: [],
-    reflectiveReport: { summary: "complete fixture", completenessRisk: "none", warnings: [], truncationCount: 0 },
-    createdAt: "2026-06-08T00:00:00.000Z",
-  }));
+    expected: {
+      testsetAnswers: entry.answers,
+      answerIncludes: entry.answers,
+      answerExcludes: [
+        "Evidence is insufficient",
+        "No source-bound records or no required field values were extracted.",
+      ],
+      recordCount: 1,
+      selectedChunkCount: 1,
+      gapCount: 0,
+    },
+  };
+}
 
-  return { libraryId: library.id, chunks };
+function toPublicMultiHopScenario(
+  left: PublicDatasetQaFixture,
+  right: PublicDatasetQaFixture,
+  index: number,
+): EvalScenario {
+  const itemsByContext = new Map<string, EvalItem>();
+  for (const entry of [left, right]) {
+    const context = publicSourceText(entry);
+    if (!itemsByContext.has(context)) {
+      itemsByContext.set(context, {
+        title: entry.title,
+        text: context,
+        summary: entry.contextExcerpt,
+      });
+    }
+  }
+  const items = [...itemsByContext.values()];
+  const expectedAnswers = uniqueStrings([...left.answers, ...right.answers]);
+  return {
+    name: `cmrc2018-multihop-${String(index + 1).padStart(2, "0")}`,
+    benchmarkSuites: ["ragbench", "crud_rag", "ragas", "ares"],
+    language: "zh",
+    question: `请分别回答两个公开资料问题：1）${left.question} 2）${right.question}`,
+    items,
+    expected: {
+      testsetAnswers: expectedAnswers,
+      answerIncludes: expectedAnswers,
+      answerExcludes: [
+        "Evidence is insufficient",
+        "No source-bound records or no required field values were extracted.",
+      ],
+      recordCount: items.length,
+      selectedChunkCount: items.length,
+      gapCount: 0,
+    },
+  };
+}
+
+function buildPublicEvalScenarios(entries: PublicDatasetQaFixture[]): EvalScenario[] {
+  if (entries.length === 0) return [];
+  const scenarios: EvalScenario[] = [];
+  for (let index = 0; index < PUBLIC_EVAL_SINGLE_HOP_COUNT; index += 1) {
+    const entry = entries[index % entries.length]!;
+    const variantIndex = Math.floor(index / entries.length);
+    scenarios.push(toPublicEvalScenario(entry, variantIndex));
+  }
+  for (let index = 0; index < PUBLIC_EVAL_MULTI_HOP_COUNT; index += 1) {
+    const left = entries[index % entries.length]!;
+    const right = entries[(index + Math.max(1, Math.floor(entries.length / 2))) % entries.length]!;
+    scenarios.push(toPublicMultiHopScenario(left, right, index));
+  }
+  return scenarios.slice(0, PUBLIC_EVAL_TARGET_COUNT);
+}
+
+interface EvalCorpusDocument extends EvalItem {
+  key: string;
+  articleIds: string[];
+  questionIds: string[];
+}
+
+function buildEvalCorpusDocuments(entries: PublicDatasetQaFixture[]): EvalCorpusDocument[] {
+  const byContext = new Map<string, EvalCorpusDocument>();
+  for (const entry of entries) {
+    const context = publicSourceText(entry);
+    const existing = byContext.get(context);
+    if (existing) {
+      existing.articleIds = uniqueStrings([...existing.articleIds, entry.articleId]);
+      existing.questionIds = uniqueStrings([...existing.questionIds, entry.questionId]);
+      continue;
+    }
+    byContext.set(context, {
+      key: `cmrc2018-doc-${byContext.size + 1}`,
+      title: entry.title,
+      text: context,
+      summary: context,
+      articleIds: [entry.articleId],
+      questionIds: [entry.questionId],
+    });
+  }
+  return [...byContext.values()];
+}
+
+const publicEvalCorpusDocuments = buildEvalCorpusDocuments(publicCmrc2018DevSubset as PublicDatasetQaFixture[]);
+
+export async function saveAoriEvalIndex(
+  db: AgentDatabase,
+  model: ModelProvider,
+  options: { libraryName?: string } = {},
+): Promise<{ libraryId: string; chunks: Chunk[] }> {
+  const library = db.createLibrary(options.libraryName ?? "Eval public-cmrc2018-deduped");
+  const allChunks: Chunk[] = [];
+
+  for (const document of publicEvalCorpusDocuments) {
+    const version = db.createDocumentVersion(
+      library.id,
+      `${document.key}.md`,
+      "text/markdown",
+      `hash-${document.key}`,
+      `${document.key}.md`,
+      { indexStrategy: "aspect_oriented_reflective" },
+    ).version;
+    const chunks = db.replaceChunks(library.id, version.id, [{
+      ordinal: 0,
+      headingPath: document.title,
+      pageNumber: null,
+      startChar: 0,
+      endChar: document.text.length,
+      text: document.text,
+    }]);
+    const draft = await model.extractAoriDocument({
+      documentName: `${document.key}.md`,
+      chunks,
+      context: {
+        stage: "global_reading",
+        groupId: document.key,
+        documentName: `${document.key}.md`,
+        documentTokenEstimate: Math.max(1, Math.ceil(document.text.length / 4)),
+        inputTokenEstimate: Math.max(1, Math.ceil(document.text.length / 4)),
+        usedTokenEstimate: Math.max(1, Math.ceil(document.text.length / 4)),
+        preservedRanges: ["full_document"],
+        omittedRanges: [],
+        truncated: false,
+        risk: "low",
+        minTruncatedContextTokens: 10_000,
+        evidenceBindingMinContextTokens: 10_000,
+        allowSmallContextOnlyForQuoteLookup: true,
+      },
+    });
+    const aoriIndex = buildAoriDocumentIndex({
+      libraryId: library.id,
+      documentId: version.documentId,
+      documentName: `${document.key}.md`,
+      versionId: version.id,
+      chunks,
+      drafts: [{ groupId: document.key, draft }],
+      rationaleTrace: [],
+      reflectiveReport: draft.reflectiveReport,
+    });
+    db.saveAoriDocumentIndex(aoriIndex);
+    allChunks.push(...chunks);
+  }
+
+  return { libraryId: library.id, chunks: allChunks };
+}
+
+export async function createEvalWorkspace(model: ModelProvider = new EvalModelProvider()): Promise<EvalWorkspace> {
+  const db = await createEvalDatabase();
+  const { libraryId } = await saveAoriEvalIndex(db, model);
+  return { db, libraryId, closeWhenDone: true };
+}
+
+export async function createEvalWorkspaceInDatabase(
+  db: AgentDatabase,
+  model: ModelProvider,
+  options: { libraryName?: string } = {},
+): Promise<EvalWorkspace> {
+  const { libraryId } = await saveAoriEvalIndex(db, model, options);
+  return { db, libraryId, closeWhenDone: false };
 }
 
 export function diagnosticsFrom(pulse: Awaited<ReturnType<PulseEngine["create"]>>): Record<string, unknown> {
@@ -252,19 +413,22 @@ export async function runEvalScenario(
     model?: ModelProvider;
     mode?: PulseInputMode;
     onEvent?: (event: PulseStreamEvent) => void;
+    workspace?: EvalWorkspace;
   } = {},
 ): Promise<{
   db: AgentDatabase;
+  libraryId: string;
   pulse: Awaited<ReturnType<PulseEngine["create"]>>;
   events: PulseStreamEvent[];
 }> {
-  const db = await createEvalDatabase();
-  const { libraryId } = saveAoriEvalIndex(db, scenario);
+  const model = options.model ?? new EvalModelProvider();
+  const workspace = options.workspace ?? await createEvalWorkspace(model);
+  const { db, libraryId } = workspace;
   const events: PulseStreamEvent[] = [];
   const pulse = await new PulseEngine(
     db,
     new NoLegacyRetrievalVectorStore(db),
-    options.model ?? new EvalModelProvider(),
+    model,
   ).create(
     libraryId,
     scenario.question,
@@ -274,7 +438,7 @@ export async function runEvalScenario(
       options.onEvent?.(event);
     },
   );
-  return { db, pulse, events };
+  return { db, libraryId, pulse, events };
 }
 
 export interface EvalScenarioAssessment {
@@ -365,230 +529,5 @@ export function assessEvalScenario(
   };
 }
 
-export const aoriPulseEvalScenarios: EvalScenario[] = [{
-  name: "count-list",
-  benchmarkSuites: ["kilt", "ragbench", "ragas", "ares"],
-  language: "en",
-  question: "How many people paid Huang in 2005? list all people",
-  aspectKind: "finding",
-  domainKind: "count_list",
-  centralQuestion: "Who paid Huang and when?",
-  items: [
-    { title: "SourceA payment", text: "source: SourceA; person: Alice; time: 2005; evidence: Alice paid Huang in 2005." },
-    { title: "SourceB payment", text: "source: SourceB; person: Bob; time: 2005; evidence: Bob paid Huang in 2005." },
-    { title: "SourceC payment", text: "source: SourceC; person: Charlie; time: 2010; evidence: Charlie paid Huang in 2010." },
-    { title: "SourceD payment", text: "source: SourceD; person: Dana; time: 2005-2006; evidence: Dana paid Huang across a range." },
-    { title: "SourceE payment", text: "source: SourceE; person: Eve; evidence: Eve paid Huang but time is unclear." },
-  ],
-  expected: {
-    answerIncludes: ['"count":2', "SourceA", "SourceB", "Uncertain records: SourceD, SourceE"],
-    answerExcludes: ["SourceC [", "16 chunks"],
-    recordCount: 5,
-    selectedChunkCount: 5,
-    gapCount: 1,
-  },
-}, {
-  name: "timeline",
-  benchmarkSuites: ["kilt", "ragbench", "ragas", "ares"],
-  language: "en",
-  question: "timeline 2005 events",
-  aspectKind: "timeline",
-  domainKind: "timeline",
-  centralQuestion: "When did payment events happen?",
-  items: [
-    { title: "EventA", text: "source: SourceA; event: Alice paid Huang; time: 2005; evidence: Alice payment." },
-    { title: "EventB", text: "source: SourceB; event: Bob paid Huang; time: 2005-2006; evidence: Bob payment range." },
-    { title: "EventC", text: "source: SourceC; event: Charlie paid Huang; time: 2010; evidence: Charlie payment." },
-  ],
-  expected: {
-    answerIncludes: ["Alice paid Huang", "Uncertain records: SourceB"],
-    answerExcludes: ["Charlie paid Huang [", "16 chunks"],
-    recordCount: 3,
-    selectedChunkCount: 3,
-  },
-}, {
-  name: "amount",
-  benchmarkSuites: ["kilt", "ragbench", "ragas", "ares"],
-  language: "en",
-  question: "What total amount of money did Huang receive?",
-  aspectKind: "amount",
-  domainKind: "amount",
-  centralQuestion: "What source-bound amounts are recorded?",
-  items: [
-    { title: "AmountA", text: "source: SourceA; amount: 10 wan; time: 2005; evidence: SourceA paid 10 wan." },
-    { title: "AmountB", text: "source: SourceB; amount: 20 wan; time: 2006; evidence: SourceB paid 20 wan." },
-    { title: "AmountC", text: "source: SourceC; amount: 5 wan; time: 2007; evidence: SourceC paid 5 wan." },
-  ],
-  expected: {
-    answerIncludes: ["SourceA: 10 wan", "SourceB: 20 wan", "SourceC: 5 wan"],
-    answerExcludes: ["No source-bound amount value was extracted", "16 chunks"],
-    recordCount: 3,
-    selectedChunkCount: 3,
-  },
-}, {
-  name: "argument-response",
-  benchmarkSuites: ["ragbench", "ragas", "ares"],
-  language: "en",
-  question: "Was the defense argument accepted and how did the court respond?",
-  aspectKind: "argument",
-  domainKind: "argument_response",
-  centralQuestion: "How did the court respond to each argument?",
-  items: [
-    {
-      title: "Loan defense",
-      text: "argument: payment was a loan; response: court rejected the defense; finding: payment was a bribe; status: not_accepted; evidence: court explains why.",
-    },
-    {
-      title: "Amount defense",
-      text: "argument: amount was overstated; response: court accepted part of it; finding: amount reduced; status: partially_accepted; evidence: court recalculated.",
-    },
-  ],
-  expected: {
-    answerIncludes: ["payment was a loan", "court rejected the defense", "amount was overstated", "partially_accepted"],
-    answerExcludes: ["16 chunks"],
-    recordCount: 2,
-    selectedChunkCount: 2,
-  },
-}, {
-  name: "insufficient-evidence",
-  benchmarkSuites: ["crag", "ragbench", "ragas", "ares"],
-  language: "en",
-  question: "What exact date did the unclear payment happen?",
-  aspectKind: "finding",
-  domainKind: "evidence_gap",
-  centralQuestion: "Which facts remain insufficiently evidenced?",
-  items: [
-    { title: "Unclear payment", text: "source: SourceA; evidence: SourceA may have paid Huang, but the exact date is not recorded." },
-  ],
-  expected: {
-    answerIncludes: ["Evidence is insufficient", "No source-bound records or no required field values were extracted"],
-    answerExcludes: ['"count":0', "16 chunks"],
-    recordCount: 1,
-    selectedChunkCount: 1,
-    gapCount: 1,
-  },
-}, {
-  name: "count-list-2006-overlap",
-  benchmarkSuites: ["crag", "ragbench", "ragas", "ares"],
-  language: "en",
-  question: "How many people paid Huang in 2006? list all people",
-  aspectKind: "finding",
-  domainKind: "count_list_overlap",
-  centralQuestion: "Which records are exact versus uncertain for year-specific counting?",
-  items: [
-    { title: "SourceA payment", text: "source: SourceA; person: Alice; time: 2006; evidence: Alice paid Huang in 2006." },
-    { title: "SourceB payment", text: "source: SourceB; person: Bob; time: 2005-2006; evidence: Bob paid Huang across 2005-2006." },
-    { title: "SourceC payment", text: "source: SourceC; person: Charlie; evidence: Charlie paid Huang but time is not explicit." },
-    { title: "SourceD payment", text: "source: SourceD; person: Dana; time: 2010; evidence: Dana paid Huang in 2010." },
-  ],
-  expected: {
-    answerIncludes: ['"count":1', "SourceA", "Uncertain records: SourceB, SourceC"],
-    answerExcludes: ["SourceD [", "16 chunks"],
-    recordCount: 4,
-    selectedChunkCount: 4,
-    gapCount: 1,
-  },
-}, {
-  name: "amount-2008-null",
-  benchmarkSuites: ["crag", "ragbench", "ragas", "ares"],
-  language: "en",
-  question: "What total amount of money did Huang receive in 2008?",
-  aspectKind: "amount",
-  domainKind: "amount_year_null",
-  centralQuestion: "What happens when the requested year has no exact amount record?",
-  items: [
-    { title: "AmountA", text: "source: SourceA; amount: 10 wan; time: 2005; evidence: SourceA paid 10 wan." },
-    { title: "AmountB", text: "source: SourceB; amount: 20 wan; time: 2006; evidence: SourceB paid 20 wan." },
-    { title: "AmountC", text: "source: SourceC; amount: 5 wan; time: 2007; evidence: SourceC paid 5 wan." },
-  ],
-  expected: {
-    answerIncludes: ["2008 amount: null"],
-    answerExcludes: ["SourceA:", "SourceB:", "SourceC:", "16 chunks"],
-    recordCount: 3,
-    selectedChunkCount: 3,
-  },
-}, {
-  name: "crud-rag-count-zh",
-  benchmarkSuites: ["crud_rag", "ragas", "ares"],
-  language: "zh",
-  question: "2005年向黄某付款的人有多少，列出名单",
-  aspectKind: "finding",
-  domainKind: "crud_count_zh",
-  centralQuestion: "中文语料里哪些付款记录能被准确计数？",
-  items: [
-    { title: "证据甲", text: "source: 证据甲; person: 张三; time: 2005; evidence: 张三在2005年向黄某付款。" },
-    { title: "证据乙", text: "source: 证据乙; person: 李四; time: 2005; evidence: 李四在2005年向黄某付款。" },
-    { title: "证据丙", text: "source: 证据丙; person: 王五; time: 2010; evidence: 王五在2010年向黄某付款。" },
-    { title: "证据丁", text: "source: 证据丁; person: 赵六; time: 2005-2006; evidence: 赵六在2005至2006年间向黄某付款。" },
-    { title: "证据戊", text: "source: 证据戊; person: 孙七; evidence: 孙七向黄某付款，但时间未写明。" },
-  ],
-  expected: {
-    answerIncludes: ['"count":2', "证据甲", "证据乙", "Uncertain records: 证据丁, 证据戊"],
-    answerExcludes: ["证据丙 [", "16 chunks"],
-    recordCount: 5,
-    selectedChunkCount: 5,
-    gapCount: 1,
-  },
-}, {
-  name: "crud-rag-timeline-zh",
-  benchmarkSuites: ["crud_rag", "ragas", "ares"],
-  language: "zh",
-  question: "按时间线列出2005年的付款事件",
-  aspectKind: "timeline",
-  domainKind: "crud_timeline_zh",
-  centralQuestion: "中文时间线问题能否保持出处绑定？",
-  items: [
-    { title: "事件甲", text: "source: 证据甲; event: 张三向黄某付款; time: 2005; evidence: 张三付款。" },
-    { title: "事件乙", text: "source: 证据乙; event: 李四向黄某付款; time: 2005-2006; evidence: 李四付款时间有区间。" },
-    { title: "事件丙", text: "source: 证据丙; event: 王五向黄某付款; time: 2010; evidence: 王五付款。" },
-  ],
-  expected: {
-    answerIncludes: ["张三向黄某付款", "Uncertain records: 证据乙"],
-    answerExcludes: ["王五向黄某付款 [", "16 chunks"],
-    recordCount: 3,
-    selectedChunkCount: 3,
-  },
-}, {
-  name: "crud-rag-amount-zh",
-  benchmarkSuites: ["crud_rag", "ragas", "ares"],
-  language: "zh",
-  question: "黄某一共收了多少金额？",
-  aspectKind: "amount",
-  domainKind: "crud_amount_zh",
-  centralQuestion: "中文金额问题是否能逐条给出出处？",
-  items: [
-    { title: "金额甲", text: "source: 来源甲; amount: 10万; time: 2005; evidence: 来源甲支付10万。" },
-    { title: "金额乙", text: "source: 来源乙; amount: 20万; time: 2006; evidence: 来源乙支付20万。" },
-    { title: "金额丙", text: "source: 来源丙; amount: 5万; time: 2007; evidence: 来源丙支付5万。" },
-  ],
-  expected: {
-    answerIncludes: ["来源甲: 10万", "来源乙: 20万", "来源丙: 5万"],
-    answerExcludes: ["No source-bound amount value was extracted", "16 chunks"],
-    recordCount: 3,
-    selectedChunkCount: 3,
-  },
-}, {
-  name: "crud-rag-argument-zh",
-  benchmarkSuites: ["crud_rag", "ragas", "ares"],
-  language: "zh",
-  question: "辩护意见是否被法院采纳，法院如何回应？",
-  aspectKind: "argument",
-  domainKind: "crud_argument_zh",
-  centralQuestion: "中文辩护-回应结构能否保持来源绑定？",
-  items: [
-    {
-      title: "借款辩护",
-      text: "argument: 付款属于借款; response: 法院认为该辩护不能成立; finding: 属于行贿款; status: not_accepted; evidence: 法院说明借款说法缺乏依据。",
-    },
-    {
-      title: "金额辩护",
-      text: "argument: 金额被夸大; response: 法院部分采纳该意见; finding: 对金额进行了调减; status: partially_accepted; evidence: 法院重新核算金额。",
-    },
-  ],
-  expected: {
-    answerIncludes: ["付款属于借款", "法院认为该辩护不能成立", "金额被夸大", "partially_accepted"],
-    answerExcludes: ["16 chunks"],
-    recordCount: 2,
-    selectedChunkCount: 2,
-  },
-}];
+export const aoriPulseEvalScenarios: EvalScenario[] =
+  buildPublicEvalScenarios(publicCmrc2018DevSubset as PublicDatasetQaFixture[]);

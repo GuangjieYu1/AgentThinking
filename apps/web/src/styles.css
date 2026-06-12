@@ -305,6 +305,29 @@ button:hover, .upload:hover { background: #1b3d43; }
   padding: 5px 8px;
   font-size: 12px;
 }
+.import-result-panel {
+  display: grid;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid #254650;
+  border-radius: 9px;
+  background: #0f2230;
+}
+.import-result-panel strong { color: #8bd9c7; font-size: 12px; }
+.import-result-panel ul {
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  list-style: none;
+}
+.import-result-panel li {
+  display: grid;
+  gap: 2px;
+  color: #d7e4f4;
+  overflow-wrap: anywhere;
+}
+.import-result-panel small { color: #8fa0bb; }
 .setting { display: grid; gap: 7px; color: #7e8da5; }
 .document-list { display: grid; gap: 7px; }
 .document {

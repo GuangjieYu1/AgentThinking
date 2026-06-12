@@ -179,7 +179,7 @@ export const api = {
     body.append("indexStrategy", options.indexStrategy);
     body.append("recordIndexingRationale", String(options.recordIndexingRationale));
     Array.from(files).forEach((file) => body.append("file", file));
-    return request<Array<{ fileName: string; duplicate: boolean }>>(`/libraries/${id}/import`, {
+    return request<Array<{ fileName: string; duplicate: boolean; jobId?: string }>>(`/libraries/${id}/import`, {
       method: "POST",
       body,
     });
@@ -362,6 +362,8 @@ export const api = {
   benchmarkRun: (runId: string) => request<BenchmarkRunResult>(`/benchmarks/runs/${runId}`),
   benchmarkRunJsonUrl: (runId: string) => `/api/benchmarks/runs/${runId}/export.json`,
   benchmarkRunMarkdownUrl: (runId: string) => `/api/benchmarks/runs/${runId}/export.md`,
+  deleteBenchmarkKnowledgeBase: (runId: string) =>
+    request<{ libraryId: string; deleted: boolean }>(`/benchmarks/runs/${runId}/library`, { method: "DELETE" }),
   createBenchmarkRun: (input: CreateBenchmarkRunInput) =>
     request<BenchmarkRunResult>("/benchmarks/runs", {
       method: "POST",

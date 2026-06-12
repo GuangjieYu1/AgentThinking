@@ -823,7 +823,7 @@ function cleanDemandAnswerPlan(value: unknown, input: DemandAnswerPlanInput): De
     source: "aspect_items",
     ...(scopeAspectIds[0] ?? largestAspect?.aspectId ? { aspectId: scopeAspectIds[0] ?? largestAspect?.aspectId } : {}),
     fields: [
-      { name: "answer_value", description: "The source-bound answer value for this question.", required: true },
+      { name: "answer_text", description: "The source-bound answer text for this question.", required: true },
       { name: "evidence", description: "Short source quote supporting the answer value.", required: true },
     ],
     coverage: "some",
@@ -1398,12 +1398,14 @@ export class FakeModelProvider implements ModelProvider {
     return finalizeExtractionOutput({ nodes, relations, themes }, chunks, undefined, { ...options, stage: "extraction" }).output;
   }
 
-  async extractAoriDocument(input: {
+  async extractAoriDocumentLegacy(input: {
     documentName: string;
     chunks: Chunk[];
     context: AoriExtractionContext;
   }): Promise<AoriDocumentDraft> {
     const selected = input.chunks.slice(0, 16);
+    const primaryTitle = selected[0]?.headingPath || firstSentence(selected[0]?.text ?? "", input.documentName);
+    const primarySummary = selected[0]?.text.slice(0, 300) || `${input.documentName} 的正文摘要。`;
     const items = selected.map((chunk, index) => ({
       key: `item_${index + 1}`,
       title: chunk.headingPath || firstSentence(chunk.text, `条目 ${index + 1}`),
@@ -1446,6 +1448,68 @@ export class FakeModelProvider implements ModelProvider {
       selfQuestions: [{
         question: "当前切面是否覆盖了主要证据？",
         answer: input.context.truncated ? "存在截断风险，需要复核。": "已覆盖当前输入范围。",
+        evidenceChunkIds: selected.slice(0, 3).map((chunk) => chunk.id),
+        status: input.context.truncated ? "gap" : "answered",
+      }],
+      reflectiveReport: {
+        summary: input.context.truncated ? "AORI 输入发生截断。" : "AORI 输入未截断。",
+        completenessRisk: input.context.truncated ? input.context.risk : "none",
+        warnings: input.context.truncated ? ["AORI global reading used a truncated context group."] : [],
+        truncationCount: input.context.truncated ? 1 : 0,
+      },
+    }, input.chunks);
+  }
+
+  async extractAoriDocument(input: {
+    documentName: string;
+    chunks: Chunk[];
+    context: AoriExtractionContext;
+  }): Promise<AoriDocumentDraft> {
+    const selected = input.chunks.slice(0, 16);
+    const primaryTitle = selected[0]?.headingPath || firstSentence(selected[0]?.text ?? "", input.documentName);
+    const primarySummary = selected[0]?.text.slice(0, 300) || `${input.documentName} 的正文摘要。`;
+    const items = selected.map((chunk, index) => ({
+      key: `item_${index + 1}`,
+      title: chunk.headingPath || firstSentence(chunk.text, `条目 ${index + 1}`),
+      summary: chunk.text.slice(0, 300),
+      evidenceChunkIds: [chunk.id],
+      sourceNodeIds: chunk.documentTreeNodeId ? [chunk.documentTreeNodeId] : [],
+    }));
+    const relations = items.slice(1).map((item, index) => ({
+      sourceKey: items[index]?.key ?? item.key,
+      targetKey: item.key,
+      relationTextInSource: "相邻叙述",
+      normalizedRelation: "相邻叙述",
+      baseRelation: "related_to" as const,
+      reason: "演示模型根据相邻材料生成的 AORI 关系。",
+      confidence: 0.55,
+      evidenceChunkIds: [...(items[index]?.evidenceChunkIds ?? []), ...item.evidenceChunkIds],
+    }));
+    return cleanAoriDraft({
+      understanding: {
+        summary: `${primaryTitle}：${primarySummary}`,
+        centralQuestion: `这份材料关于“${primaryTitle}”的核心信息是什么？`,
+        evidenceChunkIds: selected.flatMap((chunk) => [chunk.id]),
+      },
+      aspects: [{
+        kind: "other",
+        domainKind: "演示切面",
+        title: primaryTitle,
+        summary: primarySummary,
+        centralQuestion: `关于“${primaryTitle}”，原文主要说明了什么？`,
+        classificationRationale: "演示模型直接提供受控 schema 标签。",
+        confidence: 0.55,
+        items,
+        relations,
+        gaps: input.context.truncated ? [{
+          description: "当前 AORI 输入发生截断，部分范围需要人工复核。",
+          severity: input.context.risk,
+          evidenceChunkIds: [],
+        }] : [],
+      }],
+      selfQuestions: [{
+        question: "当前切面是否覆盖了主要证据？",
+        answer: input.context.truncated ? "存在截断风险，需要复核。" : "已覆盖当前输入范围。",
         evidenceChunkIds: selected.slice(0, 3).map((chunk) => chunk.id),
         status: input.context.truncated ? "gap" : "answered",
       }],
@@ -1729,9 +1793,19 @@ export class FakeModelProvider implements ModelProvider {
 
   async planDemandAnswer(input: DemandAnswerPlanInput): Promise<DemandAnswerPlan> {
     const question = input.question.normalize("NFKC").toLowerCase();
+    const questionUnits = [...question].filter((char) => /[\p{Script=Han}a-z0-9]/u.test(char));
     const target = input.aspects
       .filter((aspect) => aspect.itemCount > 0)
-      .sort((left, right) => right.itemCount - left.itemCount)[0];
+      .map((aspect, index) => {
+        const text = [
+          aspect.title,
+          aspect.summary,
+          ...((aspect.items ?? []).map((item) => `${item.title} ${item.summary}`)),
+        ].join(" ").normalize("NFKC").toLowerCase();
+        const relevance = questionUnits.reduce((score, unit) => score + (text.includes(unit) ? 1 : 0), 0);
+        return { aspect, index, relevance };
+      })
+      .sort((left, right) => right.relevance - left.relevance || right.aspect.itemCount - left.aspect.itemCount || left.index - right.index)[0]?.aspect;
     const recordName = "answer_records";
     const year = question.match(/\b(19|20)\d{2}\b/u)?.[0];
     const hasAmount = /amount|money|sum|total|\u91d1\u989d|\u94b1|\u603b\u989d|\u52a0\u8d77\u6765|\u53d7\u8d3f\u591a\u5c11/.test(question);
@@ -1788,7 +1862,7 @@ export class FakeModelProvider implements ModelProvider {
               { name: "evidence", description: "Source quote supporting the pair.", required: true },
             ]
         : [
-          { name: "answer_value", description: "Direct answer value.", required: true },
+          { name: "answer_text", description: "Direct answer text.", required: true },
           { name: "gift", description: "Gift/payment/property if the question asks what was given.", required: false },
           { name: "source_name", description: "Relevant source/entity.", required: false },
           { name: "evidence", description: "Source quote supporting the answer.", required: true },
@@ -1847,7 +1921,7 @@ export class FakeModelProvider implements ModelProvider {
       if (/response|court|回应|法院/.test(normalized)) return readLabel(["response", "court_response"]) ?? null;
       if (/finding|认定/.test(normalized)) return readLabel(["finding"]) ?? null;
       if (/status|采纳/.test(normalized)) return readLabel(["status"]) ?? null;
-      if (/answer_value|answer|答案/.test(normalized)) return readLabel(["answer_value", "answer"]) ?? (quote || input.sourceItem.summary);
+      if (/answer_text|answer_value|answer|答案/.test(normalized)) return readLabel(["answer_text", "answer_value", "answer"]) ?? (input.sourceItem.summary || quote);
       if (/evidence|quote|证据/.test(normalized)) return quote || null;
       return readLabel([field]) ?? null;
     };

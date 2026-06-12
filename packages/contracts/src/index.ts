@@ -2496,6 +2496,28 @@ export interface BenchmarkSourceItem {
   summary?: string | undefined;
 }
 
+export interface BenchmarkEvidenceRecordFieldTrace {
+  fieldName: string;
+  value?: unknown;
+  chunkId?: string | undefined;
+  evidenceChunkIds: string[];
+  quote?: string | undefined;
+}
+
+export interface BenchmarkEvidenceRecordTrace {
+  recordName: string;
+  evidenceChunkIds: string[];
+  fields: BenchmarkEvidenceRecordFieldTrace[];
+}
+
+export interface BenchmarkEvidenceTrace {
+  citationChunkIds: string[];
+  selectedChunkIds: string[];
+  evidenceRecordChunkIds: string[];
+  citations: EvidenceCitation[];
+  evidenceRecords: BenchmarkEvidenceRecordTrace[];
+}
+
 export interface BenchmarkAnswerReviewDifference {
   aspect: string;
   expected: string;
@@ -2531,6 +2553,8 @@ export interface BenchmarkRunRecord {
   iteration: number;
   question: string;
   sourceItems?: BenchmarkSourceItem[] | undefined;
+  evidenceTrace?: BenchmarkEvidenceTrace | undefined;
+  testsetAnswers?: string[] | undefined;
   expectedAnswerIncludes: string[];
   expectedAnswerExcludes: string[];
   actualAnswer: string;
@@ -2639,6 +2663,7 @@ export interface BenchmarkRunResult {
   path: string;
   createdAt: string;
   label?: string | undefined;
+  libraryId?: string | undefined;
   methodology: {
     benchmarkTarget: string;
     benchmarkAssumption: string;
@@ -2661,6 +2686,7 @@ export interface BenchmarkRunListEntry {
   path: string;
   createdAt: string;
   label?: string | undefined;
+  libraryId?: string | undefined;
   providerMode: BenchmarkProviderMode;
   providerLabel: string;
   mode: PulseInputMode;

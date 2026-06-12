@@ -605,6 +605,10 @@ export class AgentDatabase {
         library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
         ocr_mode TEXT NOT NULL CHECK (ocr_mode IN ('local', 'cloud'))
       );
+      CREATE TABLE IF NOT EXISTS global_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS documents (
         id TEXT PRIMARY KEY,
         library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
@@ -4901,5 +4905,16 @@ export class AgentDatabase {
       includedVersionIds: JSON.parse(String(result.included_version_ids_json)) as string[],
       publishedAt: String(result.published_at),
     } : undefined;
+  }
+
+  getGlobalSetting(key: string): string | undefined {
+    const result = row(this.sql.prepare("SELECT value FROM global_settings WHERE key = ?"), key);
+    return result ? String(result.value) : undefined;
+  }
+
+  setGlobalSetting(key: string, value: string): void {
+    this.sql.prepare(
+      "INSERT INTO global_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    ).run(key, value);
   }
 }

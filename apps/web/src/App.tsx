@@ -5,6 +5,7 @@ import type {
   Citation,
   Document,
   DocumentVersion,
+  GlobalSettingsView,
   GraphRuleStage,
   GraphRulesSummary,
   GraphRuleTrace,
@@ -192,6 +193,9 @@ export function App() {
     ocrConfigured: boolean;
     authRequired: boolean;
   }>();
+  const [showSettings, setShowSettings] = useState(false);
+  const [globalSettings, setGlobalSettings] = useState<GlobalSettingsView>();
+  const [savingSettings, setSavingSettings] = useState(false);
 
   const loadLibraries = async () => {
     const values = await api.libraries();
@@ -318,7 +322,64 @@ export function App() {
         <footer className="runtime">
           <span className={health?.aiConfigured && health.ocrConfigured ? "online" : "warning"} />
           {health ? `${health.provider} / OCR:${health.ocrProvider}` : "连接服务中..."}
+          <button
+            className="ghost settings-button"
+            onClick={() => {
+              void api.globalSettings().then(setGlobalSettings).catch((cause: Error) => setError(cause.message));
+              setShowSettings(true);
+            }}
+            title="模型设置"
+          >⚙</button>
         </footer>
+        {showSettings && (
+          <div className="settings-modal-overlay" onClick={() => setShowSettings(false)}>
+            <form
+              className="settings-modal"
+              onClick={(event) => event.stopPropagation()}
+              onSubmit={async (event) => {
+                event.preventDefault();
+                const form = event.currentTarget;
+                const data = new FormData(form);
+                const deepseekApiKey = (data.get("deepseekApiKey") as string).trim();
+                const aiBaseUrl = (data.get("aiBaseUrl") as string).trim();
+                const aiChatModel = (data.get("aiChatModel") as string).trim();
+                const input: Record<string, string> = {};
+                if (deepseekApiKey && !deepseekApiKey.includes("***")) input.deepseekApiKey = deepseekApiKey;
+                if (aiBaseUrl) input.aiBaseUrl = aiBaseUrl;
+                if (aiChatModel) input.aiChatModel = aiChatModel;
+                if (Object.keys(input).length === 0) return;
+                setSavingSettings(true);
+                try {
+                  const updated = await api.updateGlobalSettings(input as any);
+                  setGlobalSettings(updated);
+                  void api.health().then(setHealth).catch(() => {});
+                } catch (cause: unknown) {
+                  setError((cause as Error).message);
+                } finally {
+                  setSavingSettings(false);
+                }
+              }}
+            >
+              <h3>模型设置</h3>
+              <label>
+                DeepSeek API Key
+                <input name="deepseekApiKey" defaultValue={globalSettings?.deepseekApiKey ?? ""} placeholder="sk-..." type="password" autoComplete="off" />
+              </label>
+              <label>
+                API Base URL
+                <input name="aiBaseUrl" defaultValue={globalSettings?.aiBaseUrl ?? ""} placeholder="https://api.deepseek.com" />
+              </label>
+              <label>
+                默认模型
+                <input name="aiChatModel" defaultValue={globalSettings?.aiChatModel ?? ""} placeholder="deepseek-v4-flash" />
+              </label>
+              <div className="settings-modal-actions">
+                <button type="submit" disabled={savingSettings}>{savingSettings ? "保存中..." : "保存"}</button>
+                <button type="button" onClick={() => setShowSettings(false)}>取消</button>
+              </div>
+            </form>
+          </div>
+        )}
       </aside>
       <main className="main">
         {error && <div className="banner error" onClick={() => setError(undefined)}>{error}</div>}

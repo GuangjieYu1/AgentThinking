@@ -8,6 +8,20 @@ import { VectorStore } from "./services/vector-store.js";
 
 const config = getConfig();
 const db = new AgentDatabase(config.dataDir);
+
+if (!process.env.AI_API_KEY && !process.env.DEEPSEEK_API_KEY) {
+  const dbApiKey = db.getGlobalSetting("deepseekApiKey");
+  if (dbApiKey) config.aiApiKey = dbApiKey;
+}
+if (!process.env.AI_BASE_URL) {
+  const dbBaseUrl = db.getGlobalSetting("aiBaseUrl");
+  if (dbBaseUrl) config.aiBaseUrl = dbBaseUrl;
+}
+if (!process.env.AI_CHAT_MODEL) {
+  const dbChatModel = db.getGlobalSetting("aiChatModel");
+  if (dbChatModel) config.chatModel = dbChatModel;
+}
+
 const vectors = new VectorStore(db);
 const model = createModelProvider(config);
 const events = new LibraryEventBus();

@@ -17,6 +17,7 @@ import type {
   Document,
   DocumentTreeNode,
   EvidencePack,
+  GlobalSettingsView,
   GraphResponse,
   GraphView,
   IngestJob,
@@ -41,6 +42,7 @@ import type {
   RetrievalUnit,
   SourceStructure,
   SummaryTreeNode,
+  UpdateGlobalSettingsInput,
   V2IndexHealth,
 } from "@agent-thinking/contracts";
 
@@ -70,6 +72,12 @@ export const api = {
     ocrConfigured: boolean;
     authRequired: boolean;
   }>("/health"),
+  globalSettings: () => request<GlobalSettingsView>("/settings"),
+  updateGlobalSettings: (input: UpdateGlobalSettingsInput) =>
+    request<GlobalSettingsView>("/settings", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
   session: () => request<AuthSession>("/auth/session"),
   register: (username: string, password: string, registrationKey: string) =>
     request<AuthSession>("/auth/register", {

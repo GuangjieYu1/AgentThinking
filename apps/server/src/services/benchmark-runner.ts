@@ -263,7 +263,7 @@ function scoreRecord(scenario: EvalScenario, assessment: ReturnType<typeof asses
 }
 
 async function verifyConfiguredModel(model: ModelProvider): Promise<void> {
-  if (!model.configured) throw new Error("Configured benchmark requested, but the model provider is not configured from .env.");
+  if (!model.configured) throw new Error("当前未配置模型，请在设置中填写 API Key 后再运行 benchmark。");
   const tester = (model as { test?: () => Promise<unknown> }).test;
   if (typeof tester === "function") await tester.call(model);
 }
@@ -273,6 +273,20 @@ export async function runBenchmarkSuite(input: BenchmarkRunnerArgs): Promise<Ben
   if (scenarios.length === 0) throw new Error("No benchmark scenarios selected.");
 
   const config = getConfig();
+  if (input.db) {
+    if (!config.aiApiKey) {
+      const dbApiKey = input.db.getGlobalSetting("deepseekApiKey");
+      if (dbApiKey) config.aiApiKey = dbApiKey;
+    }
+    if (!config.aiBaseUrl || config.aiBaseUrl === "https://api.deepseek.com") {
+      const dbBaseUrl = input.db.getGlobalSetting("aiBaseUrl");
+      if (dbBaseUrl) config.aiBaseUrl = dbBaseUrl;
+    }
+    if (!config.chatModel) {
+      const dbChatModel = input.db.getGlobalSetting("aiChatModel");
+      if (dbChatModel) config.chatModel = dbChatModel;
+    }
+  }
   const model = input.provider === "fake" ? new EvalModelProvider() : createModelProvider(config);
   if (input.provider === "configured") await verifyConfiguredModel(model);
 

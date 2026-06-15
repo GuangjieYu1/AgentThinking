@@ -186,9 +186,7 @@ interface PublicDatasetQaFixture {
   evidence: string;
 }
 
-const PUBLIC_EVAL_SINGLE_HOP_COUNT = 80;
-const PUBLIC_EVAL_MULTI_HOP_COUNT = 20;
-const PUBLIC_EVAL_TARGET_COUNT = PUBLIC_EVAL_SINGLE_HOP_COUNT + PUBLIC_EVAL_MULTI_HOP_COUNT;
+const PUBLIC_EVAL_TARGET_COUNT = 25;
 
 function uniqueStrings(values: Array<string | undefined | null>): string[] {
   return [...new Set(values.map((value) => value?.trim() ?? "").filter(Boolean))];
@@ -202,28 +200,17 @@ function publicSourceText(entry: PublicDatasetQaFixture): string {
   return normalizeContextExcerpt(entry.contextExcerpt);
 }
 
-function publicScenarioName(entry: PublicDatasetQaFixture, variantIndex = 0): string {
+function publicScenarioName(entry: PublicDatasetQaFixture): string {
   const slug = entry.questionId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return variantIndex === 0 ? `cmrc2018-${slug}` : `cmrc2018-${slug}-variant-${variantIndex}`;
+  return `cmrc2018-${slug}`;
 }
 
-function publicQuestion(entry: PublicDatasetQaFixture, variantIndex = 0): string {
-  const variants = [
-    entry.question,
-    `根据公开资料，${entry.question}`,
-    `请只依据知识库原文回答：${entry.question}`,
-    `从原文可以判断，${entry.question}`,
-    `关于“${entry.title}”，${entry.question}`,
-  ];
-  return variants[variantIndex % variants.length] ?? entry.question;
-}
-
-function toPublicEvalScenario(entry: PublicDatasetQaFixture, variantIndex = 0): EvalScenario {
+function toPublicEvalScenario(entry: PublicDatasetQaFixture): EvalScenario {
   return {
-    name: publicScenarioName(entry, variantIndex),
+    name: publicScenarioName(entry),
     benchmarkSuites: ["crud_rag", "ragas", "ares"],
     language: "zh",
-    question: publicQuestion(entry, variantIndex),
+    question: entry.question,
     items: [{
       title: entry.title,
       text: publicSourceText(entry),
@@ -243,58 +230,12 @@ function toPublicEvalScenario(entry: PublicDatasetQaFixture, variantIndex = 0): 
   };
 }
 
-function toPublicMultiHopScenario(
-  left: PublicDatasetQaFixture,
-  right: PublicDatasetQaFixture,
-  index: number,
-): EvalScenario {
-  const itemsByContext = new Map<string, EvalItem>();
-  for (const entry of [left, right]) {
-    const context = publicSourceText(entry);
-    if (!itemsByContext.has(context)) {
-      itemsByContext.set(context, {
-        title: entry.title,
-        text: context,
-        summary: entry.contextExcerpt,
-      });
-    }
-  }
-  const items = [...itemsByContext.values()];
-  const expectedAnswers = uniqueStrings([...left.answers, ...right.answers]);
-  return {
-    name: `cmrc2018-multihop-${String(index + 1).padStart(2, "0")}`,
-    benchmarkSuites: ["ragbench", "crud_rag", "ragas", "ares"],
-    language: "zh",
-    question: `请分别回答两个公开资料问题：1）${left.question} 2）${right.question}`,
-    items,
-    expected: {
-      testsetAnswers: expectedAnswers,
-      answerIncludes: expectedAnswers,
-      answerExcludes: [
-        "Evidence is insufficient",
-        "No source-bound records or no required field values were extracted.",
-      ],
-      recordCount: items.length,
-      selectedChunkCount: items.length,
-      gapCount: 0,
-    },
-  };
-}
-
 function buildPublicEvalScenarios(entries: PublicDatasetQaFixture[]): EvalScenario[] {
   if (entries.length === 0) return [];
-  const scenarios: EvalScenario[] = [];
-  for (let index = 0; index < PUBLIC_EVAL_SINGLE_HOP_COUNT; index += 1) {
-    const entry = entries[index % entries.length]!;
-    const variantIndex = Math.floor(index / entries.length);
-    scenarios.push(toPublicEvalScenario(entry, variantIndex));
+  if (entries.length < PUBLIC_EVAL_TARGET_COUNT) {
+    throw new Error(`Public CMRC2018 subset must contain at least ${PUBLIC_EVAL_TARGET_COUNT} real questions.`);
   }
-  for (let index = 0; index < PUBLIC_EVAL_MULTI_HOP_COUNT; index += 1) {
-    const left = entries[index % entries.length]!;
-    const right = entries[(index + Math.max(1, Math.floor(entries.length / 2))) % entries.length]!;
-    scenarios.push(toPublicMultiHopScenario(left, right, index));
-  }
-  return scenarios.slice(0, PUBLIC_EVAL_TARGET_COUNT);
+  return entries.slice(0, PUBLIC_EVAL_TARGET_COUNT).map((entry) => toPublicEvalScenario(entry));
 }
 
 interface EvalCorpusDocument extends EvalItem {

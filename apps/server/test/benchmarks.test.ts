@@ -211,6 +211,8 @@ describe("BenchmarkService", () => {
     expect(markdown).toContain("问题数：1（多跳 0）");
     expect(markdown).toContain("脉冲输入：仅 `question` 字段");
     expect(markdown).toContain("测试集中的 `evidence` / `question_id` / `source_url`");
+    expect(markdown).toContain("25 个原始问题");
+    expect(markdown).not.toContain("100 个公开语料派生问题");
     expect(markdown).not.toContain("`answer_value` / `evidence` / `question_id` / `source_url`");
     expect(markdown).not.toContain("## Methodology");
     expect(markdown).not.toContain("AORI pulse answering over a library");

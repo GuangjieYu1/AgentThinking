@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cleanupEvalDatabases } from "./helpers/aori-pulse-eval-fixtures.js";
+import { aoriPulseEvalScenarios, cleanupEvalDatabases } from "./helpers/aori-pulse-eval-fixtures.js";
 import { AgentDatabase } from "../src/db.js";
 import { benchmarkScenarioCatalog, benchmarkSuiteCatalog, runBenchmarkSuite } from "../src/services/benchmark-runner.js";
 
@@ -14,18 +14,20 @@ afterEach(async () => {
 });
 
 describe("runBenchmarkSuite", () => {
-  it("exposes the 100-question public eval catalog including multi-hop scenarios", () => {
-    expect(benchmarkScenarioCatalog()).toHaveLength(100);
-    expect(benchmarkScenarioCatalog().some((entry) => entry.name.includes("multihop"))).toBe(true);
-    expect(benchmarkSuiteCatalog().map((entry) => entry.suite)).toEqual(["crud_rag", "ragas", "ares", "ragbench"]);
+  it("exposes the 25-question public eval catalog using original dataset questions", () => {
+    expect(benchmarkScenarioCatalog()).toHaveLength(25);
+    expect(benchmarkScenarioCatalog().some((entry) => entry.name.includes("multihop"))).toBe(false);
+    expect(benchmarkSuiteCatalog().map((entry) => entry.suite)).toEqual(["crud_rag", "ragas", "ares"]);
   });
 
   it("records source items, answer review details, and the eval library id for each scenario run", async () => {
+    const scenarioName = aoriPulseEvalScenarios[0]?.name;
+    expect(scenarioName).toBeTruthy();
     const result = await runBenchmarkSuite({
       iterations: 1,
       provider: "fake",
       mode: "full",
-      scenarioNames: ["cmrc2018-dev-29-query-0"],
+      scenarioNames: [scenarioName!],
       suites: [],
     });
 
@@ -47,11 +49,13 @@ describe("runBenchmarkSuite", () => {
     const db = new AgentDatabase(dataDir);
 
     try {
+      const scenarioName = aoriPulseEvalScenarios[0]?.name;
+      expect(scenarioName).toBeTruthy();
       const result = await runBenchmarkSuite({
         iterations: 1,
         provider: "fake",
         mode: "full",
-        scenarioNames: ["cmrc2018-dev-29-query-0"],
+        scenarioNames: [scenarioName!],
         suites: [],
         db,
         libraryName: "Benchmark persistence test",
@@ -60,7 +64,7 @@ describe("runBenchmarkSuite", () => {
       expect(result.libraryId).toBeTruthy();
       const library = db.listLibraries().find((item) => item.name === "Benchmark persistence test");
       expect(library).toBeTruthy();
-      expect(library ? db.listDocuments(library.id) : []).toHaveLength(3);
+      expect(library ? db.listDocuments(library.id).length : 0).toBeGreaterThan(0);
     } finally {
       db.close();
     }

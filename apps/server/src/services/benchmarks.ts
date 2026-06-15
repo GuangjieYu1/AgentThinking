@@ -24,7 +24,7 @@ const legacyEnglishBenchmarkMethodology = {
 
 const readableDefaultChineseBenchmarkMethodology: BenchmarkRunResult["methodology"] = {
   benchmarkTarget: "本基准测试使用公开 CMRC 2018 开发集小型公开语料，先对 contextExcerpt 去重并建立一个共享 AORI 知识库，测试时仅向 AORI 脉冲输入 question 字段。",
-  benchmarkAssumption: "当前默认生成 100 个公开语料派生问题，其中包含单跳问题和跨问题多跳问题；标准答案只用于评分和报告展示，不会输入给模型。",
+  benchmarkAssumption: "当前默认使用公开数据集中的 25 个原始问题，不做问题改写，也不拼接自造多跳问题；标准答案只用于评分和报告展示，不会输入给模型。",
   caveat: "本报告是本地回归评测，不是 CMRC 2018 全量开发集或隐藏测试集的官方分数，也不应直接与原始 leaderboard 对比。",
 };
 

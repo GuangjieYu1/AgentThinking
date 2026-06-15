@@ -63,6 +63,7 @@ export function BenchmarkWorkspace({
   const [mode, setMode] = useState<CreateBenchmarkRunInput["mode"]>("full");
   const [iterations, setIterations] = useState(1);
   const [label, setLabel] = useState("");
+  const [expandedSuite, setExpandedSuite] = useState<BenchmarkSuite>();
   const [expandedScenario, setExpandedScenario] = useState<string>();
 
   const load = async () => {
@@ -313,6 +314,7 @@ export function BenchmarkWorkspace({
                       <span>ARES Relevance</span>
                       <span>Avg Duration</span>
                       <span>Avg Tokens</span>
+                      <span>Report</span>
                     </div>
                     {activeSuiteRows.map(({ suite, current, previous, meta }) => (
                       <div className="benchmark-table-row" key={suite}>
@@ -327,10 +329,66 @@ export function BenchmarkWorkspace({
                         <div><strong>{percent(current?.avgAresAnswerRelevance)}</strong>{compareRun && <small>{delta(current?.avgAresAnswerRelevance, previous?.avgAresAnswerRelevance) ?? "-"}</small>}</div>
                         <div><strong>{decimal(current?.avgDurationMs)}ms</strong></div>
                         <div><strong>{integer(current?.avgTotalTokens)}</strong></div>
+                        <div>
+                          <button
+                            type="button"
+                            className={expandedSuite === suite ? "selected" : ""}
+                            onClick={() => setExpandedSuite((currentExpanded) => currentExpanded === suite ? undefined : suite)}
+                          >
+                            {expandedSuite === suite ? "收起" : "展开"}
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
                 </div>
+                {expandedSuite && (() => {
+                  const suiteMeta = visibleSuites.find((entry) => entry.suite === expandedSuite);
+                  const suiteRun = activeRun.benchmarkSuites.find((entry) => entry.suite === expandedSuite);
+                  const suiteRecords = activeRun.records.filter((record) => record.suites.includes(expandedSuite));
+                  if (!suiteMeta || !suiteRun) return null;
+                  return (
+                    <div className="benchmark-report-card">
+                      <div className="panel-section-heading">
+                        <h3>{suiteMeta.label} 报告</h3>
+                        <span>{suiteRun.runs} runs | {integer(suiteRun.avgTotalTokens)} tok | {decimal(suiteRun.avgDurationMs)}ms</span>
+                      </div>
+                      <div className="benchmark-report-grid">
+                        <section>
+                          <h4>套件定位</h4>
+                          <p>{kindLabel[suiteMeta.kind]} | {suiteMeta.focus.join(" / ")}</p>
+                        </section>
+                        <section>
+                          <h4>套件总览</h4>
+                          <ul>
+                            <li>strict：{percent(suiteRun.strictPassRate)}</li>
+                            <li>coverage：{percent(suiteRun.avgAnswerCoverage)}</li>
+                            <li>citation recall：{percent(suiteRun.avgCitationRecall)}</li>
+                            <li>RAGAS faithfulness：{percent(suiteRun.avgRagasFaithfulness)}</li>
+                            <li>ARES relevance：{percent(suiteRun.avgAresAnswerRelevance)}</li>
+                          </ul>
+                        </section>
+                      </div>
+                      <div className="benchmark-suite-scenarios">
+                        {suiteRecords.map((record) => (
+                          <article className="benchmark-suite-scenario" key={`${record.scenario}-${record.iteration}`}>
+                            <div className="benchmark-suite-scenario-head">
+                              <div>
+                                <strong>{record.scenario}</strong>
+                                <small>{record.language} | {record.modelCalls} calls | {integer(record.totalTokens)} tok | {decimal(record.durationMs)}ms</small>
+                              </div>
+                              <span>{record.strictPass ? "strict pass" : "strict fail"}</span>
+                            </div>
+                            <p><strong>问题：</strong>{record.question}</p>
+                            <p><strong>模型回答：</strong>{record.actualAnswer}</p>
+                            {record.answerMisses.length > 0 && <p><strong>未命中：</strong>{record.answerMisses.join(" | ")}</p>}
+                            {record.answerReview && <p><strong>AI评审：</strong>{reviewVerdictLabel[record.answerReview.verdict]}，{record.answerReview.summary}</p>}
+                          </article>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
 
               <div className="workspace-panel benchmark-scenario-table">

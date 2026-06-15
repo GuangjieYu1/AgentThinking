@@ -1461,6 +1461,47 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
+.benchmark-suite-scenarios {
+  display: grid;
+  gap: 10px;
+}
+.benchmark-suite-scenario {
+  border: 1px solid #20304a;
+  background: #101b2f;
+  border-radius: 8px;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+.benchmark-suite-scenario-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+.benchmark-suite-scenario-head strong {
+  color: #dce7f5;
+  font-size: 13px;
+}
+.benchmark-suite-scenario-head small {
+  color: #8ea0ba;
+  line-height: 1.45;
+  display: block;
+}
+.benchmark-suite-scenario-head span {
+  border: 1px solid #294159;
+  border-radius: 999px;
+  padding: 4px 8px;
+  color: #9ef0db;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.benchmark-suite-scenario p {
+  margin: 0;
+  color: #b7c7df;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
 .benchmark-report-grid-extended {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -1673,6 +1714,9 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   }
   .benchmark-report-grid {
     grid-template-columns: 1fr;
+  }
+  .benchmark-suite-scenario-head {
+    flex-direction: column;
   }
   .benchmark-table-row,
   .benchmark-scenario-table .benchmark-table-row {

@@ -31,10 +31,14 @@ interface MetricRequest {
 
 interface SemanticQuestionPlan {
   questionType: SemanticQuestionType;
+  tableId?: string | undefined;
   tablePurpose?: TablePurpose | undefined;
   metricRequests?: MetricRequest[] | undefined;
+  boundaryTableIds?: string[] | undefined;
+  negativeFactIds?: string[] | undefined;
   questionTargetPatterns?: string[] | undefined;
   questionScopePatterns?: string[] | undefined;
+  eventIds?: string[] | undefined;
   eventPatterns?: string[] | undefined;
   excludedEventPatterns?: string[] | undefined;
 }
@@ -112,7 +116,115 @@ function normalizeText(value: string): string {
 }
 
 function normalizeKey(value: string): string {
-  return normalizeText(value).toLowerCase().replace(/[“”"'`‘’·,.;:()（）【】\[\]\-_/\\]/g, "");
+  return normalizeText(value).toLowerCase().replace(/[\s“”"'`‘’·,.;:()（）【】《》？！?，。、；：\[\]\-_/\\]/g, "");
+}
+
+function withoutUnitWords(value: string): string {
+  return value
+    .replace(/人民币/g, "")
+    .replace(/亿元|万元|元/g, "");
+}
+
+function stripSemanticSuffix(value: string): string {
+  return value
+    .replace(/(详细信息|使用情况|变更情况|相关事项|相关情况|构成|情况|事项|类别|金额|价值|余额|总额|简称|项目|贷款|担保|影响)$/u, "");
+}
+
+function semanticTerms(...values: Array<string | undefined | null>): string[] {
+  const terms: string[] = [];
+  const pushTerm = (candidate: string) => {
+    const normalized = normalizeKey(candidate);
+    if (normalized.length >= 3) terms.push(normalized);
+  };
+
+  for (const value of values) {
+    const normalized = normalizeText(value ?? "");
+    if (!normalized) continue;
+    const pieces = [
+      normalized,
+      ...normalized.split(/[\s|、，,。；;：:（）()【】《》"'“”‘’]+/u),
+    ];
+    for (const piece of pieces) {
+      const key = normalizeKey(piece);
+      if (!key) continue;
+      pushTerm(key);
+      const unitless = withoutUnitWords(key);
+      pushTerm(unitless);
+      pushTerm(stripSemanticSuffix(unitless));
+      pushTerm(stripSemanticSuffix(key));
+    }
+  }
+  return uniqueStrings(terms);
+}
+
+function questionTerms(question: string): string[] {
+  const stopPatterns = [
+    /报告期内/g,
+    /报告中/g,
+    /本报告/g,
+    /这份报告/g,
+    /本公司/g,
+    /公司/g,
+    /用户问/g,
+    /如果/g,
+    /请/g,
+    /是否/g,
+    /存在/g,
+    /有没有/g,
+    /有哪些/g,
+    /哪些/g,
+    /什么/g,
+    /多少/g,
+    /分别/g,
+    /一共/g,
+    /合计/g,
+    /计算过程/g,
+    /列出/g,
+    /验证/g,
+    /为什么/g,
+    /不能/g,
+    /能支持/g,
+    /不能支持/g,
+    /支持/g,
+    /结论/g,
+    /明确/g,
+    /写明/g,
+    /包括/g,
+    /构成/g,
+    /类别/g,
+    /项目/g,
+    /分项/g,
+    /加总/g,
+    /闭合/g,
+    /影响/g,
+    /导致/g,
+    /调整事项/g,
+    /涉及/g,
+  ];
+  const stripped = stopPatterns.reduce((text, pattern) => text.replace(pattern, " "), normalizeText(question));
+  return semanticTerms(question, stripped);
+}
+
+function scoreTermsInText(terms: string[], text: string): number {
+  const haystack = normalizeKey(text);
+  if (!haystack) return 0;
+  return terms.reduce((score, term) => {
+    if (!term) return score;
+    if (haystack.includes(term)) return score + 20 + Math.min(term.length, 20);
+    if (term.includes(haystack) && haystack.length >= 4) return score + 8 + Math.min(haystack.length, 12);
+    return score;
+  }, 0);
+}
+
+function scoreCandidateAgainstQuestion(questionKey: string, terms: string[], candidateText: string): number {
+  const candidateKey = normalizeKey(candidateText);
+  if (!candidateKey) return 0;
+  const termScore = scoreTermsInText(terms, candidateText);
+  const candidateTerms = semanticTerms(candidateText);
+  const reverseScore = candidateTerms.reduce((score, term) => questionKey.includes(term)
+    ? score + 18 + Math.min(term.length, 18)
+    : score, 0);
+  return termScore + reverseScore;
 }
 
 function truncateText(value: string, max: number): string {
@@ -149,109 +261,6 @@ function convertUnit(value: number, from: "元" | "万元" | "亿元", to: "元"
 function formatNumber(value: number): string {
   const rounded = Math.round((value + Number.EPSILON) * 10000) / 10000;
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(4).replace(/\.?0+$/, "");
-}
-
-function questionPlanFor(question: string): SemanticQuestionPlan | undefined {
-  const normalized = normalizeText(question);
-  if (normalized.includes("存续债券余额") && normalized.includes("合计")) {
-    return {
-      questionType: "numeric_table_aggregation",
-      tablePurpose: "bond_balance",
-      metricRequests: [{
-        label: "存续债券余额",
-        columnPatterns: ["债券余额", "余额"],
-        unit: "亿元",
-        explainCalculation: normalized.includes("计算过程"),
-      }],
-    };
-  }
-  if (normalized.includes("募集资金总额") && normalized.includes("合计")) {
-    return {
-      questionType: "numeric_table_aggregation",
-      tablePurpose: "fundraising_usage",
-      metricRequests: [{
-        label: "募集资金总额",
-        columnPatterns: ["募集资金总额", "募集总金额"],
-        unit: "亿元",
-      }],
-    };
-  }
-  if (normalized.includes("存续债券余额") && normalized.includes("募集资金总额") && normalized.includes("区别")) {
-    return {
-      questionType: "concept_boundary",
-      tablePurpose: "unknown",
-    };
-  }
-  if (normalized.includes("募集资金用途变更")) {
-    return {
-      questionType: "negative_fact",
-      questionTargetPatterns: ["募集资金用途变更", "募集资金用途"],
-      questionScopePatterns: ["报告期内"],
-    };
-  }
-  if (normalized.includes("不涉及")) {
-    return {
-      questionType: "negative_fact",
-      questionTargetPatterns: ["不涉及"],
-      questionScopePatterns: ["报告中", "报告期内"],
-    };
-  }
-  if (normalized.includes("解释第17号")) {
-    return {
-      questionType: "accounting_event_analysis",
-      eventPatterns: ["解释第17号", "企业会计准则解释第17号", "会计政策变更"],
-      excludedEventPatterns: normalized.includes("差错更正") ? [] : ["会计差错更正"],
-    };
-  }
-  if (normalized.includes("会计差错更正")) {
-    return {
-      questionType: "accounting_event_analysis",
-      eventPatterns: ["会计差错更正"],
-      excludedEventPatterns: ["解释第17号"],
-    };
-  }
-  if (normalized.includes("受限资产")) {
-    return {
-      questionType: "exhaustive_list",
-      tablePurpose: "restricted_assets",
-      metricRequests: [{
-        label: "受限资产金额",
-        columnPatterns: ["账面价值", "金额", "期末账面价值"],
-        unit: "万元",
-      }],
-    };
-  }
-  if (normalized.includes("受限货币资金")) {
-    return {
-      questionType: "exhaustive_list",
-      tablePurpose: "restricted_cash",
-      metricRequests: [{
-        label: "受限货币资金金额",
-        columnPatterns: ["账面价值", "金额", "期末账面价值"],
-        unit: "万元",
-      }],
-    };
-  }
-  if (normalized.includes("飞行学员贷款") && normalized.includes("担保")) {
-    return {
-      questionType: "numeric_table_aggregation",
-      tablePurpose: "guarantee",
-      metricRequests: [{
-        label: "担保总额",
-        columnPatterns: ["担保总额", "担保金额"],
-        unit: "万元",
-      }, {
-        label: "已发放贷款",
-        columnPatterns: ["已发放贷款", "发放贷款"],
-        unit: "万元",
-      }, {
-        label: "实际履责金额",
-        columnPatterns: ["实际履责金额", "履责金额"],
-        unit: "万元",
-      }],
-    };
-  }
-  return undefined;
 }
 
 function splitDelimitedLine(line: string): string[] {
@@ -636,15 +645,16 @@ function sentenceSplit(text: string): string[] {
 function extractNegativeFacts(chunks: Chunk[]): NegativeFactUnit[] {
   const negatives: NegativeFactUnit[] = [];
   for (const chunk of chunks) {
-    for (const sentence of sentenceSplit(chunk.text)) {
-      if (!/(不存在|未发生|没有|无|不涉及)/.test(sentence)) continue;
+    const text = chunk.text.replace(/([^\s])\s*\n\s*\n\s*([^\s])/gu, "$1$2");
+    for (const sentence of sentenceSplit(text)) {
+      if (!/(不存在|未发生|未出现|未发现|没有|无|不涉及)/.test(sentence)) continue;
       const scope = sentence.includes("报告期内") ? "报告期内" : sentence.includes("本报告") ? "报告中" : "";
       negatives.push({
         id: `negative-${chunk.id}-${negatives.length + 1}`,
         target: sentence,
         scope,
         statement: sentence,
-        certainty: /(不存在|不涉及|未发生)/.test(sentence) ? "explicit" : "implicit",
+        certainty: /(不存在|不涉及|未发生|未出现|未发现)/.test(sentence) ? "explicit" : "implicit",
         chunkId: chunk.id,
       });
     }
@@ -963,12 +973,19 @@ function buildMultiMetricAnswer(question: string, requests: MetricRequest[], tab
   };
 }
 
+function metricBoundaryLabel(table: ParsedTable): string {
+  const metricColumn = numericColumns(table).find((column) => !columnLooksLikeIdentifier(column));
+  return metricColumn ? metricLabelFor(table, metricColumn) : table.title;
+}
+
 function buildConceptBoundaryAnswer(balanceTable: ParsedTable | undefined, fundraisingTable: ParsedTable | undefined): PulseAnswerOutput | undefined {
   if (!balanceTable || !fundraisingTable) return undefined;
+  const leftMetric = metricBoundaryLabel(balanceTable);
+  const rightMetric = metricBoundaryLabel(fundraisingTable);
   return {
     answer:
-      `“存续债券余额”来自《${balanceTable.title}》，反映报告期末仍在存续的债券余额；` +
-      `“募集资金总额”来自《${fundraisingTable.title}》，反映债务融资工具募集到的资金总额。` +
+      `“${leftMetric}”来自《${balanceTable.title}》；` +
+      `“${rightMetric}”来自《${fundraisingTable.title}》。` +
       "它们对应的表、指标含义和报告口径不同，所以不能混算。",
     summary: "Concept-boundary answer contrasted the matched balance and fundraising tables.",
     diagnostics: {
@@ -986,7 +1003,6 @@ function buildConceptBoundaryRecords(balanceTable: ParsedTable, fundraisingTable
     recordId: string,
     table: ParsedTable,
     metricName: string,
-    meaning: string,
   ): EvidenceRecord | undefined => {
     const chunkId = table.chunkIds[0] ?? "";
     const quote = table.rows[0] ? sourceQuoteForRow(table.rows[0]) : table.title;
@@ -997,7 +1013,7 @@ function buildConceptBoundaryRecords(balanceTable: ParsedTable, fundraisingTable
       fields: {
         table_title: recordField(table.title, chunkId, quote),
         metric_name: recordField(metricName, chunkId, quote),
-        meaning: recordField(meaning, chunkId, quote),
+        meaning: recordField(`Metric ${metricName} is scoped to source table ${table.title}.`, chunkId, quote),
         evidence: recordField(quote, chunkId, quote),
       },
       evidenceChunkIds: [chunkId],
@@ -1007,14 +1023,12 @@ function buildConceptBoundaryRecords(balanceTable: ParsedTable, fundraisingTable
     makeRecord(
       `${balanceTable.id}-boundary`,
       balanceTable,
-      "存续债券余额",
-      "报告期末仍在存续的债券余额",
+      metricBoundaryLabel(balanceTable),
     ),
     makeRecord(
       `${fundraisingTable.id}-boundary`,
       fundraisingTable,
-      "募集资金总额",
-      "债务融资工具募集到的资金总额",
+      metricBoundaryLabel(fundraisingTable),
     ),
   ].flatMap((record) => record ? [record] : []);
 }
@@ -1054,6 +1068,18 @@ function buildNegativeFactAnswer(question: string, negativeFacts: NegativeFactUn
     return {
       answer: statements.join("；"),
       summary: `Negative-fact routing listed ${facts.length} explicit statement(s).`,
+      diagnostics: {
+        answerPipeline: "aori_demand",
+        deterministicAnswer: true,
+        semanticQuestionType: "negative_fact",
+        warnings: [],
+      },
+    };
+  }
+  if (facts.length > 1) {
+    return {
+      answer: `不存在。${facts.map((fact) => fact.statement).join("；")}`,
+      summary: `Negative-fact routing found ${facts.length} explicit source statement(s) and stopped expansion.`,
       diagnostics: {
         answerPipeline: "aori_demand",
         deterministicAnswer: true,
@@ -1206,22 +1232,270 @@ function chunkExists(id: string, map: Map<string, Chunk>): boolean {
   return map.has(id);
 }
 
+function questionHas(question: string, ...terms: string[]): boolean {
+  const key = normalizeKey(question);
+  return terms.some((term) => key.includes(normalizeKey(term)));
+}
+
+function questionAsksForList(question: string): boolean {
+  const explicitList = questionHas(question, "哪些", "有哪些", "包括", "构成", "明细", "项目", "类别");
+  if (explicitList) return true;
+  return questionHas(question, "列出") && !questionHas(question, "计算过程");
+}
+
+function questionAsksForTotal(question: string): boolean {
+  return questionHas(question, "合计", "总额", "总计", "一共", "加总", "多少");
+}
+
+function questionAsksForBoundary(question: string): boolean {
+  return questionHas(question, "区别", "不能混算", "混算", "口径", "差异", "为什么不能");
+}
+
+function questionAsksForNegativeFact(question: string): boolean {
+  return questionHas(question, "是否存在", "是否有", "有没有", "不存在", "不涉及", "未发生", "无", "不能支持");
+}
+
+function questionAsksForEvent(question: string): boolean {
+  return questionHas(question, "影响", "调整事项", "重分类", "变更", "更正", "闭合");
+}
+
+function questionAsksForCalculation(question: string): boolean {
+  return questionHas(question, "计算过程", "怎么算");
+}
+
+function defaultMetricUnitForTable(table: ParsedTable): MetricRequest["unit"] | undefined {
+  return preferredUnitFromText(`${table.title} ${table.headingPath ?? ""}`)
+    ?? table.unitHints[0]
+    ?? table.rows.flatMap((row) => Object.values(row.cells).map((cell) => cell.unit)).find((unit): unit is MetricRequest["unit"] => Boolean(unit));
+}
+
+function maxNumericValue(table: ParsedTable): number {
+  return Math.max(
+    0,
+    ...numericColumns(table)
+      .filter((column) => !columnLooksLikeIdentifier(column))
+      .flatMap((column) => table.rows.map((row) => Math.abs(row.cells[column]?.numericValue ?? 0))),
+  );
+}
+
+function outputUnitForTable(table: ParsedTable, question: string): MetricRequest["unit"] | undefined {
+  const requestedUnit = preferredUnitFromText(question);
+  if (requestedUnit) return requestedUnit;
+  const sourceUnit = defaultMetricUnitForTable(table);
+  if (sourceUnit === "元" && maxNumericValue(table) >= 10_000) return "万元";
+  return sourceUnit;
+}
+
+function numericColumns(table: ParsedTable): string[] {
+  return table.columns.filter((column) => table.rows.some((row) => row.cells[column]?.numericValue !== undefined));
+}
+
+function columnLooksLikeIdentifier(column: string): boolean {
+  const key = normalizeKey(column);
+  return key.includes("简称") || key.includes("代码") || key.includes("名称") || key.includes("对象");
+}
+
+function metricLabelFor(table: ParsedTable, column: string): string {
+  const cleanColumn = normalizeText(column).replace(/\([^)]*\)/g, "").replace(/（[^）]*）/g, "").trim();
+  if (cleanColumn && !["金额", "账面价值", "年末账面价值", "期末账面价值"].includes(cleanColumn)) return cleanColumn;
+  const base = stripSemanticSuffix(normalizeText(table.title)).trim();
+  return `${base || table.title}${cleanColumn || "金额"}`;
+}
+
+function scoreTableForQuestion(table: ParsedTable, terms: string[], questionKey: string): number {
+  const rowLabels = table.rows.slice(0, 12).map((row) => row.label).join(" ");
+  const columns = table.columns.join(" ");
+  return scoreCandidateAgainstQuestion(questionKey, terms, table.title) * 3
+    + scoreCandidateAgainstQuestion(questionKey, terms, columns) * 2
+    + scoreCandidateAgainstQuestion(questionKey, terms, rowLabels)
+    + scoreCandidateAgainstQuestion(questionKey, terms, table.headingPath ?? "") * 0.5;
+}
+
+function scoreColumnForQuestion(table: ParsedTable, column: string, terms: string[], questionKey: string): number {
+  const values = table.rows.slice(0, 6).map((row) => `${row.label} ${row.cells[column]?.raw ?? ""}`).join(" ");
+  return scoreCandidateAgainstQuestion(questionKey, terms, `${table.title} ${column} ${values}`);
+}
+
+function selectTablesForQuestion(tables: ParsedTable[], question: string): ParsedTable[] {
+  const terms = questionTerms(question);
+  const questionKey = normalizeKey(question);
+  return tables
+    .map((table) => ({ table, score: scoreTableForQuestion(table, terms, questionKey) }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || left.table.title.localeCompare(right.table.title, "zh-CN"))
+    .map((entry) => entry.table);
+}
+
+function selectMetricRequests(table: ParsedTable, question: string): MetricRequest[] {
+  const terms = questionTerms(question);
+  const questionKey = normalizeKey(question);
+  const unit = outputUnitForTable(table, question);
+  if (!unit) return [];
+  const columns = numericColumns(table).filter((column) => !columnLooksLikeIdentifier(column));
+  if (columns.length === 0) return [];
+  const scored = columns
+    .map((column) => ({ column, score: scoreColumnForQuestion(table, column, terms, questionKey) }))
+    .sort((left, right) => right.score - left.score || left.column.localeCompare(right.column, "zh-CN"));
+  const positive = scored.filter((entry) => entry.score > 0);
+  const selected = positive.length > 0
+    ? (questionAsksForTotal(question) && positive.length > 1 ? positive : positive.slice(0, 1))
+    : (questionAsksForTotal(question) || questionAsksForList(question) ? scored.slice(0, 1) : []);
+  return selected.map((entry) => ({
+    label: metricLabelFor(table, entry.column),
+    columnPatterns: semanticTerms(entry.column, metricLabelFor(table, entry.column)),
+    unit,
+    ...(questionAsksForCalculation(question) ? { explainCalculation: true } : {}),
+  }));
+}
+
+function buildTableQuestionPlan(question: string, tables: ParsedTable[]): SemanticQuestionPlan | undefined {
+  const table = selectTablesForQuestion(tables, question)[0];
+  if (!table) return undefined;
+  const metricRequests = selectMetricRequests(table, question);
+  if (metricRequests.length === 0) return undefined;
+  const listLike = questionAsksForList(question);
+  const totalLike = questionAsksForTotal(question);
+  if (!listLike && !totalLike) return undefined;
+  return {
+    questionType: listLike ? "exhaustive_list" : "numeric_table_aggregation",
+    tableId: table.id,
+    tablePurpose: table.purpose,
+    metricRequests,
+  };
+}
+
+function buildBoundaryQuestionPlan(question: string, tables: ParsedTable[]): SemanticQuestionPlan | undefined {
+  if (!questionAsksForBoundary(question)) return undefined;
+  const selected = selectTablesForQuestion(tables, question).slice(0, 2);
+  if (selected.length < 2 || !selected[0] || !selected[1]) return undefined;
+  return {
+    questionType: "concept_boundary",
+    tablePurpose: "unknown",
+    boundaryTableIds: [selected[0].id, selected[1].id],
+  };
+}
+
+function broaderNegativeTerms(terms: string[]): string[] {
+  const relatedTerms = new Map<string, string[]>([
+    [normalizeKey("违约"), [normalizeKey("逾期"), normalizeKey("未偿还")]],
+    [normalizeKey("逾期"), [normalizeKey("违约"), normalizeKey("未偿还")]],
+    [normalizeKey("债务融资工具"), [normalizeKey("有息债务"), normalizeKey("债券")]],
+    [normalizeKey("债券"), [normalizeKey("债务融资工具"), normalizeKey("有息债务")]],
+    [normalizeKey("募集资金用途"), [normalizeKey("变更债券募集资金用途"), normalizeKey("特定用途")]],
+  ]);
+  return uniqueStrings([
+    ...terms,
+    ...terms.flatMap((term) => relatedTerms.get(term) ?? []),
+  ]);
+}
+
+function requiredNegativeIntentTerms(question: string): string[] {
+  if (questionHas(question, "违约", "逾期", "未偿还")) {
+    return [normalizeKey("违约"), normalizeKey("逾期"), normalizeKey("未偿还")];
+  }
+  return [];
+}
+
+function matchingNegativeFacts(question: string, negativeFacts: NegativeFactUnit[]): NegativeFactUnit[] {
+  const questionKey = normalizeKey(question);
+  const terms = broaderNegativeTerms(questionTerms(question));
+  const listAllExplicit = questionHas(question, "不涉及") && questionAsksForList(question);
+  const requiredIntentTerms = requiredNegativeIntentTerms(question);
+  const scored = negativeFacts
+    .map((fact) => {
+      const haystack = `${fact.target} ${fact.scope} ${fact.statement}`;
+      const haystackKey = normalizeKey(haystack);
+      if (requiredIntentTerms.length > 0 && !requiredIntentTerms.some((term) => haystackKey.includes(term))) {
+        return { fact, score: 0 };
+      }
+      const score = listAllExplicit && normalizeKey(fact.statement).includes(normalizeKey("不涉及"))
+        ? 100
+        : scoreCandidateAgainstQuestion(questionKey, terms, haystack);
+      return { fact, score };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || left.fact.id.localeCompare(right.fact.id));
+  if (requiredIntentTerms.length > 0) return scored.map((entry) => entry.fact);
+  if (listAllExplicit) return scored.map((entry) => entry.fact);
+  const bestScore = scored[0]?.score ?? 0;
+  return scored.filter((entry) => entry.score >= Math.max(1, bestScore * 0.6)).map((entry) => entry.fact);
+}
+
+function buildNegativeQuestionPlan(question: string, negativeFacts: NegativeFactUnit[]): SemanticQuestionPlan | undefined {
+  if (!questionAsksForNegativeFact(question)) return undefined;
+  const facts = matchingNegativeFacts(question, negativeFacts);
+  if (facts.length === 0) return undefined;
+  return {
+    questionType: "negative_fact",
+    negativeFactIds: facts.map((fact) => fact.id),
+    questionTargetPatterns: questionTerms(question),
+  };
+}
+
+function scoreEventForQuestion(event: AccountingEventUnit, question: string): number {
+  const terms = questionTerms(question);
+  const questionKey = normalizeKey(question);
+  return scoreCandidateAgainstQuestion(
+    questionKey,
+    terms,
+    `${event.eventName} ${event.sourceSectionTitle} ${event.eventCategory} ${event.affectedItems.join(" ")} ${event.excludes.join(" ")}`,
+  );
+}
+
+function buildEventQuestionPlan(question: string, events: AccountingEventUnit[]): SemanticQuestionPlan | undefined {
+  if (!questionAsksForEvent(question)) return undefined;
+  const scored = events
+    .map((event) => ({ event, score: scoreEventForQuestion(event, question) }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score || left.event.eventName.localeCompare(right.event.eventName, "zh-CN"));
+  const event = scored[0]?.event;
+  if (!event) return undefined;
+  return {
+    questionType: "accounting_event_analysis",
+    eventIds: [event.id],
+    eventPatterns: semanticTerms(event.eventName, event.sourceSectionTitle),
+  };
+}
+
+function questionPlanFor(input: {
+  question: string;
+  tables: ParsedTable[];
+  negativeFacts: NegativeFactUnit[];
+  events: AccountingEventUnit[];
+}): SemanticQuestionPlan | undefined {
+  return buildBoundaryQuestionPlan(input.question, input.tables)
+    ?? buildNegativeQuestionPlan(input.question, input.negativeFacts)
+    ?? buildEventQuestionPlan(input.question, input.events)
+    ?? buildTableQuestionPlan(input.question, input.tables);
+}
+
 export function buildSemanticDemandAnswer(input: {
   question: string;
   map: AoriTraversalMap;
   chunks: Chunk[];
 }): SemanticDemandAnswerResult | undefined {
-  const plan = questionPlanFor(input.question);
-  if (!plan) return undefined;
-
   const parsedTables = extractSemanticTablesFromChunks(input.chunks);
   const negativeFacts = extractNegativeFacts(input.chunks);
   const events = extractExpandedAccountingEvents(input.chunks);
+  const plan = questionPlanFor({
+    question: input.question,
+    tables: parsedTables,
+    negativeFacts,
+    events,
+  });
+  if (!plan) return undefined;
   const existingChunks = chunksById(input.chunks);
 
   if (plan.questionType === "concept_boundary") {
-    const balanceTable = parsedTables.find((table) => table.purpose === "bond_balance");
-    const fundraisingTable = parsedTables.find((table) => table.purpose === "fundraising_usage");
+    const boundaryTables = (plan.boundaryTableIds ?? [])
+      .map((id) => parsedTables.find((table) => table.id === id))
+      .filter((table): table is ParsedTable => Boolean(table));
+    const [balanceTable, fundraisingTable] = boundaryTables.length >= 2
+      ? boundaryTables
+      : [
+        parsedTables.find((table) => table.purpose === "bond_balance"),
+        parsedTables.find((table) => table.purpose === "fundraising_usage"),
+      ];
     const answer = buildConceptBoundaryAnswer(
       balanceTable,
       fundraisingTable,
@@ -1238,12 +1512,15 @@ export function buildSemanticDemandAnswer(input: {
   }
 
   if (plan.questionType === "negative_fact") {
-    const targetFacts = negativeFacts.filter((fact) => {
-      const haystack = normalizeKey(`${fact.target} ${fact.scope} ${fact.statement}`);
-      const targetMatch = plan.questionTargetPatterns?.some((pattern) => haystack.includes(normalizeKey(pattern))) ?? true;
-      const scopeMatch = plan.questionScopePatterns?.some((pattern) => haystack.includes(normalizeKey(pattern))) ?? true;
-      return targetMatch && scopeMatch;
-    });
+    const selectedIds = new Set(plan.negativeFactIds ?? []);
+    const targetFacts = selectedIds.size > 0
+      ? negativeFacts.filter((fact) => selectedIds.has(fact.id))
+      : negativeFacts.filter((fact) => {
+        const haystack = normalizeKey(`${fact.target} ${fact.scope} ${fact.statement}`);
+        const targetMatch = plan.questionTargetPatterns?.some((pattern) => haystack.includes(normalizeKey(pattern))) ?? true;
+        const scopeMatch = plan.questionScopePatterns?.some((pattern) => haystack.includes(normalizeKey(pattern))) ?? true;
+        return targetMatch && scopeMatch;
+      });
     if (targetFacts.length === 0) return undefined;
     const records = buildNegativeFactRecords(targetFacts);
     return {
@@ -1256,7 +1533,10 @@ export function buildSemanticDemandAnswer(input: {
   }
 
   if (plan.questionType === "accounting_event_analysis") {
-    const matched = events.find((event) => eventMatchesQuestion(event, plan));
+    const selectedIds = new Set(plan.eventIds ?? []);
+    const matched = selectedIds.size > 0
+      ? events.find((event) => selectedIds.has(event.id))
+      : events.find((event) => eventMatchesQuestion(event, plan));
     if (!matched) return undefined;
     const records = buildEventRecords(matched);
     if (records.length === 0) return undefined;
@@ -1269,7 +1549,9 @@ export function buildSemanticDemandAnswer(input: {
     };
   }
 
-  const table = matchingTables(parsedTables, plan)[0];
+  const table = plan.tableId
+    ? parsedTables.find((entry) => entry.id === plan.tableId)
+    : matchingTables(parsedTables, plan)[0];
   if (!table || !plan.metricRequests || plan.metricRequests.length === 0) return undefined;
 
   const grouped = new Map<string, EvidenceRecord[]>();

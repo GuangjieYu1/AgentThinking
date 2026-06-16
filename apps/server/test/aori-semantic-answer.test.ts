@@ -191,6 +191,16 @@ describe("AORI semantic answering", () => {
       const notInvolved = await engine.create(library.id, "报告中有哪些事项明确写明“不涉及”？");
       expect(notInvolved.pulse.answer).toContain("不涉及");
       expect(notInvolved.pulse.metrics?.modelCalls).toBe(0);
+
+      const paraphrasedBalance = await engine.create(library.id, "请把当前存续的债券余额总计出来，并说明怎么算。");
+      expect(paraphrasedBalance.pulse.answer).toContain("83.6");
+      expect(paraphrasedBalance.pulse.answer).toContain("15 + 5.6 + 10 + 21 + 24 + 8 = 83.6");
+      expect(paraphrasedBalance.pulse.metrics?.modelCalls).toBe(0);
+
+      const debtDefault = await engine.create(library.id, "南航集团报告期内债务融资工具有没有违约？");
+      expect(debtDefault.pulse.answer).toContain("不存在");
+      expect(debtDefault.pulse.answer).toContain("逾期未偿还");
+      expect(debtDefault.pulse.metrics?.modelCalls).toBe(0);
     } finally {
       db.close();
     }

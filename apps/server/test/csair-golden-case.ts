@@ -1,30 +1,22 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import type { EvidencePack, PulseResponse } from "@agent-thinking/contracts";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { EvidencePack, PulseInputMode, PulseResponse } from "@agent-thinking/contracts";
 import { getConfig } from "../src/config.js";
 import { AgentDatabase } from "../src/db.js";
 import { createModelProvider } from "../src/services/models.js";
 import { PulseEngine } from "../src/services/pulse.js";
 import { VectorStore } from "../src/services/vector-store.js";
 
-const libraryName = "南航年报测试-txt清洁版";
-const iterations = 5;
-const mode = "progressive" as const;
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const defaultCasePath = join(scriptDir, "fixtures", "csair-golden-case.json");
 
-const questions = [
-  "存续债券余额合计是多少亿元？请列出计算过程。",
-  "报告期内存续含到期债务融资工具募集资金总额合计是多少亿元？",
-  "“存续债券余额”和“募集资金总额”有什么区别？为什么不能混算？",
-  "报告期内是否存在募集资金用途变更？",
-  "执行《企业会计准则解释第17号》对其他流动负债、应付债券分别有什么影响？",
-  "请验证解释第17号导致的负债重分类是否闭合。",
-  "会计差错更正一共涉及哪些调整事项？",
-  "受限资产包括哪些类别？合计金额是多少？",
-  "受限货币资金由哪些项目构成？分项是否加总闭合？",
-  "公司对飞行学员贷款提供了什么担保？担保总额、已发放贷款、实际履责金额分别是多少？",
-  "报告中有哪些事项明确写明“不涉及”？",
-  "如果用户问“南航集团报告期内债务融资工具是否存在违约”，这份报告能支持什么结论？不能支持什么结论？",
-];
+interface GoldenCaseDefinition {
+  libraryName: string;
+  iterations: number;
+  mode: PulseInputMode;
+  questions: string[];
+}
 
 interface RunRecord {
   questionIndex: number;
@@ -70,6 +62,32 @@ function applyGlobalModelSettings(config: ReturnType<typeof getConfig>, db: Agen
     const dbChatModel = db.getGlobalSetting("aiChatModel");
     if (dbChatModel) config.chatModel = dbChatModel;
   }
+}
+
+function isPulseInputMode(value: unknown): value is PulseInputMode {
+  return value === "full" || value === "progressive";
+}
+
+function goldenCasePath(): string {
+  const explicit = process.argv.find((arg) => arg.startsWith("--case="))?.slice("--case=".length);
+  return explicit ? resolve(explicit) : defaultCasePath;
+}
+
+async function loadGoldenCase(path = goldenCasePath()): Promise<GoldenCaseDefinition> {
+  const raw = JSON.parse(await readFile(path, "utf8")) as Partial<GoldenCaseDefinition>;
+  if (!raw.libraryName || typeof raw.libraryName !== "string") throw new Error(`Golden case ${path} is missing libraryName.`);
+  const iterations = raw.iterations;
+  if (!Number.isInteger(iterations) || iterations === undefined || iterations < 1) throw new Error(`Golden case ${path} must set iterations to a positive integer.`);
+  if (!isPulseInputMode(raw.mode)) throw new Error(`Golden case ${path} must use mode "full" or "progressive".`);
+  if (!Array.isArray(raw.questions) || raw.questions.some((question) => typeof question !== "string" || question.trim().length === 0)) {
+    throw new Error(`Golden case ${path} must provide non-empty string questions.`);
+  }
+  return {
+    libraryName: raw.libraryName,
+    iterations,
+    mode: raw.mode,
+    questions: raw.questions.map((question) => question.trim()),
+  };
 }
 
 function compact(value: string | undefined | null, max = 420): string {
@@ -173,6 +191,9 @@ function average(values: number[]): number {
 function renderMarkdown(input: {
   libraryId: string;
   libraryName: string;
+  mode: PulseInputMode;
+  iterations: number;
+  questions: string[];
   provider: string;
   model: string;
   createdAt: string;
@@ -188,8 +209,8 @@ function renderMarkdown(input: {
     "",
     `- 知识库：${input.libraryName}`,
     `- Library ID：${input.libraryId}`,
-    `- 执行模式：${mode}`,
-    `- 每题执行次数：${iterations}`,
+    `- 执行模式：${input.mode}`,
+    `- 每题执行次数：${input.iterations}`,
     `- Provider：${input.provider}`,
     `- Model：${input.model}`,
     `- 生成时间：${input.createdAt}`,
@@ -198,7 +219,7 @@ function renderMarkdown(input: {
     "",
     "## 总览",
     "",
-    `- 总问题数：${questions.length}`,
+    `- 总问题数：${input.questions.length}`,
     `- 总执行次数：${input.records.length}`,
     `- 成功次数：${successRecords.length}`,
     `- 失败次数：${input.records.length - successRecords.length}`,
@@ -213,12 +234,12 @@ function renderMarkdown(input: {
     "|---|---|---:|---:|---:|---:|",
   ];
 
-  for (let index = 1; index <= questions.length; index += 1) {
+  for (let index = 1; index <= input.questions.length; index += 1) {
     const records = input.records.filter((record) => record.questionIndex === index);
     const successes = records.filter((record) => !record.error);
     lines.push([
       index,
-      escapeTableCell(questions[index - 1]),
+      escapeTableCell(input.questions[index - 1]),
       `${successes.length}/${records.length}`,
       `${average(successes.map((record) => record.durationMs)).toFixed(1)}ms`,
       average(successes.map((record) => record.totalTokens)).toFixed(1),
@@ -228,9 +249,9 @@ function renderMarkdown(input: {
 
   lines.push("", "## 逐题明细", "");
 
-  for (let index = 1; index <= questions.length; index += 1) {
+  for (let index = 1; index <= input.questions.length; index += 1) {
     const records = input.records.filter((record) => record.questionIndex === index);
-    lines.push(`### ${index}. ${questions[index - 1]}`, "", "> 人工标准答案：待补充。", "");
+    lines.push(`### ${index}. ${input.questions[index - 1]}`, "", "> 人工标准答案：待补充。", "");
     for (const record of records) {
       lines.push(
         `#### Run ${record.iteration}`,
@@ -286,12 +307,13 @@ function renderMarkdown(input: {
 }
 
 async function main(): Promise<void> {
+  const goldenCase = await loadGoldenCase();
   const config = getConfig();
   const db = new AgentDatabase(config.dataDir);
   applyGlobalModelSettings(config, db);
 
-  const library = db.listLibraries().find((entry) => entry.name === libraryName);
-  if (!library) throw new Error(`找不到知识库：${libraryName}`);
+  const library = db.listLibraries().find((entry) => entry.name === goldenCase.libraryName);
+  if (!library) throw new Error(`找不到知识库：${goldenCase.libraryName}`);
 
   const vectors = new VectorStore(db);
   const model = createModelProvider(config);
@@ -300,13 +322,13 @@ async function main(): Promise<void> {
   const createdAt = new Date().toISOString();
 
   try {
-    for (const [questionOffset, question] of questions.entries()) {
+    for (const [questionOffset, question] of goldenCase.questions.entries()) {
       const questionIndex = questionOffset + 1;
-      for (let iteration = 1; iteration <= iterations; iteration += 1) {
+      for (let iteration = 1; iteration <= goldenCase.iterations; iteration += 1) {
         const startedAt = Date.now();
-        console.log(`[${questionIndex}/${questions.length}] run ${iteration}/${iterations}: ${question}`);
+        console.log(`[${questionIndex}/${goldenCase.questions.length}] run ${iteration}/${goldenCase.iterations}: ${question}`);
         try {
-          const response = await engine.create(library.id, question, mode);
+          const response = await engine.create(library.id, question, goldenCase.mode);
           records.push(recordFromResponse(questionIndex, iteration, question, response, Date.now() - startedAt));
         } catch (error) {
           records.push(recordFromError(questionIndex, iteration, question, error, Date.now() - startedAt));
@@ -318,6 +340,9 @@ async function main(): Promise<void> {
     const report = renderMarkdown({
       libraryId: library.id,
       libraryName: library.name,
+      mode: goldenCase.mode,
+      iterations: goldenCase.iterations,
+      questions: goldenCase.questions,
       provider: config.provider,
       model: config.chatModel ?? "-",
       createdAt,

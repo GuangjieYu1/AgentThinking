@@ -233,7 +233,7 @@ const edgeTypes = {
   pulseSmoothStep: PulseSmoothStepEdge,
 } satisfies EdgeTypes;
 
-const aspectLabels: Record<AspectKind, string> = {
+const aspectLabels: Partial<Record<AspectKind, string>> = {
   entity: "实体",
   person: "人物",
   organization: "组织",

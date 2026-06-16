@@ -18,6 +18,7 @@ import type {
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import { buildAoriTraversalMap, type AoriTraversalAnswerResult } from "./aori-traversal-answer.js";
+import { buildSemanticDemandAnswer } from "./aori-semantic-answer.js";
 import type { ModelProvider } from "./models.js";
 
 type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
@@ -27,7 +28,7 @@ type DemandEventType =
   | "demand_record_extracted"
   | "demand_answer_synthesized";
 
-interface DemandSourceItem {
+export interface DemandSourceItem {
   id: string;
   title: string;
   summary: string;
@@ -37,6 +38,48 @@ interface DemandSourceItem {
   chunkIds: string[];
 }
 
+const demandQuestionStopPhrases = [
+  "什么",
+  "哪些",
+  "哪个",
+  "哪位",
+  "哪年",
+  "哪里",
+  "多少",
+  "几",
+  "谁",
+  "为何",
+  "为什么",
+  "如何",
+  "怎样",
+  "请问",
+  "一下",
+  "一下子",
+  "一下呢",
+  "吗",
+  "呢",
+  "吧",
+  "呀",
+  "啊",
+  "的",
+  "了",
+  "是",
+  "在",
+  "和",
+  "与",
+  "及",
+  "并",
+  "其",
+  "他",
+  "她",
+  "它",
+  "它们",
+  "他们",
+  "她们",
+  "这",
+  "那",
+];
+
 function truncateText(value: string, max: number): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   return normalized.length > max ? normalized.slice(0, Math.max(0, max - 1)).trimEnd() : normalized;
@@ -44,6 +87,84 @@ function truncateText(value: string, max: number): string {
 
 function uniqueStrings(values: Array<string | undefined | null>): string[] {
   return [...new Set(values.map((value) => value?.trim() ?? "").filter(Boolean))];
+}
+
+function normalizeDemandText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function demandQuestionTerms(value: string): string[] {
+  const normalized = normalizeDemandText(value);
+  if (!normalized) return [];
+  let stripped = normalized;
+  for (const phrase of demandQuestionStopPhrases) {
+    stripped = stripped.replaceAll(phrase, " ");
+  }
+  stripped = stripped.replace(/[^\p{Letter}\p{Number}\p{Script=Han}]+/gu, " ");
+  const asciiTerms = stripped.match(/[a-z0-9]{2,}/g) ?? [];
+  const cjkRuns = stripped.match(/[\p{Script=Han}]{2,}/gu) ?? [];
+  const cjkTerms = cjkRuns.flatMap((run) => {
+    const terms = new Set<string>();
+    if (run.length <= 4) terms.add(run);
+    for (let size = 2; size <= Math.min(4, run.length); size += 1) {
+      for (let index = 0; index <= run.length - size; index += 1) {
+        terms.add(run.slice(index, index + size));
+      }
+    }
+    return [...terms];
+  });
+  return uniqueStrings([...asciiTerms, ...cjkTerms]).filter((term) => term.length >= 2);
+}
+
+function scoreDemandSourceItemRelevance(question: string, item: DemandSourceItem): number {
+  const questionText = normalizeDemandText(question);
+  const title = normalizeDemandText(item.title);
+  const summary = normalizeDemandText(item.summary);
+  const terms = demandQuestionTerms(question);
+  if (terms.length === 0) return 0;
+  let score = 0;
+  if (title && questionText.includes(title)) score += 1000;
+  for (const term of terms) {
+    if (title.includes(term)) {
+      score += Math.max(12, term.length * 8);
+      continue;
+    }
+    if (summary.includes(term)) score += Math.max(4, term.length * 3);
+  }
+  return score;
+}
+
+export function limitDemandSourceItemsByCoverage(
+  question: string,
+  items: DemandSourceItem[],
+  coverage: DemandAnswerPlan["requiredRecords"][number]["coverage"],
+  options: { targetNodeIdsApplied?: boolean } = {},
+): DemandSourceItem[] {
+  if (coverage === "all" || items.length <= 1) return items;
+  if (options.targetNodeIdsApplied) {
+    return coverage === "single" ? items.slice(0, 1) : items;
+  }
+
+  const scored = items
+    .map((item) => ({ item, score: scoreDemandSourceItemRelevance(question, item) }))
+    .sort((left, right) => right.score - left.score || left.item.title.localeCompare(right.item.title));
+  const positives = scored.filter((entry) => entry.score > 0);
+  if (positives.length === 0) return items;
+
+  if (coverage === "single") {
+    if (positives.length === 1) return [positives[0]!.item];
+    const [first, second] = positives;
+    if (first && second && first.score >= second.score + 8) return [first.item];
+    return items;
+  }
+
+  const cutoff = Math.max(1, (positives[0]?.score ?? 0) - 4);
+  const narrowed = positives.filter((entry) => entry.score >= cutoff).slice(0, 4).map((entry) => entry.item);
+  return narrowed.length > 0 ? narrowed : items;
 }
 
 async function emitPulse(eventSink: PulseEventSink | undefined, event: PulseStreamEvent): Promise<void> {
@@ -123,6 +244,7 @@ function aspectNodesForRecord(map: AoriTraversalMap, plan: DemandAnswerPlan, rec
 }
 
 function sourceItemsForRecord(
+  question: string,
   map: AoriTraversalMap,
   plan: DemandAnswerPlan,
   recordSpec: DemandAnswerPlan["requiredRecords"][number],
@@ -180,7 +302,9 @@ function sourceItemsForRecord(
     }));
   }
   const sourceBound = items.filter((item) => item.chunkIds.length > 0);
-  return sourceBound;
+  return limitDemandSourceItemsByCoverage(question, sourceBound, recordSpec.coverage, {
+    targetNodeIdsApplied: targetNodeIds.size > 0,
+  });
 }
 
 function allRecordChunkIds(records: EvidenceRecord[]): string[] {
@@ -221,7 +345,7 @@ function appendUncertainty(existing: string | undefined, addition: string): stri
   return existing?.trim() ? `${existing.trim()} ${addition}` : addition;
 }
 
-function validateEvidenceRecordCitations(record: EvidenceRecord, chunksById: Map<string, Chunk>): EvidenceRecord {
+export function validateDemandEvidenceRecordCitations(record: EvidenceRecord, chunksById: Map<string, Chunk>): EvidenceRecord {
   const sourceChunkIds = uniqueStrings(record.evidenceChunkIds.filter((chunkId) => chunksById.has(chunkId)));
   const fields = Object.fromEntries(Object.entries(record.fields).map(([name, field]) => {
     const candidateChunkIds = uniqueStrings([...fieldChunkIds(field), ...sourceChunkIds]).filter((chunkId) => chunksById.has(chunkId));
@@ -239,7 +363,7 @@ function validateEvidenceRecordCitations(record: EvidenceRecord, chunksById: Map
     return [name, {
       ...field,
       chunkId,
-      evidenceChunkIds: chunkId ? uniqueStrings([chunkId, ...candidateChunkIds]) : [],
+      evidenceChunkIds: chunkId ? [chunkId] : [],
       quote: finalQuote,
       confidence: quoteVerified ? field.confidence : Math.min(field.confidence, 0.45),
       ...(!quoteVerified
@@ -250,10 +374,10 @@ function validateEvidenceRecordCitations(record: EvidenceRecord, chunksById: Map
   return {
     ...record,
     fields,
-    evidenceChunkIds: uniqueStrings([
-      ...sourceChunkIds,
-      ...Object.values(fields).flatMap((field) => fieldChunkIds(field)),
-    ]).filter((chunkId) => chunksById.has(chunkId)),
+    evidenceChunkIds: (() => {
+      const pinnedChunkIds = uniqueStrings(Object.values(fields).flatMap((field) => fieldChunkIds(field))).filter((chunkId) => chunksById.has(chunkId));
+      return pinnedChunkIds.length > 0 ? pinnedChunkIds : sourceChunkIds;
+    })(),
   };
 }
 
@@ -433,7 +557,7 @@ export async function extractEvidenceRecords(input: {
     requiredRecordCount: input.plan.requiredRecords.length,
   });
   for (const recordSpec of input.plan.requiredRecords) {
-    const sourceItems = sourceItemsForRecord(input.map, input.plan, recordSpec);
+    const sourceItems = sourceItemsForRecord(input.question, input.map, input.plan, recordSpec);
     for (const sourceItem of sourceItems) {
       const chunks = sourceItem.chunkIds.flatMap((chunkId) => input.chunksById.get(chunkId) ?? []);
       if (chunks.length === 0) continue;
@@ -447,7 +571,7 @@ export async function extractEvidenceRecords(input: {
         },
         chunks: chunks.map((chunk) => ({ id: chunk.id, text: chunk.text })),
       });
-      const normalized = validateEvidenceRecordCitations({
+      const normalized = validateDemandEvidenceRecordCitations({
         ...record,
         ...(sourceItem.sourceNodeId ? { sourceNodeId: sourceItem.sourceNodeId } : {}),
         ...(sourceItem.sourceAspectId ? { sourceAspectId: sourceItem.sourceAspectId } : {}),
@@ -601,12 +725,88 @@ export class AoriDemandAnswerEngine {
     mode: PulseInputMode;
     eventSink?: PulseEventSink;
   }): Promise<AoriTraversalAnswerResult> {
-    if (!this.model.configured) throw new Error("AORI demand answering requires a configured model service.");
     const map = buildAoriTraversalMap(this.db, input.libraryId);
     const allChunkIds = uniqueStrings(Object.values(map.nodesById).flatMap((node) => node.chunkIds));
     const allChunks = this.db.getChunksByIds(allChunkIds);
     const chunksById = new Map(allChunks.map((chunk) => [chunk.id, chunk]));
+    const semantic = buildSemanticDemandAnswer({
+      question: input.question,
+      map,
+      chunks: allChunks,
+    });
+    if (semantic) {
+      await emitPulse(input.eventSink, { type: "stage", message: "正在执行 AORI 语义问答" });
+      await emitDemand(input.eventSink, "demand_plan_generated", "AORI semantic demand plan generated.", {
+        plan: semantic.plan,
+        planFallback: false,
+        semanticQuestionType: semantic.questionType,
+        deterministicAnswer: true,
+      });
+      const records = semantic.records.map((record) => validateDemandEvidenceRecordCitations(record, chunksById));
+      let emittedHitCount = 0;
+      await emitDemand(input.eventSink, "demand_records_started", "Extracting semantic evidence records from source-bound chunks.", {
+        requiredRecordCount: semantic.plan.requiredRecords.length,
+      });
+      for (const record of records) {
+        const recordChunks = record.evidenceChunkIds
+          .flatMap((chunkId) => chunksById.get(chunkId) ?? [])
+          .map((chunk) => ({
+            id: chunk.id,
+            label: chunkLabel(chunk),
+            excerpt: truncateText(chunk.text, 220),
+          }));
+        await emitDemand(input.eventSink, "demand_record_extracted", `Extracted ${record.recordName}.`, {
+          record,
+          chunks: recordChunks,
+          semanticQuestionType: semantic.questionType,
+        });
+        const hits = buildHitsForRecord(record, chunksById, emittedHitCount + 1);
+        emittedHitCount += hits.length;
+        for (const hit of hits) await emitPulse(input.eventSink, { type: "hit", hit });
+      }
+      const answer = {
+        ...semantic.answer,
+        diagnostics: {
+          ...semantic.answer.diagnostics,
+          answerPipeline: "aori_demand",
+          demandPlan: semantic.plan,
+          evidenceRecords: records,
+          sourceChunkIds: allRecordChunkIds(records),
+          fallbackTraversalUsed: false,
+          skillRouteFallback: false,
+          semanticQuestionType: semantic.questionType,
+          deterministicAnswer: true,
+        },
+      } satisfies PulseAnswerOutput;
+      await emitPulse(input.eventSink, { type: "stage", message: "正在完成确定性 AORI Answer" });
+      await emitDemand(input.eventSink, "demand_answer_synthesized", answer.summary, { answer });
+      const usedChunks = this.db.getChunksByIds(uniqueStrings(semantic.usedChunkIds));
+      const evidencePack = buildDemandChunkEvidencePack(input.question, records, usedChunks);
+      const storageEvidencePack = buildStorageEvidencePack({
+        question: input.question,
+        modelName: this.model.name,
+        chunkEvidencePack: evidencePack,
+        records,
+        chunks: usedChunks,
+        plan: semantic.plan,
+      });
+      storageEvidencePack.diagnostics = {
+        ...storageEvidencePack.diagnostics,
+        semanticQuestionType: semantic.questionType,
+        deterministicAnswer: true,
+      };
+      const chunkSummaries: ChunkAnswerSummary[] = [];
+      return {
+        evidencePack,
+        chunkSummaries,
+        answer,
+        chunks: usedChunks,
+        hits: buildHits(records, usedChunks),
+        storageEvidencePack,
+      };
+    }
     await emitPulse(input.eventSink, { type: "stage", message: "正在生成 AORI Demand Answer Plan" });
+    if (!this.model.configured) throw new Error("AORI demand answering requires a configured model service.");
     const plan = await this.model.planDemandAnswer(buildDemandPlanInput(input.question, map));
     await emitDemand(input.eventSink, "demand_plan_generated", "AORI demand answer plan generated.", {
       plan,

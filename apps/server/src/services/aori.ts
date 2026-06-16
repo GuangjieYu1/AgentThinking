@@ -20,6 +20,7 @@ import type {
   LibraryAoriProfile,
   ReflectiveIndexReport,
 } from "@agent-thinking/contracts";
+import { buildSemanticAoriAspects } from "./aori-semantic-answer.js";
 
 export interface AoriDraftGroup {
   draft: AoriDocumentDraft;
@@ -149,8 +150,16 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
   const closureReports: ClosureReport[] = [];
   const allRelations: AspectRelation[] = [];
 
-  for (const [draftIndex, group] of input.drafts.entries()) {
-    for (const [aspectIndex, draftAspect] of group.draft.aspects.entries()) {
+  const aspectGroups = [
+    ...input.drafts.map((group) => ({ groupId: group.groupId, aspects: group.draft.aspects })),
+    {
+      groupId: "semantic-aspects",
+      aspects: buildSemanticAoriAspects(input.chunks),
+    },
+  ].filter((group) => group.aspects.length > 0);
+
+  for (const [draftIndex, group] of aspectGroups.entries()) {
+    for (const [aspectIndex, draftAspect] of group.aspects.entries()) {
       const aspectId = `aori-aspect-${randomUUID()}`;
       const gaps: AoriGapItem[] = [];
       const warnings: string[] = [];
@@ -186,6 +195,7 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
             1000,
           ),
           confidence: Math.max(0, Math.min(1, draftItem.confidence ?? (evidenceChunkIds.length > 0 ? 0.5 : 0.3))),
+          ...(draftItem.metadata ? { metadata: draftItem.metadata } : {}),
         };
         items.push(item);
         itemIdByKey.set(draftItem.key, item.id);
@@ -267,6 +277,7 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
         items,
         relations,
         closureReport,
+        ...(draftAspect.metadata ? { metadata: draftAspect.metadata } : {}),
       };
       aspects.push(aspect);
       closureReports.push(closureReport);

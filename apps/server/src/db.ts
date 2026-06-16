@@ -1189,11 +1189,13 @@ export class AgentDatabase {
     this.addColumn("aori_aspects", "confidence", "REAL NOT NULL DEFAULT 0.3");
     this.addColumn("aori_aspects", "evidence_status", "TEXT NOT NULL DEFAULT 'unsupported'");
     this.addColumn("aori_aspects", "closure_status", "TEXT NOT NULL DEFAULT 'open'");
+    this.addColumn("aori_aspects", "metadata_json", "TEXT");
     this.addColumn("aori_aspect_items", "evidence_status", "TEXT NOT NULL DEFAULT 'unsupported'");
     this.addColumn("aori_aspect_items", "closure_status", "TEXT NOT NULL DEFAULT 'open'");
     this.addColumn("aori_aspect_items", "fallback_only", "INTEGER NOT NULL DEFAULT 0");
     this.addColumn("aori_aspect_items", "classification_rationale", "TEXT NOT NULL DEFAULT ''");
     this.addColumn("aori_aspect_items", "confidence", "REAL NOT NULL DEFAULT 0.3");
+    this.addColumn("aori_aspect_items", "metadata_json", "TEXT");
     this.addColumn("aori_aspect_relations", "domain_relation", "TEXT NOT NULL DEFAULT 'unknown'");
     this.addColumn("aori_aspect_relations", "evidence_status", "TEXT NOT NULL DEFAULT 'unsupported'");
     this.addColumn("aori_aspect_relations", "closure_status", "TEXT NOT NULL DEFAULT 'open'");
@@ -2488,14 +2490,14 @@ export class AgentDatabase {
       const insertAspect = this.sql.prepare(`
         INSERT INTO aori_aspects
           (id, version_id, kind, domain_kind, title, summary, central_question, classification_rationale,
-            confidence, evidence_status, closure_status, item_ids_json, relation_ids_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            confidence, evidence_status, closure_status, item_ids_json, relation_ids_json, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const insertItem = this.sql.prepare(`
         INSERT INTO aori_aspect_items
           (id, version_id, aspect_id, title, summary, source_node_ids_json, evidence_chunk_ids_json,
-            evidence_status, closure_status, fallback_only, classification_rationale, confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            evidence_status, closure_status, fallback_only, classification_rationale, confidence, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const insertRelation = this.sql.prepare(`
         INSERT INTO aori_aspect_relations
@@ -2524,6 +2526,7 @@ export class AgentDatabase {
           aspect.closureStatus,
           JSON.stringify(aspect.itemIds),
           JSON.stringify(aspect.relationIds),
+          aspect.metadata ? JSON.stringify(aspect.metadata) : null,
         );
         for (const item of aspect.items) {
           insertItem.run(
@@ -2539,6 +2542,7 @@ export class AgentDatabase {
             item.fallbackOnly ? 1 : 0,
             item.classificationRationale,
             item.confidence,
+            item.metadata ? JSON.stringify(item.metadata) : null,
           );
         }
         for (const relation of aspect.relations) {
@@ -2669,6 +2673,9 @@ export class AgentDatabase {
         fallbackOnly: Boolean(Number(entry.fallback_only ?? 0)),
         classificationRationale: String(entry.classification_rationale ?? ""),
         confidence: Number(entry.confidence ?? 0.3),
+        ...(typeof entry.metadata_json === "string" && entry.metadata_json.trim()
+          ? { metadata: parseJsonValue<Record<string, unknown>>(entry.metadata_json, {}) }
+          : {}),
       }));
     const relations = rows(this.sql.prepare("SELECT * FROM aori_aspect_relations WHERE version_id = ?"), versionId)
       .map((entry): AspectRelation => ({
@@ -2745,6 +2752,9 @@ export class AgentDatabase {
           items: aspectItems,
           relations: aspectRelations,
           closureReport,
+          ...(typeof entry.metadata_json === "string" && entry.metadata_json.trim()
+            ? { metadata: parseJsonValue<Record<string, unknown>>(entry.metadata_json, {}) }
+            : {}),
         };
       });
     const relationLexicon: DocumentRelationLexicon = {

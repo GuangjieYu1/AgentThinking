@@ -8,6 +8,11 @@ export const aspectKinds = [
   "place",
   "object",
   "event",
+  "table",
+  "metric",
+  "reconciliation",
+  "negative_fact",
+  "causal_chain",
   "timeline",
   "causality",
   "state_change",
@@ -648,6 +653,7 @@ export interface AspectItem {
   fallbackOnly: boolean;
   classificationRationale: string;
   confidence: number;
+  metadata?: Record<string, unknown> | undefined;
 }
 
 export interface AspectRelation {
@@ -685,6 +691,7 @@ export interface Aspect {
   items: AspectItem[];
   relations: AspectRelation[];
   closureReport: ClosureReport;
+  metadata?: Record<string, unknown> | undefined;
 }
 
 export interface DocumentRelationLexiconEntry {
@@ -964,6 +971,7 @@ export interface AoriTraversalNode {
   closureStatus?: string | undefined;
   evidenceStatus?: string | undefined;
   confidence?: number | undefined;
+  metadata?: Record<string, unknown> | undefined;
 }
 
 export interface AoriTraversalMap {
@@ -1490,6 +1498,7 @@ export interface AoriDocumentDraft {
     classificationRationale: string;
     confidence: number;
     closureStatus?: ClosureStatus | undefined;
+    metadata?: Record<string, unknown> | undefined;
     items: Array<{
       key: string;
       title: string;
@@ -1501,6 +1510,7 @@ export interface AoriDocumentDraft {
       fallbackOnly?: boolean | undefined;
       classificationRationale?: string | undefined;
       confidence?: number | undefined;
+      metadata?: Record<string, unknown> | undefined;
     }>;
     relations: Array<{
       sourceKey: string;
@@ -2455,6 +2465,7 @@ export interface PulseAnswerOutput {
     sourceChunkIds?: string[] | undefined;
     fallbackTraversalUsed?: boolean | undefined;
     skillRouteFallback?: boolean | undefined;
+    [key: string]: unknown;
   } | undefined;
   evidenceRows?: PulseEvidenceRow[] | undefined;
 }
@@ -3335,6 +3346,7 @@ export const aoriDocumentDraftSchema = z.object({
     classificationRationale: z.string().trim().min(1).max(1000).default("Model did not provide an aspect classification rationale."),
     confidence: z.coerce.number().min(0).max(1).default(0.3),
     closureStatus: z.enum(closureStatuses).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
     items: z.array(z.object({
       key: z.string().trim().min(1).max(100),
       title: z.string().trim().min(1).max(240),
@@ -3346,6 +3358,7 @@ export const aoriDocumentDraftSchema = z.object({
       fallbackOnly: z.boolean().optional(),
       classificationRationale: z.string().trim().max(1000).optional(),
       confidence: z.coerce.number().min(0).max(1).optional(),
+      metadata: z.record(z.string(), z.unknown()).optional(),
     })).default([]),
     relations: z.array(z.object({
       sourceKey: z.string().trim().min(1).max(100),

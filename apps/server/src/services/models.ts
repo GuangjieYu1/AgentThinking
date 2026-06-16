@@ -937,6 +937,7 @@ function cleanAoriDraft(value: unknown, chunks: Chunk[]): AoriDocumentDraft {
           1000,
         ),
         confidence: item.confidence === undefined ? (evidenceChunkIds.length > 0 ? 0.5 : 0.3) : safeConfidence(item.confidence),
+        ...(safeMetadata(item.metadata) ? { metadata: safeMetadata(item.metadata) } : {}),
       };
     });
     const itemKeys = new Set(items.map((item) => item.key));
@@ -975,6 +976,7 @@ function cleanAoriDraft(value: unknown, chunks: Chunk[]): AoriDocumentDraft {
       ),
       confidence: aspect.confidence === undefined ? 0.3 : safeConfidence(aspect.confidence),
       closureStatus: safeClosureStatus(aspect.closureStatus, aspectEvidenceChunkIds),
+      ...(safeMetadata(aspect.metadata) ? { metadata: safeMetadata(aspect.metadata) } : {}),
       items,
       relations,
       gaps: Array.isArray(aspect.gaps) ? aspect.gaps.slice(0, 20).flatMap((gapEntry) => {
@@ -1093,6 +1095,11 @@ function safeConfidence(value: unknown): number {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) return 0.5;
   return Math.min(1, Math.max(0, numeric));
+}
+
+function safeMetadata(value: unknown): Record<string, unknown> | undefined {
+  const metadata = normalizedUnknownObject(value);
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 function fallbackExtractionFromChunks(chunks: Chunk[], note = "模型结构化输出不可用，系统生成保守候选。"): ExtractionOutput {
@@ -2640,10 +2647,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "Aspect relations must use sourceKey/targetKey from the same aspect items. " +
             "The formal document relation name must come from relationTextInSource or normalizedRelation; baseRelation is only a compatibility enum. " +
             "Choose aspect kind from the controlled schema and add domainKind as an open document-local label. Include classificationRationale and confidence. " +
+            "When the source contains tables, explicit negative facts, accounting events, causal chains, or deterministic numeric rollups, include a compact metadata object on the aspect or item so downstream code can preserve those semantics. " +
             "Do not invent relation names without source evidence. If coverage is incomplete, add gaps. " +
             "Use Simplified Chinese for human-readable text. Return exactly this shape: " +
             '{"understanding":{"summary":"...","centralQuestion":"...","centralNodeTitle":"...","evidenceChunkIds":["chunk-id"],"evidenceStatus":"supported|partially_supported|unsupported|disputed","closureStatus":"closed|partial|open","classificationRationale":"...","confidence":0.8},' +
-            '"aspects":[{"kind":"entity|event|amount|evidence|argument|claim|finding|timeline|other","domainKind":"document-local label","title":"...","summary":"...","centralQuestion":"...","classificationRationale":"...","confidence":0.8,"closureStatus":"closed|partial|open","items":[{"key":"i1","title":"...","summary":"...","evidenceChunkIds":["chunk-id"],"sourceNodeIds":["optional-tree-node-id"],"evidenceStatus":"supported|partially_supported|unsupported|disputed","closureStatus":"closed|partial|open","fallbackOnly":false,"classificationRationale":"...","confidence":0.8}],' +
+            '"aspects":[{"kind":"entity|event|table|metric|reconciliation|negative_fact|causal_chain|amount|evidence|argument|claim|finding|timeline|other","domainKind":"document-local label","title":"...","summary":"...","centralQuestion":"...","classificationRationale":"...","confidence":0.8,"closureStatus":"closed|partial|open","metadata":{"semanticKind":"optional","...":"..."},"items":[{"key":"i1","title":"...","summary":"...","evidenceChunkIds":["chunk-id"],"sourceNodeIds":["optional-tree-node-id"],"evidenceStatus":"supported|partially_supported|unsupported|disputed","closureStatus":"closed|partial|open","fallbackOnly":false,"classificationRationale":"...","confidence":0.8,"metadata":{"semanticKind":"optional","...":"..."}}],' +
             '"relations":[{"sourceKey":"i1","targetKey":"i2","domainRelation":"document relation label","relationTextInSource":"source phrase","normalizedRelation":"document relation name","baseRelation":"supports|contradicts|explains|depends_on|example_of|related_to","reason":"...","confidence":0.8,"evidenceChunkIds":["chunk-id"],"evidenceStatus":"supported|partially_supported|unsupported|disputed","closureStatus":"closed|partial|open"}],' +
             '"gaps":[{"description":"...","severity":"low|medium|high","evidenceChunkIds":["chunk-id"]}]}],' +
             '"selfQuestions":[{"question":"...","answer":"...","evidenceChunkIds":["chunk-id"],"status":"answered|gap|unchecked"}],' +
@@ -3450,7 +3458,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
             "Write the final answer for the AORI Demand Answer Engine. " +
             "Use only the user question, Demand Plan, EvidenceRecords, and each field's chunk id plus source quote. Do not use AORI summaries as evidence. " +
             "You, not program code, must perform any filtering, counting, listing, summing, grouping, comparison, chronology, explanation, and uncertainty judgment required by the question. " +
-            "State the answer scope/policy. State included, excluded, and uncertain records when that matters. " +
+            "Answer the question directly in the first sentence, using the shortest source-faithful wording that fully satisfies the question. " +
+            "Prefer exact source wording for names, titles, dates, numbers, list items, and categorical labels when the source provides them. " +
+            "Mention scope, filtering, included records, excluded records, or uncertain records only when they materially affect the conclusion, resolve ambiguity, or explain missing evidence. " +
             "If evidence is insufficient, say it is insufficient. Never convert empty records or missing numeric fields into 0. " +
             "Cite chunk ids and source quotes from EvidenceRecord fields when making factual claims. " +
             'Return JSON only: {"answer":"...","summary":"...","diagnostics":{"warnings":[]}}.',

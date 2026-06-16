@@ -244,6 +244,7 @@ export function buildAoriTraversalMap(db: AgentDatabase, libraryId: string): Aor
         closureStatus: aspect.closureStatus,
         evidenceStatus: aspect.evidenceStatus,
         confidence: aspect.confidence,
+        ...(aspect.metadata ? { metadata: aspect.metadata } : {}),
       });
       linkParentChild(nodes, documentNode.id, aspectNode.id);
 
@@ -264,6 +265,7 @@ export function buildAoriTraversalMap(db: AgentDatabase, libraryId: string): Aor
           closureStatus: item.closureStatus,
           evidenceStatus: item.evidenceStatus,
           confidence: item.confidence,
+          ...(item.metadata ? { metadata: item.metadata } : {}),
         });
         itemNodeIdByItemId.set(item.id, itemNode.id);
         linkParentChild(nodes, aspectNode.id, itemNode.id);

@@ -714,6 +714,304 @@ export interface SelfQuestion {
   status: "answered" | "gap" | "unchecked";
 }
 
+export const semanticUnitKinds = [
+  "table",
+  "metric",
+  "event",
+  "causal_chain",
+  "reconciliation",
+  "negative_fact",
+] as const;
+export type SemanticUnitKind = (typeof semanticUnitKinds)[number];
+export type SemanticUnitReflectionStatus = "ok" | "needs_review" | "conflicting" | "incomplete";
+
+export interface SemanticUnitBase {
+  id: string;
+  kind: SemanticUnitKind;
+  libraryId: string;
+  documentId: string;
+  versionId: string;
+  title?: string | undefined;
+  summary: string;
+  sourceChunkIds: string[];
+  sourceNodeIds?: string[] | undefined;
+  confidence: number;
+  reflectionStatus: SemanticUnitReflectionStatus;
+  reflectionNotes?: string[] | undefined;
+  metadata?: Record<string, unknown> | undefined;
+}
+
+export interface SemanticUnitDraftBase {
+  id?: string | undefined;
+  kind: SemanticUnitKind;
+  title?: string | undefined;
+  summary: string;
+  sourceChunkIds: string[];
+  sourceNodeIds?: string[] | undefined;
+  confidence: number;
+  reflectionStatus: SemanticUnitReflectionStatus;
+  reflectionNotes?: string[] | undefined;
+  metadata?: Record<string, unknown> | undefined;
+}
+
+export interface TableColumn {
+  name: string;
+  normalizedName?: string | undefined;
+  unit?: string | undefined;
+  semanticRole?: "label" | "metric" | "date" | "status" | "description" | "total" | "unknown" | undefined;
+}
+
+export interface TableCell {
+  raw: string;
+  value?: number | string | boolean | undefined;
+  unit?: string | undefined;
+  normalizedValue?: number | string | boolean | undefined;
+}
+
+export interface TableRow {
+  id: string;
+  ordinal: number;
+  cells: Record<string, TableCell>;
+  sourceChunkIds: string[];
+}
+
+export interface TableSemanticUnit extends SemanticUnitBase {
+  kind: "table";
+  tableTitle: string;
+  sectionTitle?: string | undefined;
+  columns: TableColumn[];
+  rows: TableRow[];
+  unitHints: string[];
+  tableRole:
+    | "financial_metric_table"
+    | "status_table"
+    | "change_table"
+    | "composition_table"
+    | "schedule_table"
+    | "risk_table"
+    | "unknown";
+}
+
+export interface TableSemanticUnitDraft extends SemanticUnitDraftBase {
+  kind: "table";
+  tableTitle: string;
+  sectionTitle?: string | undefined;
+  columns: TableColumn[];
+  rows: TableRow[];
+  unitHints: string[];
+  tableRole:
+    | "financial_metric_table"
+    | "status_table"
+    | "change_table"
+    | "composition_table"
+    | "schedule_table"
+    | "risk_table"
+    | "unknown";
+}
+
+export interface MetricSemanticUnit extends SemanticUnitBase {
+  kind: "metric";
+  metricName: string;
+  tableId?: string | undefined;
+  tableTitle?: string | undefined;
+  columnName?: string | undefined;
+  unit?: string | undefined;
+  metricRole:
+    | "balance"
+    | "amount"
+    | "change"
+    | "planned"
+    | "actual"
+    | "remaining"
+    | "total"
+    | "ratio"
+    | "status"
+    | "unknown";
+  aggregationAllowed: boolean;
+  aggregationType?: "sum" | "count" | "average" | "none" | undefined;
+}
+
+export interface MetricSemanticUnitDraft extends SemanticUnitDraftBase {
+  kind: "metric";
+  metricName: string;
+  tableId?: string | undefined;
+  tableTitle?: string | undefined;
+  columnName?: string | undefined;
+  unit?: string | undefined;
+  metricRole:
+    | "balance"
+    | "amount"
+    | "change"
+    | "planned"
+    | "actual"
+    | "remaining"
+    | "total"
+    | "ratio"
+    | "status"
+    | "unknown";
+  aggregationAllowed: boolean;
+  aggregationType?: "sum" | "count" | "average" | "none" | undefined;
+}
+
+export interface EventSemanticUnit extends SemanticUnitBase {
+  kind: "event";
+  eventName: string;
+  eventCategory:
+    | "policy_change"
+    | "error_correction"
+    | "contract_obligation"
+    | "risk_event"
+    | "approval_event"
+    | "status_change"
+    | "business_event"
+    | "unknown";
+  affectedItems: string[];
+  sourceSectionTitle: string;
+  excludes?: string[] | undefined;
+}
+
+export interface EventSemanticUnitDraft extends SemanticUnitDraftBase {
+  kind: "event";
+  eventName: string;
+  eventCategory:
+    | "policy_change"
+    | "error_correction"
+    | "contract_obligation"
+    | "risk_event"
+    | "approval_event"
+    | "status_change"
+    | "business_event"
+    | "unknown";
+  affectedItems: string[];
+  sourceSectionTitle: string;
+  excludes?: string[] | undefined;
+}
+
+export interface CausalChainSemanticUnit extends SemanticUnitBase {
+  kind: "causal_chain";
+  cause: string;
+  mechanism?: string | undefined;
+  effects: Array<{
+    item: string;
+    direction: "increase" | "decrease" | "reclassify" | "no_effect" | "unknown";
+    amount?: number | undefined;
+    unit?: string | undefined;
+  }>;
+  relatedEventId?: string | undefined;
+  relatedTableIds?: string[] | undefined;
+}
+
+export interface CausalChainSemanticUnitDraft extends SemanticUnitDraftBase {
+  kind: "causal_chain";
+  cause: string;
+  mechanism?: string | undefined;
+  effects: Array<{
+    item: string;
+    direction: "increase" | "decrease" | "reclassify" | "no_effect" | "unknown";
+    amount?: number | undefined;
+    unit?: string | undefined;
+  }>;
+  relatedEventId?: string | undefined;
+  relatedTableIds?: string[] | undefined;
+}
+
+export interface ReconciliationSemanticUnit extends SemanticUnitBase {
+  kind: "reconciliation";
+  name: string;
+  sourceTableId?: string | undefined;
+  sourceEventId?: string | undefined;
+  formulaType: "sum" | "delta" | "reclassification" | "beginning_plus_changes_equals_ending";
+  items: Array<{
+    label: string;
+    value: number;
+    unit: string;
+    sign: 1 | -1;
+    sourceRowId?: string | undefined;
+    sourceCellId?: string | undefined;
+  }>;
+  computedTotal: number;
+  reportedTotal?: number | undefined;
+  diff?: number | undefined;
+  closed: boolean;
+}
+
+export interface ReconciliationSemanticUnitDraft extends SemanticUnitDraftBase {
+  kind: "reconciliation";
+  name: string;
+  sourceTableId?: string | undefined;
+  sourceEventId?: string | undefined;
+  formulaType: "sum" | "delta" | "reclassification" | "beginning_plus_changes_equals_ending";
+  items: Array<{
+    label: string;
+    value: number;
+    unit: string;
+    sign: 1 | -1;
+    sourceRowId?: string | undefined;
+    sourceCellId?: string | undefined;
+  }>;
+  computedTotal: number;
+  reportedTotal?: number | undefined;
+  diff?: number | undefined;
+  closed: boolean;
+}
+
+export interface NegativeFactSemanticUnit extends SemanticUnitBase {
+  kind: "negative_fact";
+  target: string;
+  predicate: string;
+  scope: string;
+  statement: string;
+  certainty: "explicit" | "implicit";
+}
+
+export interface NegativeFactSemanticUnitDraft extends SemanticUnitDraftBase {
+  kind: "negative_fact";
+  target: string;
+  predicate: string;
+  scope: string;
+  statement: string;
+  certainty: "explicit" | "implicit";
+}
+
+export type SemanticUnit =
+  | TableSemanticUnit
+  | MetricSemanticUnit
+  | EventSemanticUnit
+  | CausalChainSemanticUnit
+  | ReconciliationSemanticUnit
+  | NegativeFactSemanticUnit;
+
+export type SemanticUnitDraft =
+  | TableSemanticUnitDraft
+  | MetricSemanticUnitDraft
+  | EventSemanticUnitDraft
+  | CausalChainSemanticUnitDraft
+  | ReconciliationSemanticUnitDraft
+  | NegativeFactSemanticUnitDraft;
+
+export interface ReflectiveFinding {
+  id: string;
+  semanticUnitId: string;
+  findingType:
+    | "incomplete_table"
+    | "unit_mismatch"
+    | "event_boundary_conflict"
+    | "calculation_not_closed"
+    | "ambiguous_scope"
+    | "overlap_with_other_aspect"
+    | "insufficient_source_evidence";
+  severity: "low" | "medium" | "high";
+  message: string;
+}
+
+export interface ReflectiveFindingDraft {
+  id?: string | undefined;
+  semanticUnitId: string;
+  findingType: ReflectiveFinding["findingType"];
+  severity: ReflectiveFinding["severity"];
+  message: string;
+}
+
 export interface AoriDocumentIndex {
   available: true;
   versionId: string;
@@ -726,6 +1024,8 @@ export interface AoriDocumentIndex {
   relationLexicon: DocumentRelationLexicon;
   closureReports: ClosureReport[];
   selfQuestions: SelfQuestion[];
+  semanticUnits: SemanticUnit[];
+  reflectiveFindings: ReflectiveFinding[];
   reflectiveReport: ReflectiveIndexReport;
   rationaleTrace: IndexingRationaleTrace[];
   rationaleDebug: AoriRationaleDebug;
@@ -1521,6 +1821,8 @@ export interface AoriDocumentDraft {
       evidenceChunkIds?: string[] | undefined;
     }> | undefined;
   }>;
+  semanticUnits?: SemanticUnitDraft[] | undefined;
+  reflectiveFindings?: ReflectiveFindingDraft[] | undefined;
   selfQuestions: Array<{
     question: string;
     answer?: string | undefined;
@@ -1956,6 +2258,57 @@ export type PulseQuestionType =
   | "comparison"
   | "mixed";
 
+export type QuestionType =
+  | "numeric_aggregation"
+  | "concept_boundary"
+  | "event_effect"
+  | "negative_fact"
+  | "exhaustive_list"
+  | "general_qa";
+
+export interface SemanticTarget {
+  questionType: QuestionType;
+  targetDescription: string;
+  constraints: {
+    aggregation?: "sum" | "count" | "average" | "compare" | "none" | undefined;
+    unit?: string | undefined;
+    timeScope?: string | undefined;
+    requireCompleteSet?: boolean | undefined;
+  };
+  rawQuestion: string;
+}
+
+export interface AspectCandidate {
+  aspectId: string;
+  aspectKind: SemanticUnitKind;
+  title: string;
+  summary: string;
+  metadata: Record<string, unknown>;
+  sourceChunkIds: string[];
+  retrievalScore: number;
+}
+
+export interface AspectCandidateDecision {
+  aspectId: string;
+  decision: "selected" | "rejected";
+  reason: string;
+  confidence: number;
+}
+
+export interface QuestionAspectPlan {
+  questionType: QuestionType;
+  target: SemanticTarget;
+  selectedAspects: AspectCandidateDecision[];
+  rejectedAspects: AspectCandidateDecision[];
+  execution: {
+    strategy: "deterministic_numeric" | "table_exhaustive" | "event_boundary" | "negative_fact" | "concept_boundary" | "fallback_demand";
+    aggregation?: "sum" | "count" | "average" | "compare" | "none" | undefined;
+    unit?: string | undefined;
+    requireCompleteEvidence: boolean;
+  };
+  confidence: number;
+}
+
 export type PulseEvidenceTool =
   | "semanticSearchChildChunks"
   | "fullTextSearchChildChunks"
@@ -2273,7 +2626,7 @@ export interface EvidencePack {
   evidencePackSchemaVersion?: 1 | 2 | undefined;
   pipeline?: {
     indexProfile: ActiveIndexProfile;
-    packBuilder: "legacy" | "v2" | "aori_traversal" | "aori_skill" | "aori_demand";
+    packBuilder: "legacy" | "v2" | "aori_traversal" | "aori_skill" | "aori_demand" | "aori_semantic";
     model: string;
     promptVersion: string;
   } | undefined;
@@ -2417,6 +2770,13 @@ export interface PulseVerificationResult {
   rewriteInstructions?: string | undefined;
 }
 
+export interface NumericAnswerVerification {
+  passed: boolean;
+  computedTotal: number;
+  answerTotal?: number | undefined;
+  issues: string[];
+}
+
 export interface PulseAnswerOutput {
   answer: string;
   summary: string;
@@ -2440,10 +2800,15 @@ export interface PulseAnswerOutput {
     retrievalSteps?: PulseEvidenceStep[] | undefined;
     citedChunkIds?: string[] | undefined;
     warnings?: string[] | undefined;
-    answerPipeline?: "aori_demand" | "aori_skill" | "aori_traversal" | undefined;
+    answerPipeline?: "aori_demand" | "aori_skill" | "aori_traversal" | "aori_semantic" | undefined;
     selectedSkill?: AoriSkillName | undefined;
     skillRoute?: AoriSkillRoute | undefined;
     targetAspects?: AoriSkillRoute["targetAspects"] | undefined;
+    questionAspectPlan?: QuestionAspectPlan | undefined;
+    semanticUnitsUsed?: SemanticUnit[] | undefined;
+    calculatorResult?: unknown;
+    answerVerification?: NumericAnswerVerification | undefined;
+    fallbackReason?: string | undefined;
     demandPlan?: DemandAnswerPlan | undefined;
     evidenceRecords?: EvidenceRecord[] | undefined;
     facetFactTable?: FacetFactTable | undefined;
@@ -2522,12 +2887,29 @@ export interface BenchmarkEvidenceRecordTrace {
   fields: BenchmarkEvidenceRecordFieldTrace[];
 }
 
+export interface BenchmarkSemanticUnitTrace {
+  id: string;
+  kind: SemanticUnitKind;
+  title?: string | undefined;
+  confidence?: number | undefined;
+  reflectionStatus?: SemanticUnitReflectionStatus | undefined;
+}
+
+export interface BenchmarkSemanticTrace {
+  questionAspectPlan?: QuestionAspectPlan | undefined;
+  semanticUnitsUsed: BenchmarkSemanticUnitTrace[];
+  calculatorResult?: unknown;
+  answerVerification?: NumericAnswerVerification | undefined;
+  fallbackReason?: string | undefined;
+}
+
 export interface BenchmarkEvidenceTrace {
   citationChunkIds: string[];
   selectedChunkIds: string[];
   evidenceRecordChunkIds: string[];
   citations: EvidenceCitation[];
   evidenceRecords: BenchmarkEvidenceRecordTrace[];
+  semanticTrace?: BenchmarkSemanticTrace | undefined;
 }
 
 export interface BenchmarkAnswerReviewDifference {
@@ -3365,6 +3747,146 @@ export const aoriDocumentDraftSchema = z.object({
       severity: z.enum(["low", "medium", "high"]).default("medium"),
       evidenceChunkIds: z.array(z.string().trim().min(1)).optional(),
     })).optional(),
+  })).default([]),
+  semanticUnits: z.array(z.union([
+    z.object({
+      kind: z.literal("table"),
+      title: z.string().trim().max(240).optional(),
+      summary: z.string().trim().min(1).max(3000),
+      sourceChunkIds: z.array(z.string().trim().min(1)).default([]),
+      sourceNodeIds: z.array(z.string().trim().min(1)).optional(),
+      confidence: z.coerce.number().min(0).max(1).default(0.3),
+      reflectionStatus: z.enum(["ok", "needs_review", "conflicting", "incomplete"]).default("needs_review"),
+      reflectionNotes: z.array(z.string().trim().min(1).max(500)).optional(),
+      metadata: z.record(z.unknown()).optional(),
+      tableTitle: z.string().trim().min(1).max(240),
+      sectionTitle: z.string().trim().min(1).max(240).optional(),
+      columns: z.array(z.object({
+        name: z.string().trim().min(1).max(120),
+        normalizedName: z.string().trim().min(1).max(120).optional(),
+        unit: z.string().trim().min(1).max(40).optional(),
+        semanticRole: z.enum(["label", "metric", "date", "status", "description", "total", "unknown"]).optional(),
+      })).default([]),
+      rows: z.array(z.object({
+        id: z.string().trim().min(1).max(120),
+        ordinal: z.coerce.number().int().min(0),
+        cells: z.record(z.object({
+          raw: z.string(),
+          value: z.union([z.string(), z.number(), z.boolean()]).optional(),
+          unit: z.string().trim().min(1).max(40).optional(),
+          normalizedValue: z.union([z.string(), z.number(), z.boolean()]).optional(),
+        })),
+        sourceChunkIds: z.array(z.string().trim().min(1)).default([]),
+      })).default([]),
+      unitHints: z.array(z.string().trim().min(1).max(80)).default([]),
+      tableRole: z.enum(["financial_metric_table", "status_table", "change_table", "composition_table", "schedule_table", "risk_table", "unknown"]).default("unknown"),
+    }),
+    z.object({
+      kind: z.literal("metric"),
+      title: z.string().trim().max(240).optional(),
+      summary: z.string().trim().min(1).max(3000),
+      sourceChunkIds: z.array(z.string().trim().min(1)).default([]),
+      sourceNodeIds: z.array(z.string().trim().min(1)).optional(),
+      confidence: z.coerce.number().min(0).max(1).default(0.3),
+      reflectionStatus: z.enum(["ok", "needs_review", "conflicting", "incomplete"]).default("needs_review"),
+      reflectionNotes: z.array(z.string().trim().min(1).max(500)).optional(),
+      metadata: z.record(z.unknown()).optional(),
+      metricName: z.string().trim().min(1).max(240),
+      tableId: z.string().trim().min(1).max(120).optional(),
+      tableTitle: z.string().trim().min(1).max(240).optional(),
+      columnName: z.string().trim().min(1).max(120).optional(),
+      unit: z.string().trim().min(1).max(40).optional(),
+      metricRole: z.enum(["balance", "amount", "change", "planned", "actual", "remaining", "total", "ratio", "status", "unknown"]).default("unknown"),
+      aggregationAllowed: z.boolean().default(false),
+      aggregationType: z.enum(["sum", "count", "average", "none"]).optional(),
+    }),
+    z.object({
+      kind: z.literal("event"),
+      title: z.string().trim().max(240).optional(),
+      summary: z.string().trim().min(1).max(3000),
+      sourceChunkIds: z.array(z.string().trim().min(1)).default([]),
+      sourceNodeIds: z.array(z.string().trim().min(1)).optional(),
+      confidence: z.coerce.number().min(0).max(1).default(0.3),
+      reflectionStatus: z.enum(["ok", "needs_review", "conflicting", "incomplete"]).default("needs_review"),
+      reflectionNotes: z.array(z.string().trim().min(1).max(500)).optional(),
+      metadata: z.record(z.unknown()).optional(),
+      eventName: z.string().trim().min(1).max(240),
+      eventCategory: z.enum(["policy_change", "error_correction", "contract_obligation", "risk_event", "approval_event", "status_change", "business_event", "unknown"]).default("unknown"),
+      affectedItems: z.array(z.string().trim().min(1).max(240)).default([]),
+      sourceSectionTitle: z.string().trim().min(1).max(240),
+      excludes: z.array(z.string().trim().min(1).max(240)).optional(),
+    }),
+    z.object({
+      kind: z.literal("causal_chain"),
+      title: z.string().trim().max(240).optional(),
+      summary: z.string().trim().min(1).max(3000),
+      sourceChunkIds: z.array(z.string().trim().min(1)).default([]),
+      sourceNodeIds: z.array(z.string().trim().min(1)).optional(),
+      confidence: z.coerce.number().min(0).max(1).default(0.3),
+      reflectionStatus: z.enum(["ok", "needs_review", "conflicting", "incomplete"]).default("needs_review"),
+      reflectionNotes: z.array(z.string().trim().min(1).max(500)).optional(),
+      metadata: z.record(z.unknown()).optional(),
+      cause: z.string().trim().min(1).max(500),
+      mechanism: z.string().trim().min(1).max(1000).optional(),
+      effects: z.array(z.object({
+        item: z.string().trim().min(1).max(240),
+        direction: z.enum(["increase", "decrease", "reclassify", "no_effect", "unknown"]).default("unknown"),
+        amount: z.coerce.number().optional(),
+        unit: z.string().trim().min(1).max(40).optional(),
+      })).default([]),
+      relatedEventId: z.string().trim().min(1).max(120).optional(),
+      relatedTableIds: z.array(z.string().trim().min(1).max(120)).optional(),
+    }),
+    z.object({
+      kind: z.literal("reconciliation"),
+      title: z.string().trim().max(240).optional(),
+      summary: z.string().trim().min(1).max(3000),
+      sourceChunkIds: z.array(z.string().trim().min(1)).default([]),
+      sourceNodeIds: z.array(z.string().trim().min(1)).optional(),
+      confidence: z.coerce.number().min(0).max(1).default(0.3),
+      reflectionStatus: z.enum(["ok", "needs_review", "conflicting", "incomplete"]).default("needs_review"),
+      reflectionNotes: z.array(z.string().trim().min(1).max(500)).optional(),
+      metadata: z.record(z.unknown()).optional(),
+      name: z.string().trim().min(1).max(240),
+      sourceTableId: z.string().trim().min(1).max(120).optional(),
+      sourceEventId: z.string().trim().min(1).max(120).optional(),
+      formulaType: z.enum(["sum", "delta", "reclassification", "beginning_plus_changes_equals_ending"]).default("sum"),
+      items: z.array(z.object({
+        label: z.string().trim().min(1).max(240),
+        value: z.coerce.number(),
+        unit: z.string().trim().min(1).max(40),
+        sign: z.union([z.literal(1), z.literal(-1)]).default(1),
+        sourceRowId: z.string().trim().min(1).max(120).optional(),
+        sourceCellId: z.string().trim().min(1).max(120).optional(),
+      })).default([]),
+      computedTotal: z.coerce.number(),
+      reportedTotal: z.coerce.number().optional(),
+      diff: z.coerce.number().optional(),
+      closed: z.boolean().default(false),
+    }),
+    z.object({
+      kind: z.literal("negative_fact"),
+      title: z.string().trim().max(240).optional(),
+      summary: z.string().trim().min(1).max(3000),
+      sourceChunkIds: z.array(z.string().trim().min(1)).default([]),
+      sourceNodeIds: z.array(z.string().trim().min(1)).optional(),
+      confidence: z.coerce.number().min(0).max(1).default(0.3),
+      reflectionStatus: z.enum(["ok", "needs_review", "conflicting", "incomplete"]).default("needs_review"),
+      reflectionNotes: z.array(z.string().trim().min(1).max(500)).optional(),
+      metadata: z.record(z.unknown()).optional(),
+      target: z.string().trim().min(1).max(240),
+      predicate: z.string().trim().min(1).max(240),
+      scope: z.string().trim().min(1).max(240),
+      statement: z.string().trim().min(1).max(2000),
+      certainty: z.enum(["explicit", "implicit"]),
+    }),
+  ])).default([]),
+  reflectiveFindings: z.array(z.object({
+    id: z.string().trim().min(1).max(120),
+    semanticUnitId: z.string().trim().min(1).max(120),
+    findingType: z.enum(["incomplete_table", "unit_mismatch", "event_boundary_conflict", "calculation_not_closed", "ambiguous_scope", "overlap_with_other_aspect", "insufficient_source_evidence"]),
+    severity: z.enum(["low", "medium", "high"]),
+    message: z.string().trim().min(1).max(1000),
   })).default([]),
   selfQuestions: z.array(z.object({
     question: z.string().trim().min(1).max(1000),

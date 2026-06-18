@@ -3,12 +3,16 @@ import type {
   BenchmarkOverallSummary,
   BenchmarkProviderMode,
   BenchmarkRunRecord,
+  BenchmarkSemanticTrace,
+  BenchmarkSemanticUnitTrace,
   BenchmarkScenarioSummary,
   BenchmarkSuite,
   BenchmarkSuiteCatalogEntry,
   BenchmarkSuiteSummary,
   EvidenceRecord,
+  NumericAnswerVerification,
   PulseInputMode,
+  QuestionAspectPlan,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase } from "../db.js";
 import { getConfig } from "../config.js";
@@ -94,13 +98,64 @@ function evidenceRecordsFromDiagnostics(diagnostics: Record<string, unknown> | u
   return records.filter(isEvidenceRecord);
 }
 
+function isQuestionAspectPlan(value: unknown): value is QuestionAspectPlan {
+  if (!value || typeof value !== "object") return false;
+  const plan = value as Partial<QuestionAspectPlan>;
+  return typeof plan.questionType === "string" && typeof plan.confidence === "number" && Boolean(plan.execution) && Boolean(plan.target);
+}
+
+function isNumericAnswerVerification(value: unknown): value is NumericAnswerVerification {
+  if (!value || typeof value !== "object") return false;
+  const verification = value as Partial<NumericAnswerVerification>;
+  return typeof verification.passed === "boolean" && typeof verification.computedTotal === "number" && Array.isArray(verification.issues);
+}
+
+function semanticUnitsFromDiagnostics(diagnostics: Record<string, unknown> | undefined): BenchmarkSemanticUnitTrace[] {
+  const units = diagnostics?.semanticUnitsUsed;
+  if (!Array.isArray(units)) return [];
+  return units.flatMap((unit): BenchmarkSemanticUnitTrace[] => {
+    if (!unit || typeof unit !== "object") return [];
+    const candidate = unit as Partial<BenchmarkSemanticUnitTrace>;
+    if (typeof candidate.id !== "string" || typeof candidate.kind !== "string") return [];
+    return [{
+      id: candidate.id,
+      kind: candidate.kind,
+      ...(typeof candidate.title === "string" ? { title: candidate.title } : {}),
+      ...(typeof candidate.confidence === "number" ? { confidence: candidate.confidence } : {}),
+      ...(typeof candidate.reflectionStatus === "string" ? { reflectionStatus: candidate.reflectionStatus } : {}),
+    }];
+  });
+}
+
+function semanticTraceFromDiagnostics(diagnostics: Record<string, unknown> | undefined): BenchmarkSemanticTrace | undefined {
+  const semanticUnitsUsed = semanticUnitsFromDiagnostics(diagnostics);
+  const questionAspectPlan = isQuestionAspectPlan(diagnostics?.questionAspectPlan) ? diagnostics?.questionAspectPlan : undefined;
+  const answerVerification = isNumericAnswerVerification(diagnostics?.answerVerification) ? diagnostics?.answerVerification : undefined;
+  const fallbackReason = typeof diagnostics?.fallbackReason === "string" ? diagnostics.fallbackReason : undefined;
+  const calculatorResult = diagnostics?.calculatorResult;
+  if (!questionAspectPlan && semanticUnitsUsed.length === 0 && answerVerification === undefined && fallbackReason === undefined && calculatorResult === undefined) {
+    return undefined;
+  }
+  return {
+    ...(questionAspectPlan ? { questionAspectPlan } : {}),
+    semanticUnitsUsed,
+    ...(calculatorResult === undefined ? {} : { calculatorResult }),
+    ...(answerVerification ? { answerVerification } : {}),
+    ...(fallbackReason ? { fallbackReason } : {}),
+  };
+}
+
 function evidenceTraceFromPulse(pulse: Awaited<ReturnType<typeof runEvalScenario>>["pulse"]): BenchmarkEvidenceTrace {
-  const evidenceRecords = evidenceRecordsFromDiagnostics(pulse.evidencePack?.diagnostics);
+  const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown> | undefined;
+  const evidenceRecords = evidenceRecordsFromDiagnostics(diagnostics);
   const citationChunkIds = uniqueStrings(pulse.evidencePack?.citations.map((citation) => citation.chunkId) ?? []);
-  const selectedChunkIds = uniqueStrings(
-    pulse.evidencePack?.chunkEvidencePack?.selectedChunks.map((selected) => selected.chunkId) ?? [],
-  );
+  const selectedChunkIds = uniqueStrings([
+    ...(pulse.evidencePack?.chunkEvidencePack?.selectedChunks.map((selected) => selected.chunkId) ?? []),
+    ...(pulse.evidencePack?.evidenceRows.map((row) => row.evidenceChunkId) ?? []),
+    ...citationChunkIds,
+  ]);
   const evidenceRecordChunkIds = uniqueStrings(evidenceRecords.flatMap((record) => record.evidenceChunkIds));
+  const semanticTrace = semanticTraceFromDiagnostics(diagnostics);
 
   return {
     citationChunkIds,
@@ -118,6 +173,7 @@ function evidenceTraceFromPulse(pulse: Awaited<ReturnType<typeof runEvalScenario
         ...(field.quote ? { quote: field.quote } : {}),
       })),
     })),
+    ...(semanticTrace ? { semanticTrace } : {}),
   };
 }
 

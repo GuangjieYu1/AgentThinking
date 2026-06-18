@@ -8,7 +8,7 @@ import { PulseEngine } from "../src/services/pulse.js";
 import { VectorStore } from "../src/services/vector-store.js";
 
 const libraryName = "南航年报测试-txt清洁版";
-const iterations = 5;
+const iterations = 2;
 const mode = "progressive" as const;
 
 const questions = [

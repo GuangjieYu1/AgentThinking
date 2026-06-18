@@ -37,6 +37,7 @@ describe("runBenchmarkSuite", () => {
     expect(result.records[0]?.evidenceTrace?.citationChunkIds.length).toBeGreaterThan(0);
     expect(result.records[0]?.evidenceTrace?.selectedChunkIds.length).toBeGreaterThan(0);
     expect(result.records[0]?.evidenceTrace?.evidenceRecordChunkIds.length).toBeGreaterThan(0);
+    expect(result.records[0]?.evidenceTrace?.semanticTrace?.fallbackReason).toBeTruthy();
     expect(result.records[0]?.testsetAnswers?.length).toBeGreaterThan(0);
     expect(result.records[0]?.answerReview).toBeTruthy();
     expect(result.records[0]?.answerReview?.sourceComparisons.length).toBeGreaterThan(0);

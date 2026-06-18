@@ -18,7 +18,9 @@ import type {
   ExtractionOutput,
   IndexingRationaleTrace,
   LibraryAoriProfile,
+  ReflectiveFinding,
   ReflectiveIndexReport,
+  SemanticUnit,
 } from "@agent-thinking/contracts";
 
 export interface AoriDraftGroup {
@@ -62,6 +64,34 @@ function relationNameOf(relation: AoriDocumentDraft["aspects"][number]["relation
 
 function quoteForChunk(chunk: Chunk | undefined): string {
   return truncateText((chunk?.text ?? "").replace(/\s+/g, " ").trim(), 260);
+}
+
+function semanticUnitSourceChunks(unit: { sourceChunkIds: string[] }, chunkById: Map<string, Chunk>): string[] {
+  return uniqueStrings(unit.sourceChunkIds).filter((chunkId) => chunkById.has(chunkId));
+}
+
+function normalizeSemanticUnit(
+  unit: NonNullable<AoriDocumentDraft["semanticUnits"]>[number],
+  input: BuildAoriDocumentIndexInput,
+  chunkById: Map<string, Chunk>,
+): SemanticUnit | undefined {
+  const sourceChunkIds = semanticUnitSourceChunks(unit, chunkById);
+  if (sourceChunkIds.length === 0) return undefined;
+  const base = {
+    ...unit,
+    id: unit.id || `aori-semantic-${randomUUID()}`,
+    libraryId: input.libraryId,
+    documentId: input.documentId,
+    versionId: input.versionId,
+    title: unit.title ? truncateText(unit.title, 240) : undefined,
+    summary: truncateText(unit.summary || unit.title || unit.kind, 3000),
+    sourceChunkIds,
+    sourceNodeIds: uniqueStrings(unit.sourceNodeIds ?? []),
+    confidence: Math.max(0, Math.min(1, unit.confidence ?? 0.3)),
+    reflectionStatus: unit.reflectionStatus ?? "needs_review",
+    reflectionNotes: uniqueStrings(unit.reflectionNotes ?? []).map((note) => truncateText(note, 500)),
+  };
+  return base as SemanticUnit;
 }
 
 function makeGap(input: {
@@ -148,8 +178,23 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
   const aspects: Aspect[] = [];
   const closureReports: ClosureReport[] = [];
   const allRelations: AspectRelation[] = [];
+  const semanticUnits: SemanticUnit[] = [];
+  const reflectiveFindings: ReflectiveFinding[] = [];
 
   for (const [draftIndex, group] of input.drafts.entries()) {
+    for (const draftUnit of group.draft.semanticUnits ?? []) {
+      const unit = normalizeSemanticUnit(draftUnit, input, chunkById);
+      if (unit) semanticUnits.push(unit);
+    }
+    for (const finding of group.draft.reflectiveFindings ?? []) {
+      reflectiveFindings.push({
+        id: finding.id ?? `aori-finding-${randomUUID()}`,
+        semanticUnitId: finding.semanticUnitId,
+        findingType: finding.findingType,
+        severity: finding.severity,
+        message: truncateText(finding.message, 1000),
+      });
+    }
     for (const [aspectIndex, draftAspect] of group.draft.aspects.entries()) {
       const aspectId = `aori-aspect-${randomUUID()}`;
       const gaps: AoriGapItem[] = [];
@@ -319,6 +364,8 @@ export function buildAoriDocumentIndex(input: BuildAoriDocumentIndexInput): Aori
       entries: [...lexiconByName.values()].sort((left, right) => left.relationName.localeCompare(right.relationName)),
     },
     closureReports,
+    semanticUnits,
+    reflectiveFindings,
     selfQuestions: draftValues.flatMap((draft) => draft.selfQuestions).slice(0, 60).map((question) => ({
       id: `aori-self-question-${randomUUID()}`,
       versionId: input.versionId,

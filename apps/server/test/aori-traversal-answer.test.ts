@@ -11,6 +11,7 @@ import type {
   DfsStepDecision,
   DfsStepInput,
   FinalAnswerFromChunksInput,
+  SemanticUnitDraft,
   SearchResult,
 } from "@agent-thinking/contracts";
 import { AgentDatabase } from "../src/db.js";
@@ -135,6 +136,7 @@ function saveAoriIndex(db: AgentDatabase, input: {
   aspects: Parameters<typeof buildAoriDocumentIndex>[0]["drafts"][number]["draft"]["aspects"];
   summary?: string;
   centralQuestion?: string;
+  semanticUnits?: SemanticUnitDraft[];
 }): void {
   db.saveAoriDocumentIndex(buildAoriDocumentIndex({
     libraryId: input.libraryId,
@@ -155,6 +157,7 @@ function saveAoriIndex(db: AgentDatabase, input: {
           confidence: 0.8,
         },
         aspects: input.aspects,
+        semanticUnits: input.semanticUnits ?? [],
         selfQuestions: [],
         reflectiveReport: { summary: "ok", completenessRisk: "none", warnings: [], truncationCount: 0 },
       },
@@ -665,6 +668,133 @@ describe("AORI traversal answering", () => {
     expect(pulse.pulse.answer).not.toContain("手表");
     const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
     expect((diagnostics.evidenceRecords as unknown[])).toHaveLength(1);
+    db.close();
+  });
+
+  it("answers numeric aggregation from persisted semantic units before Demand fallback", async () => {
+    const db = await database();
+    const library = db.createLibrary("Semantic Numeric AORI");
+    const version = db.createDocumentVersion(library.id, "semantic-numeric.md", "text/markdown", "hash", "semantic-numeric.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "资金表", pageNumber: null, startChar: 0, endChar: 80, text: "资金表：项目 A 10 万元，项目 B 4 万元，合计 14 万元。" },
+    ]);
+    saveAoriIndex(db, {
+      libraryId: library.id,
+      documentName: "semantic-numeric.md",
+      versionId: version.id,
+      documentId: version.documentId,
+      chunks,
+      aspects: [],
+      semanticUnits: [{
+        id: "semantic-reconciliation-1",
+        kind: "reconciliation",
+        title: "资金表 合计 总额",
+        summary: "资金表 合计 总额 computed from itemized rows.",
+        sourceChunkIds: [chunks[0]!.id],
+        confidence: 0.94,
+        reflectionStatus: "ok",
+        name: "资金表",
+        formulaType: "sum",
+        items: [
+          { label: "项目 A", value: 10, unit: "万元", sign: 1, sourceRowId: "row-1" },
+          { label: "项目 B", value: 4, unit: "万元", sign: 1, sourceRowId: "row-2" },
+        ],
+        computedTotal: 14,
+        reportedTotal: 14,
+        diff: 0,
+        closed: true,
+      }],
+    });
+    const events: string[] = [];
+
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel()).create(
+      library.id,
+      "资金表合计总额是多少？",
+      "full",
+      (event) => {
+        events.push(event.type);
+      },
+    );
+
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_semantic");
+    expect(pulse.pulse.answer).toContain("14万元");
+    expect(pulse.pulse.answer).toContain("闭合");
+    expect(events).toContain("question_task_generated");
+    expect(events).not.toContain("demand_plan_generated");
+    const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
+    expect(diagnostics.answerPipeline).toBe("aori_semantic");
+    expect(diagnostics.questionAspectPlan).toBeDefined();
+    expect(diagnostics.semanticUnitsUsed).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "semantic-reconciliation-1" }),
+    ]));
+    expect(diagnostics.answerVerification).toMatchObject({ passed: true, computedTotal: 14 });
+    db.close();
+  });
+
+  it("answers negative fact questions from the matching target, predicate, and scope", async () => {
+    const db = await database();
+    const library = db.createLibrary("Semantic Negative AORI");
+    const version = db.createDocumentVersion(library.id, "semantic-negative.md", "text/markdown", "hash", "semantic-negative.md", {
+      indexStrategy: "aspect_oriented_reflective",
+    }).version;
+    const chunks = db.replaceChunks(library.id, version.id, [
+      { ordinal: 0, headingPath: "债务融资工具", pageNumber: null, startChar: 0, endChar: 40, text: "报告期内债务融资工具不存在违约。" },
+      { ordinal: 1, headingPath: "飞行学员贷款", pageNumber: null, startChar: 41, endChar: 80, text: "报告期内飞行学员贷款不存在违约。" },
+    ]);
+    saveAoriIndex(db, {
+      libraryId: library.id,
+      documentName: "semantic-negative.md",
+      versionId: version.id,
+      documentId: version.documentId,
+      chunks,
+      aspects: [],
+      semanticUnits: [
+        {
+          id: "negative-debt",
+          kind: "negative_fact",
+          title: "债务融资工具",
+          summary: "报告期内债务融资工具不存在违约。",
+          sourceChunkIds: [chunks[0]!.id],
+          confidence: 0.92,
+          reflectionStatus: "ok",
+          target: "债务融资工具",
+          predicate: "不存在",
+          scope: "报告期内",
+          statement: "报告期内债务融资工具不存在违约。",
+          certainty: "explicit",
+        },
+        {
+          id: "negative-loan",
+          kind: "negative_fact",
+          title: "飞行学员贷款",
+          summary: "报告期内飞行学员贷款不存在违约。",
+          sourceChunkIds: [chunks[1]!.id],
+          confidence: 0.92,
+          reflectionStatus: "ok",
+          target: "飞行学员贷款",
+          predicate: "不存在",
+          scope: "报告期内",
+          statement: "报告期内飞行学员贷款不存在违约。",
+          certainty: "explicit",
+        },
+      ],
+    });
+
+    const pulse = await new PulseEngine(db, new ThrowingVectorStore(db), new SkillCountTestModel()).create(
+      library.id,
+      "报告期内债务融资工具是否存在违约？",
+      "full",
+    );
+
+    expect(pulse.evidencePack?.pipeline?.packBuilder).toBe("aori_semantic");
+    expect(pulse.pulse.answer).toContain("债务融资工具不存在违约");
+    expect(pulse.pulse.answer).not.toContain("飞行学员贷款");
+    const diagnostics = pulse.evidencePack?.diagnostics as Record<string, unknown>;
+    expect(diagnostics.semanticUnitsUsed).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "negative-debt" }),
+    ]));
     db.close();
   });
 });

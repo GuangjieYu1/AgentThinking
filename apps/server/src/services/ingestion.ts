@@ -17,6 +17,7 @@ import { isWordMediaType } from "../domain/files.js";
 import { parseMarkdownStructure } from "../domain/source-structure.js";
 import type { GraphRulesResult } from "./graphRules.js";
 import { aoriIndexToExtraction, buildAoriDocumentIndex, type AoriDraftGroup } from "./aori.js";
+import { buildDraftSemanticIndex } from "./aori-semantic-index.js";
 import { LibraryAoriService } from "./library-aori.js";
 import { LibraryEventBus } from "./library-events.js";
 import type { ModelProvider } from "./models.js";
@@ -469,7 +470,7 @@ export class IngestionQueue extends EventEmitter {
       if (shouldRunAori && aoriContextPlan) {
         const draftGroups: AoriDraftGroup[] = [];
         for (const group of aoriContextPlan.groups) {
-          const draft = await this.model.extractAoriDocument({
+          const modelDraft = await this.model.extractAoriDocument({
             documentName: source.documentName,
             chunks: group.chunks,
             context: {
@@ -488,6 +489,17 @@ export class IngestionQueue extends EventEmitter {
               allowSmallContextOnlyForQuoteLookup: this.config.aoriAllowSmallContextOnlyForQuoteLookup,
             },
           });
+          const semanticDraft = buildDraftSemanticIndex({
+            libraryId: source.libraryId,
+            documentId: source.documentId,
+            versionId: source.version.id,
+            chunks: group.chunks,
+          });
+          const draft = {
+            ...modelDraft,
+            semanticUnits: [...(modelDraft.semanticUnits ?? []), ...semanticDraft.semanticUnits],
+            reflectiveFindings: [...(modelDraft.reflectiveFindings ?? []), ...semanticDraft.reflectiveFindings],
+          };
           draftGroups.push({ groupId: group.groupId, draft });
         }
         const aoriIndex = buildAoriDocumentIndex({

@@ -71,7 +71,11 @@ import type {
   RelationStatus,
   RelationType,
   ReflectiveIndexReport,
+  ReflectiveFinding,
   SearchResult,
+  SemanticUnit,
+  SemanticUnitKind,
+  SemanticUnitReflectionStatus,
   SummaryTreeLevel,
   SummaryTreeNode,
   StatementStatus,
@@ -355,6 +359,19 @@ function parseJsonValue<T>(value: Row[string] | undefined, fallback: T): T {
 
 function normalizeIndexStrategy(value: unknown): IndexStrategy {
   return value === "aspect_oriented_reflective" ? "aspect_oriented_reflective" : "bottom_up_evidence";
+}
+
+function isSemanticUnitKind(value: unknown): value is SemanticUnitKind {
+  return value === "table" ||
+    value === "metric" ||
+    value === "event" ||
+    value === "causal_chain" ||
+    value === "reconciliation" ||
+    value === "negative_fact";
+}
+
+function semanticUnitReflectionStatus(value: unknown): SemanticUnitReflectionStatus {
+  return value === "ok" || value === "conflicting" || value === "incomplete" ? value : "needs_review";
 }
 
 function sqliteBoolean(value: unknown): boolean {
@@ -884,6 +901,31 @@ export class AgentDatabase {
         risk TEXT NOT NULL CHECK (risk IN ('low','medium','high')),
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS aori_semantic_units (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        title TEXT,
+        summary TEXT NOT NULL,
+        source_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+        source_node_ids_json TEXT NOT NULL DEFAULT '[]',
+        confidence REAL NOT NULL DEFAULT 0.3,
+        reflection_status TEXT NOT NULL DEFAULT 'needs_review',
+        reflection_notes_json TEXT NOT NULL DEFAULT '[]',
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS aori_reflective_findings (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+        semantic_unit_id TEXT NOT NULL,
+        finding_type TEXT NOT NULL,
+        severity TEXT NOT NULL CHECK (severity IN ('low','medium','high')),
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS library_aori_profiles (
         library_id TEXT PRIMARY KEY REFERENCES libraries(id) ON DELETE CASCADE,
         summary TEXT NOT NULL,
@@ -1151,6 +1193,9 @@ export class AgentDatabase {
       CREATE INDEX IF NOT EXISTS idx_retrieval_units_build ON retrieval_units(build_id, version_id, ordinal);
       CREATE INDEX IF NOT EXISTS idx_retrieval_units_context ON retrieval_units(context_unit_id);
       CREATE INDEX IF NOT EXISTS idx_vector_records_target ON vector_records(library_id, build_id, target_type, dimensions);
+      CREATE INDEX IF NOT EXISTS idx_aori_semantic_units_version ON aori_semantic_units(version_id, kind);
+      CREATE INDEX IF NOT EXISTS idx_aori_semantic_units_library ON aori_semantic_units(library_id, kind);
+      CREATE INDEX IF NOT EXISTS idx_aori_reflective_findings_version ON aori_reflective_findings(version_id);
     `);
     this.addColumn("libraries", "owner_user_id", "TEXT REFERENCES users(id) ON DELETE CASCADE");
     this.addColumn("chunks", "start_line", "INTEGER");
@@ -2457,6 +2502,8 @@ export class AgentDatabase {
   }
 
   private clearAoriForVersion(versionId: string): void {
+    this.sql.prepare("DELETE FROM aori_reflective_findings WHERE version_id = ?").run(versionId);
+    this.sql.prepare("DELETE FROM aori_semantic_units WHERE version_id = ?").run(versionId);
     this.sql.prepare("DELETE FROM aori_indexing_rationale WHERE version_id = ?").run(versionId);
     this.sql.prepare("DELETE FROM aori_self_questions WHERE version_id = ?").run(versionId);
     this.sql.prepare("DELETE FROM aori_closure_reports WHERE version_id = ?").run(versionId);
@@ -2618,6 +2665,46 @@ export class AgentDatabase {
           question.status,
         );
       }
+      const insertSemanticUnit = this.sql.prepare(`
+        INSERT INTO aori_semantic_units
+          (id, version_id, library_id, document_id, kind, title, summary, source_chunk_ids_json,
+            source_node_ids_json, confidence, reflection_status, reflection_notes_json, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const unit of index.semanticUnits) {
+        insertSemanticUnit.run(
+          unit.id,
+          index.versionId,
+          index.libraryId,
+          index.documentId,
+          unit.kind,
+          unit.title ?? null,
+          unit.summary,
+          JSON.stringify(unit.sourceChunkIds),
+          JSON.stringify(unit.sourceNodeIds ?? []),
+          unit.confidence,
+          unit.reflectionStatus,
+          JSON.stringify(unit.reflectionNotes ?? []),
+          JSON.stringify(unit),
+          timestamp,
+        );
+      }
+      const insertReflectiveFinding = this.sql.prepare(`
+        INSERT INTO aori_reflective_findings
+          (id, version_id, semantic_unit_id, finding_type, severity, message, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const finding of index.reflectiveFindings) {
+        insertReflectiveFinding.run(
+          finding.id,
+          index.versionId,
+          finding.semanticUnitId,
+          finding.findingType,
+          finding.severity,
+          finding.message,
+          timestamp,
+        );
+      }
       const insertRationale = this.sql.prepare(`
         INSERT INTO aori_indexing_rationale
           (id, version_id, stage, decision_type, summary, input_token_estimate, used_token_estimate,
@@ -2768,6 +2855,35 @@ export class AgentDatabase {
         evidenceChunkIds: parseTextList(entry.evidence_chunk_ids_json),
         status: String(entry.status) as SelfQuestion["status"],
       }));
+    const semanticUnits = rows(this.sql.prepare("SELECT * FROM aori_semantic_units WHERE version_id = ? ORDER BY rowid"), versionId)
+      .flatMap((entry): SemanticUnit[] => {
+        const kind = isSemanticUnitKind(entry.kind) ? entry.kind : undefined;
+        const payload = parseJsonValue<Record<string, unknown>>(entry.payload_json, {});
+        if (!kind || payload.kind !== kind) return [];
+        return [{
+          ...payload,
+          id: String(entry.id),
+          kind,
+          libraryId: source.libraryId,
+          documentId: source.documentId,
+          versionId,
+          title: entry.title === null || entry.title === undefined ? undefined : String(entry.title),
+          summary: String(entry.summary),
+          sourceChunkIds: parseTextList(entry.source_chunk_ids_json),
+          sourceNodeIds: parseTextList(entry.source_node_ids_json),
+          confidence: Number(entry.confidence ?? 0.3),
+          reflectionStatus: semanticUnitReflectionStatus(entry.reflection_status),
+          reflectionNotes: parseTextList(entry.reflection_notes_json),
+        } as SemanticUnit];
+      });
+    const reflectiveFindings = rows(this.sql.prepare("SELECT * FROM aori_reflective_findings WHERE version_id = ? ORDER BY rowid"), versionId)
+      .map((entry): ReflectiveFinding => ({
+        id: String(entry.id),
+        semanticUnitId: String(entry.semantic_unit_id),
+        findingType: String(entry.finding_type) as ReflectiveFinding["findingType"],
+        severity: String(entry.severity) as ReflectiveFinding["severity"],
+        message: String(entry.message),
+      }));
     const rationaleTrace = rows(this.sql.prepare("SELECT * FROM aori_indexing_rationale WHERE version_id = ? ORDER BY rowid"), versionId)
       .map((entry): IndexingRationaleTrace => ({
         id: String(entry.id),
@@ -2816,6 +2932,8 @@ export class AgentDatabase {
       relationLexicon,
       closureReports,
       selfQuestions,
+      semanticUnits,
+      reflectiveFindings,
       reflectiveReport: parseJsonValue<ReflectiveIndexReport>(doc.reflective_report_json, {
         summary: "",
         completenessRisk: "none",

@@ -482,6 +482,8 @@ export async function extractEvidenceRecords(input: {
 }
 
 function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[]): RetrievalTrace[] {
+  const extractedRecordIds = records.map((record) => record.recordId);
+  const extractedChunkIds = allRecordChunkIds(records);
   return [{
     stepIndex: 1,
     tool: "planDemandAnswer",
@@ -494,18 +496,18 @@ function retrievalTrace(plan: DemandAnswerPlan, records: EvidenceRecord[]): Retr
     stepIndex: 2,
     tool: "extractEvidenceRecords",
     purpose: "Extract source-bound fields from AORI item chunks according to the demand plan.",
-    inputIds: allRecordChunkIds(records),
-    outputIds: records.map((record) => record.recordId),
+    inputIds: extractedChunkIds,
+    outputIds: extractedRecordIds,
     newEvidenceRowCount: records.length,
-    status: records.length > 0 ? "success" : "empty",
+    status: extractedRecordIds.length === 0 || extractedChunkIds.length === 0 ? "empty" : "success",
   }, {
     stepIndex: 3,
     tool: "synthesizeDemandAnswer",
     purpose: "Synthesize the final answer from the user question, demand plan, EvidenceRecords, and field-level source quotes.",
-    inputIds: records.map((record) => record.recordId),
+    inputIds: extractedRecordIds,
     outputIds: ["final_answer"],
     newEvidenceRowCount: records.length,
-    status: records.length > 0 ? "success" : "empty",
+    status: extractedRecordIds.length === 0 ? "empty" : "success",
   }];
 }
 

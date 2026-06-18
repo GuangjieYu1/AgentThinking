@@ -12,6 +12,7 @@ import type {
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
 import { AoriDemandAnswerEngine } from "./aori-demand-answer.js";
+import { AoriSemanticAnswerEngine } from "./aori-semantic-answer.js";
 import type { ModelProvider } from "./models.js";
 import { PulseEvidenceController } from "./pulse-evidence-controller.js";
 import type { VectorStore } from "./vector-store.js";
@@ -172,13 +173,37 @@ export class PulseEngine {
     try {
       const aoriAnswerMode = this.options.aoriAnswerMode ?? "demand";
       if (aoriAnswerMode !== "legacy" && this.db.listAoriDocumentIndexes(libraryId).length > 0) {
-        const engine = new AoriDemandAnswerEngine(this.db, this.model);
-        const result = await engine.answer({
+        const semanticEngine = new AoriSemanticAnswerEngine(this.db);
+        const semanticResult = await semanticEngine.answer({
           libraryId,
           question,
           mode,
           ...(eventSink ? { eventSink } : {}),
         });
+        const result = semanticResult.usedSemanticPath
+          ? semanticResult
+          : await new AoriDemandAnswerEngine(this.db, this.model).answer({
+            libraryId,
+            question,
+            mode,
+            ...(eventSink ? { eventSink } : {}),
+          }).then((demandResult) => ({
+            ...demandResult,
+            storageEvidencePack: {
+              ...demandResult.storageEvidencePack,
+              diagnostics: {
+                ...demandResult.storageEvidencePack.diagnostics,
+                fallbackReason: semanticResult.fallbackReason,
+              },
+            },
+            answer: {
+              ...demandResult.answer,
+              diagnostics: {
+                ...demandResult.answer.diagnostics,
+                fallbackReason: semanticResult.fallbackReason,
+              },
+            },
+          }));
         await emitPulse(eventSink, { type: "answer", answer: result.answer.answer, summary: result.answer.summary });
         await emitPulse(eventSink, { type: "stage", message: "正在保存 AORI answer 脉冲结果" });
         const metrics = this.buildPulseMetrics(startedAt, startedAtMs, metricsAccumulator);

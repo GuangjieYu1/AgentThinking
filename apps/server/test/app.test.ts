@@ -109,6 +109,7 @@ describe("HTTP application", () => {
       filesDir: join(dir, "files"),
       ocrCacheDir: join(dir, "ocr"),
       provider: "fake",
+      authRequired: false,
     });
     const db = new AgentDatabase(dir);
     const vectors = new VectorStore(db);
@@ -155,6 +156,7 @@ describe("HTTP application", () => {
       filesDir: join(dir, "files"),
       ocrCacheDir: join(dir, "ocr"),
       provider: "fake",
+      authRequired: false,
     });
     const db = new AgentDatabase(dir);
     const vectors = new VectorStore(db);
@@ -223,6 +225,7 @@ describe("HTTP application", () => {
       ocrCacheDir: join(dir, "ocr"),
       provider: "fake",
       aiApiKey: "never-return-this-key",
+      authRequired: false,
     });
     const db = new AgentDatabase(dir);
     const vectors = new VectorStore(db);
@@ -524,6 +527,7 @@ describe("HTTP application", () => {
       filesDir: join(dir, "files"),
       ocrCacheDir: join(dir, "ocr"),
       provider: "fake",
+      authRequired: false,
     });
     const db = new AgentDatabase(dir);
     const vectors = new VectorStore(db);
@@ -601,6 +605,7 @@ describe("HTTP application", () => {
       analysisDir: join(dir, "analysis"),
       ocrCacheDir: join(dir, "ocr"),
       provider: "fake",
+      authRequired: false,
     });
     const db = new AgentDatabase(dir);
     const vectors = new VectorStore(db);

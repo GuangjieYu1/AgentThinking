@@ -37,6 +37,20 @@ interface DemandSourceItem {
   chunkIds: string[];
 }
 
+export interface DemandFallbackBudget {
+  maxModelCalls: number;
+  maxTotalTokens: number;
+  maxSourceItems: number;
+  maxEvidenceRecords: number;
+}
+
+export const defaultDemandFallbackBudget: DemandFallbackBudget = {
+  maxModelCalls: 18,
+  maxTotalTokens: 120_000,
+  maxSourceItems: 24,
+  maxEvidenceRecords: 16,
+};
+
 function truncateText(value: string, max: number): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   return normalized.length > max ? normalized.slice(0, Math.max(0, max - 1)).trimEnd() : normalized;
@@ -425,18 +439,30 @@ export async function extractEvidenceRecords(input: {
   map: AoriTraversalMap;
   chunksById: Map<string, Chunk>;
   model: ModelProvider;
+  budget: DemandFallbackBudget;
   eventSink?: PulseEventSink;
 }): Promise<EvidenceRecord[]> {
   const records: EvidenceRecord[] = [];
   let emittedHitCount = 0;
+  let sourceItemCount = 0;
+  let modelCallCount = 0;
+  let estimatedTokenCount = 0;
   await emitDemand(input.eventSink, "demand_records_started", "Extracting evidence records from demand plan fields.", {
     requiredRecordCount: input.plan.requiredRecords.length,
+    budget: input.budget,
   });
   for (const recordSpec of input.plan.requiredRecords) {
+    if (records.length >= input.budget.maxEvidenceRecords || modelCallCount >= input.budget.maxModelCalls || sourceItemCount >= input.budget.maxSourceItems) break;
     const sourceItems = sourceItemsForRecord(input.map, input.plan, recordSpec);
     for (const sourceItem of sourceItems) {
+      if (records.length >= input.budget.maxEvidenceRecords || modelCallCount >= input.budget.maxModelCalls || sourceItemCount >= input.budget.maxSourceItems) break;
       const chunks = sourceItem.chunkIds.flatMap((chunkId) => input.chunksById.get(chunkId) ?? []);
       if (chunks.length === 0) continue;
+      const estimatedSourceTokens = Math.ceil(chunks.reduce((sum, chunk) => sum + chunk.text.length, 0) / 4);
+      if (estimatedTokenCount + estimatedSourceTokens > input.budget.maxTotalTokens) break;
+      sourceItemCount += 1;
+      modelCallCount += 1;
+      estimatedTokenCount += estimatedSourceTokens;
       const record = await input.model.extractDemandEvidenceRecord({
         question: input.question,
         recordSpec,
@@ -546,6 +572,7 @@ function buildStorageEvidencePack(input: {
   records: EvidenceRecord[];
   chunks: Chunk[];
   plan: DemandAnswerPlan;
+  budget: DemandFallbackBudget;
 }): EvidencePack {
   const evidenceRows = buildEvidenceRows(input.records, input.chunks);
   return {
@@ -585,6 +612,7 @@ function buildStorageEvidencePack(input: {
       demandPlan: input.plan,
       evidenceRecords: input.records,
       sourceChunkIds: allRecordChunkIds(input.records),
+      fallbackBudget: input.budget,
       fallbackTraversalUsed: false,
       skillRouteFallback: input.modelName === "fake",
     },
@@ -595,6 +623,7 @@ export class AoriDemandAnswerEngine {
   constructor(
     private readonly db: AgentDatabase,
     private readonly model: ModelProvider,
+    private readonly budget: DemandFallbackBudget = defaultDemandFallbackBudget,
   ) {}
 
   async answer(input: {
@@ -608,6 +637,10 @@ export class AoriDemandAnswerEngine {
     const allChunkIds = uniqueStrings(Object.values(map.nodesById).flatMap((node) => node.chunkIds));
     const allChunks = this.db.getChunksByIds(allChunkIds);
     const chunksById = new Map(allChunks.map((chunk) => [chunk.id, chunk]));
+    const extractionBudget = {
+      ...this.budget,
+      maxModelCalls: Math.max(0, this.budget.maxModelCalls - 2),
+    };
     await emitPulse(input.eventSink, { type: "stage", message: "正在生成 AORI Demand Answer Plan" });
     const plan = await this.model.planDemandAnswer(buildDemandPlanInput(input.question, map));
     await emitDemand(input.eventSink, "demand_plan_generated", "AORI demand answer plan generated.", {
@@ -620,6 +653,7 @@ export class AoriDemandAnswerEngine {
       map,
       chunksById,
       model: this.model,
+      budget: extractionBudget,
       ...(input.eventSink ? { eventSink: input.eventSink } : {}),
     });
     await emitPulse(input.eventSink, { type: "stage", message: "正在合成 AORI Demand Answer" });
@@ -636,6 +670,7 @@ export class AoriDemandAnswerEngine {
         demandPlan: plan,
         evidenceRecords: records,
         sourceChunkIds: allRecordChunkIds(records),
+        fallbackBudget: this.budget,
         fallbackTraversalUsed: false,
         skillRouteFallback: this.model.name === "fake",
       },
@@ -650,6 +685,7 @@ export class AoriDemandAnswerEngine {
       records,
       chunks: usedChunks,
       plan,
+      budget: this.budget,
     });
     const chunkSummaries: ChunkAnswerSummary[] = [];
     return {

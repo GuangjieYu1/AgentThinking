@@ -4,5 +4,6 @@ coverage/
 .vite/
 .env
 data/
+experiments/reports/*
+!experiments/reports/.gitkeep
 *.log
-

@@ -11,7 +11,7 @@ import type {
   Relation,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase, PendingPulseHit } from "../db.js";
-import { AoriDemandAnswerEngine } from "./aori-demand-answer.js";
+import { AoriDemandAnswerEngine, defaultDemandFallbackBudget } from "./aori-demand-answer.js";
 import { AoriSemanticAnswerEngine } from "./aori-semantic-answer.js";
 import type { ModelProvider } from "./models.js";
 import { PulseEvidenceController } from "./pulse-evidence-controller.js";
@@ -182,7 +182,7 @@ export class PulseEngine {
         });
         const result = semanticResult.usedSemanticPath
           ? semanticResult
-          : await new AoriDemandAnswerEngine(this.db, this.model).answer({
+          : await new AoriDemandAnswerEngine(this.db, this.model, defaultDemandFallbackBudget).answer({
             libraryId,
             question,
             mode,
@@ -193,6 +193,7 @@ export class PulseEngine {
               ...demandResult.storageEvidencePack,
               diagnostics: {
                 ...demandResult.storageEvidencePack.diagnostics,
+                fallbackBudget: defaultDemandFallbackBudget,
                 fallbackReason: semanticResult.fallbackReason,
               },
             },

@@ -19,8 +19,12 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-function fixtureRun(dataDir: string, runId = "2026-06-11-test"): BenchmarkRunResult {
-  const runPath = join(dataDir, "benchmarks", `${runId}.json`);
+function benchmarkConfig(dataDir: string) {
+  return getConfig({ dataDir, benchmarkDir: join(dataDir, "runtime", "benchmarks") });
+}
+
+function fixtureRun(benchmarkDir: string, runId = "2026-06-11-test"): BenchmarkRunResult {
+  const runPath = join(benchmarkDir, `${runId}.json`);
   return {
     id: runId,
     path: runPath,
@@ -196,10 +200,11 @@ function fixtureRun(dataDir: string, runId = "2026-06-11-test"): BenchmarkRunRes
 describe("BenchmarkService", () => {
   it("exports compact readable Chinese markdown", async () => {
     const dataDir = await temporaryDir();
-    const service = new BenchmarkService(getConfig({ dataDir }));
-    const run = fixtureRun(dataDir);
+    const config = benchmarkConfig(dataDir);
+    const service = new BenchmarkService(config);
+    const run = fixtureRun(config.benchmarkDir);
 
-    await mkdir(join(dataDir, "benchmarks"), { recursive: true });
+    await mkdir(config.benchmarkDir, { recursive: true });
     await writeFile(run.path, JSON.stringify(run, null, 2), "utf8");
 
     const markdown = await service.exportMarkdown(run.id);
@@ -222,12 +227,13 @@ describe("BenchmarkService", () => {
   it("deletes a benchmark knowledge base and removes the run library pointer", async () => {
     const dataDir = await temporaryDir();
     const db = new AgentDatabase(dataDir);
-    const service = new BenchmarkService(getConfig({ dataDir }), db);
+    const config = benchmarkConfig(dataDir);
+    const service = new BenchmarkService(config, db);
     const library = db.createLibrary("Benchmark delete me");
-    const run = { ...fixtureRun(dataDir), libraryId: library.id };
+    const run = { ...fixtureRun(config.benchmarkDir), libraryId: library.id };
 
     try {
-      await mkdir(join(dataDir, "benchmarks"), { recursive: true });
+      await mkdir(config.benchmarkDir, { recursive: true });
       await writeFile(run.path, JSON.stringify(run, null, 2), "utf8");
 
       const deleted = await service.deleteRunKnowledgeBase(run.id);

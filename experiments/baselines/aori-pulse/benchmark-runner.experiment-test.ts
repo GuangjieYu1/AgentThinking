@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { aoriPulseEvalScenarios, cleanupEvalDatabases } from "./helpers/aori-pulse-eval-fixtures.js";
-import { AgentDatabase } from "../src/db.js";
-import { benchmarkScenarioCatalog, benchmarkSuiteCatalog, runBenchmarkSuite } from "../src/services/benchmark-runner.js";
+import { aoriPulseEvalScenarios, cleanupEvalDatabases } from "../../../apps/server/test/helpers/aori-pulse-eval-fixtures.js";
+import { AgentDatabase } from "../../../apps/server/src/db.js";
+import { benchmarkScenarioCatalog, benchmarkSuiteCatalog, runBenchmarkSuite } from "./benchmark-runner.js";
 
 const temporaryDirectories: string[] = [];
 

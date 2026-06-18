@@ -1,15 +1,18 @@
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { EvidencePack, PulseResponse } from "@agent-thinking/contracts";
-import { getConfig } from "../src/config.js";
-import { AgentDatabase } from "../src/db.js";
-import { createModelProvider } from "../src/services/models.js";
-import { PulseEngine } from "../src/services/pulse.js";
-import { VectorStore } from "../src/services/vector-store.js";
+import { getConfig } from "../../apps/server/src/config.js";
+import { AgentDatabase } from "../../apps/server/src/db.js";
+import { createModelProvider } from "../../apps/server/src/services/models.js";
+import { PulseEngine } from "../../apps/server/src/services/pulse.js";
+import { VectorStore } from "../../apps/server/src/services/vector-store.js";
 
 const libraryName = "南航年报测试-txt清洁版";
 const iterations = 2;
 const mode = "progressive" as const;
+const reportCitationLimit = 8;
+const reportEvidenceRowLimit = 12;
+const reportHitLimit = 10;
 
 const questions = [
   "存续债券余额合计是多少亿元？请列出计算过程。",
@@ -41,8 +44,8 @@ interface RunRecord {
   totalTokens: number;
   promptCacheHitTokens: number;
   promptCacheMissTokens: number;
-  hits: Array<{ type: string; id: string; label: string; score: number; excerpt?: string | null }>;
-  citations: Array<{ heading?: string; pageNumber?: number | null; chunkId?: string; quote?: string }>;
+  hits: Array<{ type: string; id: string; label: string; score: number }>;
+  citations: Array<{ heading?: string; pageNumber?: number | null; chunkId?: string }>;
   evidenceRows: Array<{
     rowId: string;
     type: string;
@@ -50,7 +53,6 @@ interface RunRecord {
     usage: string;
     chunkId: string;
     claim: string;
-    quote: string;
   }>;
   gaps: Array<{ type: string; description: string; severity?: string }>;
   pipeline?: string | undefined;
@@ -88,23 +90,21 @@ function metric(response: PulseResponse | undefined, key: "durationMs" | "modelC
 }
 
 function evidenceRows(pack: EvidencePack | undefined): RunRecord["evidenceRows"] {
-  return (pack?.evidenceRows ?? []).slice(0, 24).map((row) => ({
+  return (pack?.evidenceRows ?? []).slice(0, reportEvidenceRowLimit).map((row) => ({
     rowId: row.rowId,
     type: row.evidenceType,
     role: row.role ?? "-",
     usage: row.usage ?? "-",
     chunkId: row.evidenceChunkId,
     claim: row.claimText,
-    quote: row.evidenceQuote,
   }));
 }
 
 function citations(pack: EvidencePack | undefined): RunRecord["citations"] {
-  return (pack?.citations ?? []).slice(0, 18).map((citation) => ({
+  return (pack?.citations ?? []).slice(0, reportCitationLimit).map((citation) => ({
     heading: Array.isArray(citation.headingPath) ? citation.headingPath.join(" / ") : citation.headingPath ?? "",
     pageNumber: citation.pageNumber,
     chunkId: citation.chunkId,
-    quote: citation.quote,
   }));
 }
 
@@ -131,12 +131,11 @@ function recordFromResponse(questionIndex: number, iteration: number, question: 
     totalTokens: metric(response, "totalTokens"),
     promptCacheHitTokens: metric(response, "promptCacheHitTokens"),
     promptCacheMissTokens: metric(response, "promptCacheMissTokens"),
-    hits: response.hits.slice(0, 20).map((hit) => ({
+    hits: response.hits.slice(0, reportHitLimit).map((hit) => ({
       type: hit.targetType,
       id: hit.targetId,
       label: hit.label,
       score: hit.score,
-      excerpt: hit.excerpt,
     })),
     citations: citations(response.evidencePack),
     evidenceRows: evidenceRows(response.evidencePack),
@@ -195,6 +194,7 @@ function renderMarkdown(input: {
     `- 生成时间：${input.createdAt}`,
     "- 说明：本次小 golden set 只提供问题，没有提供人工标准答案；报告记录 AORI Progressive 的原始回答、证据与消耗，供后续人工判分或补充 gold answer。",
     "- 说明：当前项目默认 AORI 答案模式会优先使用已导入知识库的 AORI 切面索引；因此本报告测的是“基于 AORI 索引后的脉冲问答”，不是不索引直接回答的 baseline。",
+    "- 说明：为提升可读性，本报告省略引用原文 quote 与 hit excerpt；如需回查原文，请通过 chunk id / row id 定位 evidence pack 或知识库片段。",
     "",
     "## 总览",
     "",
@@ -257,25 +257,25 @@ function renderMarkdown(input: {
       }
 
       if (record.citations.length > 0) {
-        lines.push("**Citations**", "", "| Chunk | Heading | Page | Quote |", "|---|---|---:|---|");
+        lines.push("**Citations**", "", "| Chunk | Heading | Page |", "|---|---|---:|");
         for (const citation of record.citations) {
-          lines.push(`| ${escapeTableCell(citation.chunkId)} | ${escapeTableCell(citation.heading)} | ${escapeTableCell(citation.pageNumber)} | ${escapeTableCell(compact(citation.quote, 260))} |`);
+          lines.push(`| ${escapeTableCell(citation.chunkId)} | ${escapeTableCell(citation.heading)} | ${escapeTableCell(citation.pageNumber)} |`);
         }
         lines.push("");
       }
 
       if (record.evidenceRows.length > 0) {
-        lines.push("**Evidence Rows**", "", "| Row | Type | Role | Usage | Chunk | Claim | Quote |", "|---|---|---|---|---|---|---|");
+        lines.push("**Evidence Rows**", "", "| Row | Type | Role | Usage | Chunk | Claim |", "|---|---|---|---|---|---|");
         for (const row of record.evidenceRows) {
-          lines.push(`| ${escapeTableCell(row.rowId)} | ${escapeTableCell(row.type)} | ${escapeTableCell(row.role)} | ${escapeTableCell(row.usage)} | ${escapeTableCell(row.chunkId)} | ${escapeTableCell(compact(row.claim, 220))} | ${escapeTableCell(compact(row.quote, 220))} |`);
+          lines.push(`| ${escapeTableCell(row.rowId)} | ${escapeTableCell(row.type)} | ${escapeTableCell(row.role)} | ${escapeTableCell(row.usage)} | ${escapeTableCell(row.chunkId)} | ${escapeTableCell(compact(row.claim, 220))} |`);
         }
         lines.push("");
       }
 
       if (record.hits.length > 0) {
-        lines.push("**Pulse Hits**", "", "| Type | ID | Label | Score | Excerpt |", "|---|---|---|---:|---|");
+        lines.push("**Pulse Hits**", "", "| Type | ID | Label | Score |", "|---|---|---|---:|");
         for (const hit of record.hits) {
-          lines.push(`| ${escapeTableCell(hit.type)} | ${escapeTableCell(hit.id)} | ${escapeTableCell(hit.label)} | ${hit.score.toFixed(3)} | ${escapeTableCell(compact(hit.excerpt, 220))} |`);
+          lines.push(`| ${escapeTableCell(hit.type)} | ${escapeTableCell(hit.id)} | ${escapeTableCell(hit.label)} | ${hit.score.toFixed(3)} |`);
         }
         lines.push("");
       }
@@ -323,9 +323,10 @@ async function main(): Promise<void> {
       createdAt,
       records,
     });
-    await mkdir(config.benchmarkDir, { recursive: true });
+    const reportsDir = resolve(import.meta.dirname, "../reports");
+    await mkdir(reportsDir, { recursive: true });
     const stamp = createdAt.replace(/[-:]/g, "").replace(/\..+$/, "").replace("T", "-");
-    const outputPath = join(config.benchmarkDir, `csair-golden-progressive-${stamp}.md`);
+    const outputPath = join(reportsDir, `csair-golden-progressive-${stamp}.md`);
     await writeFile(outputPath, report, "utf8");
     console.log(`Report written: ${outputPath}`);
   } finally {

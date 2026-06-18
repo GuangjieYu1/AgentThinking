@@ -526,7 +526,7 @@ export function buildAoriGraphView(index: AoriDocumentIndex, mode: "overview" | 
         for (const chunkId of item.evidenceChunkIds) {
           const chunkNodeId = `aori-chunk-node-${chunkId}`;
           if (!nodes.has(chunkNodeId)) {
-            addNode({ id: chunkNodeId, type: "source_chunk", label: chunkId, chunkId, evidenceStatus: "supported", closureStatus: "closed" }, 4);
+            addNode({ id: chunkNodeId, type: "source_chunk", label: chunkId, chunkId, evidenceStatus: "supported" }, 4);
             collapsedNodeIds.add(chunkNodeId);
           }
           addEdge({
@@ -536,7 +536,6 @@ export function buildAoriGraphView(index: AoriDocumentIndex, mode: "overview" | 
             type: "evidence",
             label: "evidence",
             evidenceStatus: "supported",
-            closureStatus: "closed",
           });
         }
       }

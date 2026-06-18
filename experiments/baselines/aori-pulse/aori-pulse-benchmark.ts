@@ -2,8 +2,8 @@ import { inspect } from "node:util";
 import {
   aoriPulseBenchmarkSuites,
   type BenchmarkSuite,
-} from "./helpers/aori-pulse-eval-fixtures.js";
-import { runBenchmarkSuite } from "../src/services/benchmark-runner.js";
+} from "../../../apps/server/test/helpers/aori-pulse-eval-fixtures.js";
+import { runBenchmarkSuite } from "./benchmark-runner.js";
 import type { BenchmarkRunRecord, BenchmarkScenarioSummary, BenchmarkSuiteSummary, PulseInputMode } from "@agent-thinking/contracts";
 
 type ProviderMode = "configured" | "fake";

@@ -14,10 +14,10 @@ import type {
   PulseInputMode,
   QuestionAspectPlan,
 } from "@agent-thinking/contracts";
-import type { AgentDatabase } from "../db.js";
-import { getConfig } from "../config.js";
-import { createModelProvider } from "./models.js";
-import type { BenchmarkAnswerReviewInput, ModelProvider } from "./models.js";
+import type { AgentDatabase } from "../../../apps/server/src/db.js";
+import { getConfig } from "../../../apps/server/src/config.js";
+import { createModelProvider } from "../../../apps/server/src/services/models.js";
+import type { BenchmarkAnswerReviewInput, ModelProvider } from "../../../apps/server/src/services/models.js";
 import {
   aoriPulseBenchmarkSuites,
   aoriPulseEvalScenarios,
@@ -28,7 +28,7 @@ import {
   EvalModelProvider,
   runEvalScenario,
   type EvalScenario,
-} from "../../test/helpers/aori-pulse-eval-fixtures.js";
+} from "../../../apps/server/test/helpers/aori-pulse-eval-fixtures.js";
 
 export interface BenchmarkRunnerArgs {
   iterations: number;

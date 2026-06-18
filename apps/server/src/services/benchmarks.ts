@@ -1,6 +1,5 @@
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import type {
   BenchmarkCatalog,
   BenchmarkRunListEntry,
@@ -10,11 +9,6 @@ import type {
 } from "@agent-thinking/contracts";
 import type { AppConfig } from "../config.js";
 import type { AgentDatabase } from "../db.js";
-import {
-  benchmarkScenarioCatalog,
-  benchmarkSuiteCatalog,
-  runBenchmarkSuite,
-} from "./benchmark-runner.js";
 
 const legacyEnglishBenchmarkMethodology = {
   benchmarkTarget: "AORI pulse answering over a library that has already been indexed into aspect-oriented reflective facets.",
@@ -194,52 +188,15 @@ export class BenchmarkService {
   readonly rootDir: string;
 
   constructor(private readonly config: AppConfig, private readonly db?: AgentDatabase) {
-    this.rootDir = join(config.dataDir, "benchmarks");
+    this.rootDir = config.benchmarkDir;
   }
 
   catalog(): BenchmarkCatalog {
-    return {
-      suites: benchmarkSuiteCatalog(),
-      scenarios: benchmarkScenarioCatalog(),
-    };
+    return { suites: [], scenarios: [] };
   }
 
-  async run(input: CreateBenchmarkRunInput): Promise<BenchmarkRunResult> {
-    const createdAt = now();
-    const id = `${createdAt.slice(0, 10)}-${randomUUID().slice(0, 8)}`;
-    const path = join(this.rootDir, `${id}.json`);
-    const summary = await runBenchmarkSuite({
-      iterations: input.iterations,
-      provider: input.provider,
-      mode: input.mode,
-      scenarioNames: input.scenarioNames,
-      suites: input.suites,
-      db: this.db,
-      libraryName: `Benchmark ${id} public-cmrc2018-deduped`,
-    });
-    const result: BenchmarkRunResult = {
-      id,
-      path,
-      createdAt,
-      ...(input.label ? { label: input.label } : {}),
-      ...(summary.libraryId ? { libraryId: summary.libraryId } : {}),
-      methodology: { ...readableDefaultChineseBenchmarkMethodology },
-      providerMode: input.provider,
-      providerLabel: summary.providerLabel,
-      mode: input.mode,
-      iterations: input.iterations,
-      requestedSuites: input.suites,
-      requestedScenarios: input.scenarioNames,
-      benchmarkSuites: summary.benchmarkSuites,
-      scenarioSummaries: summary.scenarioSummaries,
-      overall: summary.overall,
-      records: summary.records,
-    };
-    await mkdir(dirname(path), { recursive: true });
-    const tempPath = `${path}.tmp`;
-    await writeFile(tempPath, JSON.stringify(result, null, 2), "utf8");
-    await rename(tempPath, path);
-    return result;
+  async run(_input: CreateBenchmarkRunInput): Promise<BenchmarkRunResult> {
+    throw new Error("Benchmark runner has been isolated under experiments/baselines/aori-pulse and is not available from the production API.");
   }
 
   async listRuns(): Promise<BenchmarkRunListEntry[]> {

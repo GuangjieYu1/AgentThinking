@@ -2809,6 +2809,12 @@ export interface PulseAnswerOutput {
     calculatorResult?: unknown;
     answerVerification?: NumericAnswerVerification | undefined;
     fallbackReason?: string | undefined;
+    fallbackBudget?: {
+      maxModelCalls: number;
+      maxTotalTokens: number;
+      maxSourceItems: number;
+      maxEvidenceRecords: number;
+    } | undefined;
     demandPlan?: DemandAnswerPlan | undefined;
     evidenceRecords?: EvidenceRecord[] | undefined;
     facetFactTable?: FacetFactTable | undefined;

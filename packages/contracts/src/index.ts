@@ -220,6 +220,56 @@ export const aoriTraversalNodeTypes = [
   "self_question",
   "gap",
 ] as const;
+export const traversalRetrievalPatterns = [
+  "table_horizontal",
+  "entity_scatter",
+  "timeline_chain",
+  "hierarchical_depth",
+  "single_point",
+] as const;
+export const traversalCompletenessTypes = [
+  "sum_alignment",
+  "row_count",
+  "entity_boundary",
+  "timeline_end",
+  "none",
+] as const;
+export const traversalDirectionBiases = ["side_first", "down_first", "none"] as const;
+export const traversalChunkRoles = [
+  "header",
+  "data_row",
+  "summary",
+  "paragraph",
+  "list_item",
+  "table",
+  "unknown",
+] as const;
+export const traversalDirections = ["seed", "parent", "child", "sibling_prev", "sibling_next", "nearby", "stop"] as const;
+export const traversalMoveTypes = ["parent", "child", "sibling_prev", "sibling_next", "nearby", "stop_current_front"] as const;
+export const traversalSeedSources = ["AORI", "vector", "keyword"] as const;
+export const traversalSeedDecisions = ["promote", "promote_low_priority", "discard"] as const;
+export const traversalClosureStatuses = [
+  "closed",
+  "partial",
+  "mismatch",
+  "failed",
+  "continue",
+  "low_confidence",
+] as const;
+export const traversalStopReasons = [
+  "closed",
+  "document_boundary",
+  "round_budget",
+  "time_budget",
+  "fronts_exhausted",
+  "node_cap",
+  "token_cap",
+  "no_seed",
+  "no_moves",
+  "partial",
+] as const;
+export const traversalConflictTypes = ["cross_subTask_conflict", "same_subTask_conflict"] as const;
+export const traversalConflictActions = ["surface_conflict", "limited_conflict_resolution", "confirmed_conflict", "false_conflict", "context_missing"] as const;
 export const libraryEntityAlignmentDecisions = ["same", "new", "ambiguous"] as const;
 export const libraryAspectAlignmentDecisions = ["map_to_existing", "new_aspect", "subaspect", "ambiguous"] as const;
 export const libraryRelationAlignmentDecisions = ["map_to_existing", "new_relation", "abstract_under_family", "ambiguous"] as const;
@@ -318,6 +368,18 @@ export type AoriRiskLevel = (typeof aoriRiskLevels)[number];
 export type AoriGraphScope = (typeof aoriGraphScopes)[number];
 export type AoriGraphViewMode = (typeof aoriGraphViewModes)[number];
 export type AoriTraversalNodeType = (typeof aoriTraversalNodeTypes)[number];
+export type TraversalRetrievalPattern = (typeof traversalRetrievalPatterns)[number];
+export type TraversalCompletenessType = (typeof traversalCompletenessTypes)[number];
+export type TraversalDirectionBias = (typeof traversalDirectionBiases)[number];
+export type TraversalChunkRole = (typeof traversalChunkRoles)[number];
+export type TraversalDirection = (typeof traversalDirections)[number];
+export type TraversalMoveType = (typeof traversalMoveTypes)[number];
+export type TraversalSeedSource = (typeof traversalSeedSources)[number];
+export type TraversalSeedDecision = (typeof traversalSeedDecisions)[number];
+export type TraversalClosureStatus = (typeof traversalClosureStatuses)[number];
+export type TraversalStopReason = (typeof traversalStopReasons)[number];
+export type TraversalConflictType = (typeof traversalConflictTypes)[number];
+export type TraversalConflictAction = (typeof traversalConflictActions)[number];
 export type LibraryEntityAlignmentDecision = (typeof libraryEntityAlignmentDecisions)[number];
 export type LibraryAspectAlignmentDecision = (typeof libraryAspectAlignmentDecisions)[number];
 export type LibraryRelationAlignmentDecision = (typeof libraryRelationAlignmentDecisions)[number];
@@ -1280,6 +1342,175 @@ export interface AoriTraversalMap {
     summary: string;
     centralQuestion?: string | undefined;
   }>;
+}
+
+export interface TraversalSubTask {
+  id: string;
+  question: string;
+  pattern: TraversalRetrievalPattern;
+  patternConfidence: number;
+  fallbackPatterns: TraversalRetrievalPattern[];
+  completenessType: TraversalCompletenessType;
+  mergePolicy: "independent_section" | "shared_reference";
+  directionBias: TraversalDirectionBias;
+  rationale: string;
+}
+
+export interface TraversalSeedCandidate {
+  chunkId: string;
+  source: TraversalSeedSource;
+  score: number;
+  reliability: number;
+  reason: string;
+}
+
+export interface TraversalSeedScore {
+  termOverlap: number;
+  neighborConsistency: number;
+  patternCompatibility: number;
+  sourceReliability: number;
+  positionPrior: number;
+  finalScore: number;
+}
+
+export interface TraversalSeedCluster {
+  id: string;
+  chunkIds: string[];
+  anchorChunkId: string;
+  decision: TraversalSeedDecision;
+  arbitrationScores: TraversalSeedScore;
+  pattern: TraversalRetrievalPattern;
+  llmNote?: string | undefined;
+}
+
+export interface TraversalNeighborSkeleton {
+  id: string;
+  role: TraversalChunkRole;
+  preview: string;
+}
+
+export interface TraversalChunkSkeleton {
+  id: string;
+  role: TraversalChunkRole;
+  headingPath: string | null;
+  ordinal: number;
+  hasNumeric: boolean;
+  preview: string;
+  connected: {
+    parent?: TraversalNeighborSkeleton | undefined;
+    children: TraversalNeighborSkeleton[];
+    siblings: TraversalNeighborSkeleton[];
+  };
+}
+
+export interface TraversalLegalMove {
+  move: TraversalMoveType;
+  target?: string | undefined;
+  reason: string;
+}
+
+export interface TraversalSelectedMove {
+  move: TraversalMoveType;
+  target?: string | undefined;
+  reason: string;
+  confidence: number;
+}
+
+export interface TraversalEvidenceItem {
+  chunkId: string;
+  value?: number | string | undefined;
+  unit?: string | undefined;
+  metric?: string | undefined;
+  status: TraversalClosureStatus | "open";
+  direction: TraversalDirection;
+  pathChunkIds: string[];
+  reason: string;
+}
+
+export interface TraversalScoutDeclaration {
+  value: number;
+  unit?: string | undefined;
+  metric: string;
+  scope: string;
+  sourceChunkId: string;
+  bindingColumn?: string | undefined;
+  confidence: "low" | "medium" | "high";
+}
+
+export interface TraversalScoutResult {
+  phase: "scout";
+  targets: string[];
+  maxRounds: number;
+  declaredValue?: number | undefined;
+  unit?: string | undefined;
+  metric?: string | undefined;
+  scope?: string | undefined;
+  sourceChunkId?: string | undefined;
+  bindingColumn?: string | undefined;
+  confidence: "low" | "medium" | "high";
+  competingDeclarations: TraversalScoutDeclaration[];
+  calibrationStatus: "calibrated" | "not_applicable" | "calibration_missing";
+}
+
+export interface TraversalActiveFront {
+  id: string;
+  clusterId: string;
+  anchorChunkId: string;
+  direction: TraversalDirection;
+  pathLength: number;
+  lastSkeleton: TraversalChunkSkeleton;
+  confidence: "continue" | "low" | "dead_end";
+  pathChunkIds: string[];
+}
+
+export interface TraversalClosureVerdict {
+  status: TraversalClosureStatus;
+  verifierType: TraversalCompletenessType;
+  confidence: "low" | "medium" | "high";
+  summary: string;
+  checks: Record<string, unknown>;
+}
+
+export interface TraversalConflict {
+  type: TraversalConflictType;
+  subTaskIds: string[];
+  chunkIds: string[];
+  action: TraversalConflictAction;
+  summary: string;
+}
+
+export interface TraversalLogEntry {
+  round: number;
+  from: string;
+  to?: string | undefined;
+  direction: TraversalDirection;
+  reason: string;
+}
+
+export interface TraversalEvidencePath {
+  subTaskId: string;
+  question: string;
+  pattern: TraversalRetrievalPattern;
+  path: Array<{
+    chunkId: string;
+    role: TraversalChunkRole;
+    direction: TraversalDirection;
+    content: string;
+  }>;
+  traversalLog: TraversalLogEntry[];
+  closure: TraversalClosureVerdict;
+  conflicts: TraversalConflict[];
+}
+
+export interface TraversalRetrievalResult {
+  question: string;
+  subTasks: TraversalSubTask[];
+  seedClusters: TraversalSeedCluster[];
+  scoutResults: Record<string, TraversalScoutResult>;
+  evidencePaths: TraversalEvidencePath[];
+  conflicts: TraversalConflict[];
+  stoppedReason: TraversalStopReason;
+  diagnostics: Record<string, unknown>;
 }
 
 export type AoriSkillName =

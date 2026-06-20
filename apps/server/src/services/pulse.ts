@@ -15,6 +15,7 @@ import { AoriDemandAnswerEngine, defaultDemandFallbackBudget } from "./aori-dema
 import { AoriSemanticAnswerEngine } from "./aori-semantic-answer.js";
 import type { ModelProvider } from "./models.js";
 import { PulseEvidenceController } from "./pulse-evidence-controller.js";
+import { TraversalRetrievalEngine } from "./traversal-retrieval/traversal-engine.js";
 import type { VectorStore } from "./vector-store.js";
 
 type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
@@ -117,7 +118,10 @@ export class PulseEngine {
     private readonly db: AgentDatabase,
     private readonly vectors: VectorStore,
     private readonly model: ModelProvider,
-    private readonly options: { aoriAnswerMode?: "demand" | "traversal" | "legacy" | "strict_evidence_table" } = {},
+    private readonly options: {
+      aoriAnswerMode?: "demand" | "traversal" | "legacy" | "strict_evidence_table";
+      enableTraversalRetrievalV2?: boolean;
+    } = {},
   ) {}
 
   async create(
@@ -172,6 +176,35 @@ export class PulseEngine {
     await emitPulse(eventSink, { type: "start", mode, question });
     try {
       const aoriAnswerMode = this.options.aoriAnswerMode ?? "demand";
+      if (
+        this.options.enableTraversalRetrievalV2 === true &&
+        aoriAnswerMode === "traversal" &&
+        this.db.listAoriDocumentIndexes(libraryId).length > 0
+      ) {
+        const result = await new TraversalRetrievalEngine(this.db, this.vectors).answer({
+          libraryId,
+          question,
+          mode,
+          ...(eventSink ? { eventSink } : {}),
+        });
+        await emitPulse(eventSink, { type: "answer", answer: result.answer.answer, summary: result.answer.summary });
+        await emitPulse(eventSink, { type: "stage", message: "正在保存 Traversal Retrieval v2 脉冲结果" });
+        const metrics = this.buildPulseMetrics(startedAt, startedAtMs, metricsAccumulator);
+        const pulse = this.db.createPulse(
+          libraryId,
+          question,
+          result.answer.answer,
+          result.answer.summary,
+          mode,
+          result.hits,
+          result.storageEvidencePack,
+          metrics,
+        );
+        const response = this.db.getPulseResponse(libraryId, pulse.id);
+        if (!response) throw new Error("脉冲创建后读取失败");
+        await emitPulse(eventSink, { type: "done", response });
+        return response;
+      }
       if (aoriAnswerMode !== "legacy" && this.db.listAoriDocumentIndexes(libraryId).length > 0) {
         const semanticEngine = new AoriSemanticAnswerEngine(this.db);
         const semanticResult = await semanticEngine.answer({

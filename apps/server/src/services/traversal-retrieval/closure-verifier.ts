@@ -5,11 +5,18 @@ import type {
   TraversalScoutResult,
 } from "@agent-thinking/contracts";
 
+export interface ClosureRoleInfo {
+  role: string;
+  confidence: number;
+}
+
 export interface ClosureVerifierInput {
   completenessType: TraversalCompletenessType;
   evidence: TraversalEvidenceItem[];
   scout?: TraversalScoutResult | undefined;
+  roleMap?: Map<string, ClosureRoleInfo> | undefined;
   rowBoundaryChecked?: boolean | undefined;
+  rowBoundaryEvidence?: Record<string, unknown> | undefined;
   exhaustedDirections?: string[] | undefined;
   documentTimeRange?: { from?: string | undefined; to?: string | undefined } | undefined;
 }
@@ -23,6 +30,62 @@ function numericValue(value: number | string | undefined): number | undefined {
 
 function confidence(status: TraversalClosureVerdict["status"]): TraversalClosureVerdict["confidence"] {
   return status === "closed" ? "high" : status === "partial" || status === "continue" ? "medium" : "low";
+}
+
+function normalizeMetric(value: string | undefined): string {
+  return (value ?? "").normalize("NFKC").replace(/\s+/g, "").toLowerCase();
+}
+
+function metricEquivalent(left: string | undefined, right: string | undefined): boolean {
+  const normalizedLeft = normalizeMetric(left);
+  const normalizedRight = normalizeMetric(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft === normalizedRight || normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return true;
+  const leftChars = new Set([...normalizedLeft].filter((char) => /[\p{Script=Han}A-Za-z0-9]/u.test(char)));
+  const rightChars = new Set([...normalizedRight].filter((char) => /[\p{Script=Han}A-Za-z0-9]/u.test(char)));
+  let overlap = 0;
+  for (const char of leftChars) if (rightChars.has(char)) overlap += 1;
+  return overlap >= 2 && overlap / Math.max(1, Math.min(leftChars.size, rightChars.size)) >= 0.45;
+}
+
+function sameDeclaredValue(left: number | undefined, right: number | undefined): boolean {
+  return typeof left === "number" && typeof right === "number" && Math.abs(left - right) <= 0.01;
+}
+
+function roleForEvidence(input: ClosureVerifierInput, item: TraversalEvidenceItem): ClosureRoleInfo | undefined {
+  return input.roleMap?.get(item.chunkId);
+}
+
+function dataRowEvidence(input: ClosureVerifierInput): TraversalEvidenceItem[] {
+  return input.evidence.filter((item) => {
+    const role = roleForEvidence(input, item);
+    return role?.role === "data_row" && role.confidence >= 0.6;
+  });
+}
+
+function uncountedNumericEvidence(input: ClosureVerifierInput): TraversalEvidenceItem[] {
+  return input.evidence.filter((item) => {
+    if (numericValue(item.value) === undefined) return false;
+    const role = roleForEvidence(input, item);
+    if (!role) return true;
+    return role.role === "unknown" || role.role === "data_row" && role.confidence < 0.6;
+  });
+}
+
+function conflictingDeclarations(input: ClosureVerifierInput, declared: number): NonNullable<TraversalScoutResult["competingDeclarations"]> {
+  const scout = input.scout;
+  if (!scout) return [];
+  return scout.competingDeclarations.filter((entry) => {
+    if (entry.sourceChunkId === scout.sourceChunkId) return false;
+    if (entry.confidence !== "high") return false;
+    if (!sameDeclaredValue(entry.value, declared)) return false;
+    const metricConflict = scout.metric ? !metricEquivalent(entry.metric, scout.metric) : false;
+    const scopeConflict = scout.scope && entry.scope ? normalizeMetric(entry.scope) !== normalizeMetric(scout.scope) : false;
+    const indicatorConflict = scout.bindingColumn && entry.bindingColumn
+      ? normalizeMetric(entry.bindingColumn) !== normalizeMetric(scout.bindingColumn)
+      : false;
+    return metricConflict || scopeConflict || indicatorConflict;
+  });
 }
 
 function verdict(
@@ -51,39 +114,65 @@ export class ClosureVerifier {
 
   private verifySumAlignment(input: ClosureVerifierInput): TraversalClosureVerdict {
     const declared = input.scout?.declaredValue;
-    const values = input.evidence.flatMap((item) => {
+    const countedEvidence = dataRowEvidence(input);
+    const uncountedNumeric = uncountedNumericEvidence(input);
+    const values = countedEvidence.flatMap((item) => {
       const value = numericValue(item.value);
       return value === undefined ? [] : [value];
     });
     const collectedSum = values.reduce((sum, value) => sum + value, 0);
     const gap = typeof declared === "number" ? Number((declared - collectedSum).toFixed(6)) : undefined;
     const unitConsistency = input.scout?.unit
-      ? input.evidence.every((item) => !item.unit || item.unit === input.scout?.unit)
+      ? countedEvidence.every((item) => !item.unit || item.unit === input.scout?.unit)
       : true;
     const metricBinding = input.scout?.metric
-      ? input.evidence.some((item) => item.metric && (item.metric.includes(input.scout!.metric!) || input.scout!.metric!.includes(item.metric)))
+      ? countedEvidence.some((item) => metricEquivalent(item.metric, input.scout?.metric))
       : true;
-    const competingValues = new Set((input.scout?.competingDeclarations ?? []).map((entry) => entry.value));
-    const competingCheck = typeof declared === "number" ? !competingValues.has(declared) : false;
+    const competingConflicts = typeof declared === "number" ? conflictingDeclarations(input, declared) : [];
+    const competingCheck = typeof declared === "number" ? competingConflicts.length === 0 : false;
     const numericSum = typeof gap === "number" && Math.abs(gap) <= 0.01;
     const rowBoundary = input.rowBoundaryChecked === true;
+    const rowBoundaryEvidence = input.rowBoundaryEvidence ?? {};
 
     if (!input.scout || input.scout.calibrationStatus !== "calibrated" || typeof declared !== "number") {
       return verdict("sum_alignment", "continue", "Declared value is not calibrated yet.", {
         declaredValueFound: false,
         collectedSum,
         evidenceCount: input.evidence.length,
+        countedDataRowCount: countedEvidence.length,
+      });
+    }
+    if (!input.roleMap) {
+      return verdict("sum_alignment", "low_confidence", "Role map is required before numeric sum closure can be trusted.", {
+        declaredValue: declared,
+        collectedSum,
+        gap,
+        roleMapPresent: false,
+        evidenceCount: input.evidence.length,
+      });
+    }
+    if (uncountedNumeric.length > 0) {
+      return verdict("sum_alignment", "low_confidence", "Numeric rows with unknown or low-confidence roles were excluded from the sum.", {
+        declaredValue: declared,
+        collectedSum,
+        gap,
+        uncountedNumericChunkIds: uncountedNumeric.map((item) => item.chunkId),
+        countedDataRowChunkIds: countedEvidence.map((item) => item.chunkId),
+        rowBoundary,
+        rowBoundaryEvidence,
       });
     }
     if (!metricBinding || !competingCheck) {
-      return verdict("sum_alignment", "mismatch", "Collected values do not bind to the calibrated target metric.", {
+      return verdict("sum_alignment", "mismatch", "Collected values do not bind cleanly to the calibrated target metric or conflict with another declaration.", {
         declaredValue: declared,
         collectedSum,
         gap,
         unitConsistency,
         metricBinding,
         competingCheck,
+        competingConflicts,
         rowBoundary,
+        rowBoundaryEvidence,
       });
     }
     if (!numericSum) {
@@ -95,6 +184,7 @@ export class ClosureVerifier {
         metricBinding,
         competingCheck,
         rowBoundary,
+        rowBoundaryEvidence,
       });
     }
     if (!rowBoundary) {
@@ -106,6 +196,7 @@ export class ClosureVerifier {
         metricBinding,
         competingCheck,
         rowBoundary,
+        rowBoundaryEvidence,
       });
     }
     return verdict("sum_alignment", "closed", "Numeric sum, metric binding, unit consistency, and row boundary passed.", {
@@ -116,6 +207,7 @@ export class ClosureVerifier {
       metricBinding,
       competingCheck,
       rowBoundary,
+      rowBoundaryEvidence,
     });
   }
 

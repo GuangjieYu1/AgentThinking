@@ -106,6 +106,10 @@ describe("traversal retrieval v2 components", () => {
       completenessType: "sum_alignment",
       scout: calibratedScout(),
       evidence: matchingEvidence,
+      roleMap: new Map([
+        ["row-a", { role: "data_row", confidence: 0.86 }],
+        ["row-b", { role: "data_row", confidence: 0.86 }],
+      ]),
       rowBoundaryChecked: true,
     }).status).toBe("closed");
 
@@ -113,6 +117,10 @@ describe("traversal retrieval v2 components", () => {
       completenessType: "sum_alignment",
       scout: calibratedScout(),
       evidence: matchingEvidence,
+      roleMap: new Map([
+        ["row-a", { role: "data_row", confidence: 0.86 }],
+        ["row-b", { role: "data_row", confidence: 0.86 }],
+      ]),
       rowBoundaryChecked: false,
     }).status).toBe("partial");
 
@@ -124,9 +132,14 @@ describe("traversal retrieval v2 components", () => {
         metric: "其他金额",
         scope: "其他金额合计",
         sourceChunkId: "other-summary",
-        confidence: "medium",
+        confidence: "high",
       }] }),
       evidence: matchingEvidence,
+      roleMap: new Map([
+        ["row-a", { role: "data_row", confidence: 0.86 }],
+        ["row-b", { role: "data_row", confidence: 0.86 }],
+        ["other-summary", { role: "summary", confidence: 0.88 }],
+      ]),
       rowBoundaryChecked: true,
     }).status).toBe("mismatch");
 
@@ -134,6 +147,9 @@ describe("traversal retrieval v2 components", () => {
       completenessType: "sum_alignment",
       scout: calibratedScout(),
       evidence: [evidence({ chunkId: "row-a", value: 60, metric: "募集金额" })],
+      roleMap: new Map([
+        ["row-a", { role: "data_row", confidence: 0.86 }],
+      ]),
       rowBoundaryChecked: true,
     }).status).toBe("failed");
   });

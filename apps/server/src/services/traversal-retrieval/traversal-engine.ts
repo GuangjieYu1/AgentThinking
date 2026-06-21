@@ -10,6 +10,7 @@ import type {
   PulseStreamEvent,
   RetrievalTrace,
   TraversalActiveFront,
+  TraversalChunkRole,
   TraversalClosureStatus,
   TraversalClosureVerdict,
   TraversalEvidenceItem,
@@ -26,7 +27,7 @@ import type {
 import type { AgentDatabase, PendingPulseHit } from "../../db.js";
 import { type AoriTraversalAnswerResult, buildAoriTraversalMap } from "../aori-traversal-answer.js";
 import type { VectorStore } from "../vector-store.js";
-import { ClosureVerifier } from "./closure-verifier.js";
+import { ClosureVerifier, type ClosureRoleInfo } from "./closure-verifier.js";
 import {
   defaultTraversalGraphLimits,
   GraphOps,
@@ -38,7 +39,7 @@ import { ScoutExtractor } from "./scout-extractor.js";
 import { SeedArbitrationEngine } from "./seed-arbitration.js";
 import { TableRoleAdapter } from "./table-role-adapter.js";
 import type { ChunkGraphReader } from "./table-skeleton-extractor.js";
-import { chunkLabel, hasNumericSignal, previewText, termOverlap, uniqueStrings } from "./utils.js";
+import { byOrdinal, chunkLabel, hasNumericSignal, normalizeText, previewText, termOverlap, uniqueStrings } from "./utils.js";
 
 type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
 
@@ -66,6 +67,10 @@ interface LLMPolicyDecision {
   stopProposal: boolean;
 }
 
+interface SameSectionChunkReader {
+  getSameSectionChunks(chunkIds: string[], limit?: number): Chunk[];
+}
+
 const defaultClosedVerdict: TraversalClosureVerdict = {
   status: "closed",
   verifierType: "none",
@@ -90,8 +95,38 @@ function unitFromText(text: string): string | undefined {
   return text.match(/亿元|万元|千元|元|亿|万|%/)?.[0];
 }
 
-function closedEnough(status: TraversalClosureStatus): boolean {
-  return status === "closed" || status === "partial" || status === "mismatch" || status === "failed" || status === "low_confidence";
+function metricFromChunkText(text: string): string | undefined {
+  const normalized = normalizeText(text);
+  const metricKeyword = normalized.match(/募集金额|募集资金|金额|余额|总额|规模|数量|比例|占比|收入|成本|利润|支出|费用/u)?.[0];
+  if (metricKeyword) return metricKeyword;
+  const numeric = normalized.match(/[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?/);
+  if (!numeric || numeric.index === undefined) return undefined;
+  const before = normalized.slice(Math.max(0, numeric.index - 36), numeric.index).replace(/[|,，:：;；]/g, " ").trim();
+  const phrase = before.match(/[\p{Script=Han}A-Za-z0-9（）()]{2,24}$/u)?.[0];
+  return phrase || undefined;
+}
+
+function terminalState(status: TraversalClosureStatus): "stop" | "partial_stop" | "continue" {
+  if (status === "closed") return "stop";
+  if (status === "partial") return "partial_stop";
+  return "continue";
+}
+
+function partialStopAllowed(reason: TraversalStopReason | undefined): boolean {
+  return reason === "round_budget" ||
+    reason === "time_budget" ||
+    reason === "node_cap" ||
+    reason === "token_cap" ||
+    reason === "fronts_exhausted" ||
+    reason === "no_moves" ||
+    reason === "no_seed";
+}
+
+function shouldStopForClosure(status: TraversalClosureStatus, reason?: TraversalStopReason | undefined): boolean {
+  const terminal = terminalState(status);
+  if (terminal === "stop") return true;
+  if (terminal === "partial_stop") return partialStopAllowed(reason);
+  return false;
 }
 
 function patternForQuestion(question: string): TraversalRetrievalPattern {
@@ -215,15 +250,15 @@ async function emitPulse(eventSink: PulseEventSink | undefined, event: PulseStre
 function buildEvidenceItem(
   chunk: Chunk,
   front: TraversalActiveFront,
-  scout: TraversalScoutResult,
 ): TraversalEvidenceItem {
   const value = numericValue(chunk.text);
-  const roleMetric = scout.metric ?? chunk.headingPath ?? "source fact";
+  const unit = unitFromText(chunk.text);
+  const metric = chunk.headingPath ?? metricFromChunkText(chunk.text);
   return {
     chunkId: chunk.id,
     ...(value !== undefined ? { value } : {}),
-    ...(unitFromText(chunk.text) ?? scout.unit ? { unit: unitFromText(chunk.text) ?? scout.unit } : {}),
-    metric: roleMetric,
+    ...(unit ? { unit } : {}),
+    ...(metric ? { metric } : {}),
     status: "continue",
     direction: front.direction,
     pathChunkIds: front.pathChunkIds,
@@ -231,8 +266,103 @@ function buildEvidenceItem(
   };
 }
 
-function rowBoundaryChecked(evidence: TraversalEvidenceItem[]): boolean {
-  return evidence.length >= 2 && new Set(evidence.map((item) => item.direction)).size >= 1;
+function roleInfoForChunk(
+  chunk: Chunk,
+  roleMap: Map<string, ClosureRoleInfo>,
+  roleAdapter: TableRoleAdapter,
+): ClosureRoleInfo {
+  const existing = roleMap.get(chunk.id);
+  if (existing) return existing;
+  const classified = roleAdapter.classify(chunk);
+  const info = { role: classified.role, confidence: classified.confidence };
+  roleMap.set(chunk.id, info);
+  return info;
+}
+
+function addRoleInfos(
+  chunks: Chunk[],
+  roleMap: Map<string, ClosureRoleInfo>,
+  roleAdapter: TableRoleAdapter,
+): void {
+  for (const chunk of chunks) roleInfoForChunk(chunk, roleMap, roleAdapter);
+}
+
+function sameHeading(left: string | null, right: string | null): boolean {
+  return normalizeText(left) === normalizeText(right);
+}
+
+interface RowBoundaryResult {
+  checked: boolean;
+  evidence: Record<string, unknown>;
+}
+
+function rowBoundaryChecked(input: {
+  evidence: TraversalEvidenceItem[];
+  chunksById: Map<string, Chunk>;
+  roleMap: Map<string, ClosureRoleInfo>;
+  headingPath?: string | null | undefined;
+  sectionChunks: Chunk[];
+}): RowBoundaryResult {
+  const evidenceChunkIds = new Set(input.evidence.map((item) => item.chunkId));
+  const dataRowChunks = input.evidence
+    .flatMap((item) => {
+      const chunk = input.chunksById.get(item.chunkId);
+      const role = input.roleMap.get(item.chunkId);
+      return chunk && role?.role === "data_row" && role.confidence >= 0.6 ? [chunk] : [];
+    })
+    .sort(byOrdinal);
+  if (dataRowChunks.length === 0) {
+    return {
+      checked: false,
+      evidence: {
+        reason: "no_data_row_evidence",
+        dataRowChunkIds: [],
+      },
+    };
+  }
+
+  const headingPath = input.headingPath ?? dataRowChunks[0]?.headingPath ?? null;
+  const sectionChunks = input.sectionChunks
+    .filter((chunk) => sameHeading(chunk.headingPath, headingPath))
+    .sort(byOrdinal);
+  const expectedDataRows = sectionChunks.filter((chunk) => {
+    const role = input.roleMap.get(chunk.id);
+    return role?.role === "data_row" && role.confidence >= 0.6;
+  });
+  const missingDataRows = expectedDataRows.filter((chunk) => !evidenceChunkIds.has(chunk.id));
+  const ordinals = dataRowChunks.map((chunk) => chunk.ordinal);
+  const minOrdinal = Math.min(...ordinals);
+  const maxOrdinal = Math.max(...ordinals);
+  const allDataRowsVisited = expectedDataRows.length > 0 && missingDataRows.length === 0;
+  const lastDataRow = dataRowChunks.at(-1);
+  const nextSibling = [...input.sectionChunks]
+    .filter((chunk) =>
+      lastDataRow &&
+      chunk.libraryId === lastDataRow.libraryId &&
+      chunk.versionId === lastDataRow.versionId &&
+      chunk.ordinal > lastDataRow.ordinal
+    )
+    .sort(byOrdinal)[0];
+  const nextSiblingRole = nextSibling ? input.roleMap.get(nextSibling.id) : undefined;
+  const terminalSibling = nextSibling
+    ? nextSiblingRole?.role === "summary" || !sameHeading(nextSibling.headingPath, headingPath)
+    : false;
+
+  return {
+    checked: allDataRowsVisited && terminalSibling,
+    evidence: {
+      headingPath,
+      ordinalRange: [minOrdinal, maxOrdinal],
+      dataRowChunkIds: dataRowChunks.map((chunk) => chunk.id),
+      expectedDataRowChunkIds: expectedDataRows.map((chunk) => chunk.id),
+      missingDataRowChunkIds: missingDataRows.map((chunk) => chunk.id),
+      nextSiblingChunkId: nextSibling?.id,
+      nextSiblingRole: nextSiblingRole?.role,
+      nextSiblingHeadingPath: nextSibling?.headingPath ?? null,
+      allDataRowsVisited,
+      terminalSibling,
+    },
+  };
 }
 
 function evidencePath(input: {
@@ -537,16 +667,10 @@ export class TraversalRetrievalEngine {
     });
     let fronts = this.graphOps.createInitialFronts(seedClusters);
     const chunksById = new Map(allRelevantChunks.map((chunk) => [chunk.id, chunk]));
+    const roleMap = new Map<string, ClosureRoleInfo>();
     const visited = new Set<string>();
     const evidence = new Map<string, TraversalEvidenceItem>();
     const traversalLog: TraversalEvidencePath["traversalLog"] = [];
-    let finalClosure = subTask.completenessType === "none" ? defaultClosedVerdict : this.verifier.verify({
-      completenessType: subTask.completenessType,
-      evidence: [],
-      scout,
-      rowBoundaryChecked: false,
-      exhaustedDirections: [],
-    });
     const state: TraversalBudgetState = {
       startedAtMs: Date.now(),
       round: 0,
@@ -558,7 +682,7 @@ export class TraversalRetrievalEngine {
       if (!chunk) continue;
       chunksById.set(chunk.id, chunk);
       visited.add(chunk.id);
-      evidence.set(chunk.id, buildEvidenceItem(chunk, front, scout));
+      evidence.set(chunk.id, buildEvidenceItem(chunk, front));
       state.visitedNodeCount += 1;
       state.injectedTokens += Math.ceil(chunk.text.length / 4);
       traversalLog.push({
@@ -569,6 +693,16 @@ export class TraversalRetrievalEngine {
         reason: "seed cluster promoted into traversal front",
       });
     }
+    addRoleInfos([...chunksById.values()], roleMap, new TableRoleAdapter());
+    let finalClosure = this.verifier.verify({
+      completenessType: subTask.completenessType,
+      evidence: [...evidence.values()],
+      scout,
+      roleMap,
+      rowBoundaryChecked: false,
+      rowBoundaryEvidence: {},
+      exhaustedDirections: [],
+    });
 
     let stoppedReason: TraversalStopReason | undefined = fronts.length === 0 ? "no_seed" : undefined;
     while (!stoppedReason) {
@@ -595,7 +729,9 @@ export class TraversalRetrievalEngine {
             completenessType: subTask.completenessType,
             evidence: [...evidence.values()],
             scout,
-            rowBoundaryChecked: rowBoundaryChecked([...evidence.values()]),
+            roleMap,
+            rowBoundaryChecked: rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern }).checked,
+            rowBoundaryEvidence: rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern }).evidence,
             exhaustedDirections: ["summary_candidate_stop_proposal"],
           });
           traversalLog.push({
@@ -605,7 +741,7 @@ export class TraversalRetrievalEngine {
             reason: `ClosureVerifier on stop proposal: ${finalClosure.status}. ${finalClosure.summary}`,
           });
           nextFronts.push(
-            closedEnough(finalClosure.status)
+            shouldStopForClosure(finalClosure.status, stoppedReason)
               ? { ...front, direction: "stop", confidence: "dead_end" }
               : front,
           );
@@ -628,7 +764,7 @@ export class TraversalRetrievalEngine {
         }
         chunksById.set(chunk.id, chunk);
         visited.add(chunk.id);
-        evidence.set(chunk.id, buildEvidenceItem(chunk, next, scout));
+        evidence.set(chunk.id, buildEvidenceItem(chunk, next));
         state.visitedNodeCount += 1;
         state.injectedTokens += Math.ceil(chunk.text.length / 4);
         appliedMoveCount += 1;
@@ -646,12 +782,14 @@ export class TraversalRetrievalEngine {
       if (!stoppedReason && appliedMoveCount === 0 && fronts.length === 0) stoppedReason = "no_moves";
     }
 
-    if (!closedEnough(finalClosure.status)) {
+    if (!shouldStopForClosure(finalClosure.status, stoppedReason)) {
       finalClosure = this.verifier.verify({
         completenessType: subTask.completenessType,
         evidence: [...evidence.values()],
         scout,
-        rowBoundaryChecked: rowBoundaryChecked([...evidence.values()]),
+        roleMap,
+        rowBoundaryChecked: rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern }).checked,
+        rowBoundaryEvidence: rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern }).evidence,
         exhaustedDirections: [stoppedReason ?? "unknown_stop"],
       });
     }

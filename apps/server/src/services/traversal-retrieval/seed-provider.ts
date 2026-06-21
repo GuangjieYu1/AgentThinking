@@ -1,10 +1,9 @@
 import type { Chunk, TraversalSeedCandidate } from "@agent-thinking/contracts";
 import type { AgentDatabase } from "../../db.js";
 import { buildAoriTraversalMap } from "../aori-traversal-answer.js";
-import type { VectorStore } from "../vector-store.js";
 import { previewText, termOverlap, uniqueStrings } from "./utils.js";
 
-export function collectSeedCandidates(db: AgentDatabase, vectors: VectorStore, libraryId: string, question: string): TraversalSeedCandidate[] {
+export function collectSeedCandidates(db: AgentDatabase, libraryId: string, question: string): TraversalSeedCandidate[] {
   const candidates: TraversalSeedCandidate[] = [];
   const seen = new Set<string>();
   const add = (candidate: TraversalSeedCandidate): void => {
@@ -27,9 +26,6 @@ export function collectSeedCandidates(db: AgentDatabase, vectors: VectorStore, l
       });
     }
   }
-  void vectors.usesSqliteVec;
-  // VectorStore search needs an embedding from a model. Traversal v2 seed collection keeps
-  // this deterministic and relies on keyword plus AORI seeds until model policy is wired.
   for (const result of db.searchText(libraryId, question, 8)) {
     add({
       chunkId: result.chunk.id,

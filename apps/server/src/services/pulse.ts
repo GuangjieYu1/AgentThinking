@@ -181,7 +181,7 @@ export class PulseEngine {
         aoriAnswerMode === "traversal" &&
         this.db.listAoriDocumentIndexes(libraryId).length > 0
       ) {
-        const result = await new TraversalRetrievalEngine(this.db, this.vectors).answer({
+        const result = await new TraversalRetrievalEngine(this.db).answer({
           libraryId,
           question,
           mode,

@@ -11,7 +11,6 @@ import type {
 } from "@agent-thinking/contracts";
 import type { AgentDatabase } from "../../db.js";
 import { type AoriTraversalAnswerResult } from "../aori-traversal-answer.js";
-import type { VectorStore } from "../vector-store.js";
 import { ClosureVerifier, type ClosureRoleInfo } from "./closure-verifier.js";
 import {
   defaultTraversalGraphLimits,
@@ -119,7 +118,6 @@ export class TraversalRetrievalEngine {
 
   constructor(
     private readonly db: AgentDatabase,
-    private readonly vectors: VectorStore,
     options: TraversalRetrievalEngineOptions = {},
   ) {
     this.limits = { ...defaultTraversalGraphLimits, ...options.limits };
@@ -161,7 +159,7 @@ export class TraversalRetrievalEngine {
   }): Promise<TraversalRetrievalResult> {
     await emitPulse(input.eventSink, { type: "stage", message: "正在执行 Traversal Retrieval v2" });
     const subTask = makeSubTask(input.question);
-    const candidates = collectSeedCandidates(this.db, this.vectors, input.libraryId, input.question);
+    const candidates = collectSeedCandidates(this.db, input.libraryId, input.question);
     const candidateChunks = uniqueChunks(this.db.getChunksByIds(candidates.map((candidate) => candidate.chunkId)));
     const allRelevantChunks = uniqueChunks([
       ...candidateChunks,
@@ -238,13 +236,14 @@ export class TraversalRetrievalEngine {
           evidence: [...evidence.values()],
         });
         if (decision.stopProposal || decision.selected.move === "stop_current_front") {
+          const boundary = rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern });
           finalClosure = this.verifier.verify({
             completenessType: subTask.completenessType,
             evidence: [...evidence.values()],
             scout,
             roleMap,
-            rowBoundaryChecked: rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern }).checked,
-            rowBoundaryEvidence: rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern }).evidence,
+            rowBoundaryChecked: boundary.checked,
+            rowBoundaryEvidence: boundary.evidence,
             exhaustedDirections: ["summary_candidate_stop_proposal"],
           });
           traversalLog.push({
@@ -253,15 +252,34 @@ export class TraversalRetrievalEngine {
             direction: "stop",
             reason: `ClosureVerifier on stop proposal: ${finalClosure.status}. ${finalClosure.summary}`,
           });
-          nextFronts.push(
-            shouldStopForClosure(finalClosure.status, stoppedReason)
-              ? { ...front, direction: "stop", confidence: "dead_end" }
-              : front,
-          );
           if (finalClosure.status === "closed") {
+            nextFronts.push({ ...front, direction: "stop", confidence: "dead_end" });
             stoppedReason = "closed";
             break;
           }
+          const fallbackMove = moves.find((move) => move.move !== "stop_current_front" && move.target);
+          if (fallbackMove?.target) {
+            const next = this.graphOps.applyMove(front, fallbackMove);
+            const chunk = this.reader.getChunk(fallbackMove.target);
+            if (chunk) {
+              chunksById.set(chunk.id, chunk);
+              visited.add(chunk.id);
+              evidence.set(chunk.id, buildEvidenceItem(chunk, next));
+              state.visitedNodeCount += 1;
+              state.injectedTokens += Math.ceil(chunk.text.length / 4);
+              appliedMoveCount += 1;
+              traversalLog.push({
+                round: state.round,
+                from: front.anchorChunkId,
+                to: chunk.id,
+                direction: next.direction,
+                reason: `ClosureVerifier rejected stop (${finalClosure.status}); continuing via ${fallbackMove.reason}`,
+              });
+              nextFronts.push(next);
+              continue;
+            }
+          }
+          nextFronts.push({ ...front, direction: "stop", confidence: "dead_end" });
           continue;
         }
         const legalMove = moves.find((move) => move.move === decision.selected.move && move.target === decision.selected.target);

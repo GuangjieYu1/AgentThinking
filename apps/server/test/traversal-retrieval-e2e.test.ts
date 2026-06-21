@@ -145,9 +145,27 @@ describe("traversal retrieval v2 E2E", () => {
     expect(scout?.calibrationStatus).toBe("calibrated");
     expect(scout?.declaredValue).toBe(35);
 
-    // 6. 当前因小计中断，Verifier 返回 failed（数值不对齐）— 这是 stub policy 的预期行为
-    // Phase 2B Scout-first 后才应返回 closed
-    expect(["failed", "mismatch", "partial", "closed"]).toContain(result.diagnostics.closureStatus);
+    const closure = result.evidencePaths[0]?.closure;
+    expect(result.stoppedReason).toBe("closed");
+    expect(closure?.status).toBe("closed");
+    expect(closure?.verifierType).toBe("sum_alignment");
+
+    const pathChunkIds = result.evidencePaths.flatMap((path) => path.path.map((entry) => entry.chunkId));
+    expect(pathChunkIds).toContain("r3");
+
+    const checks = closure?.checks as Record<string, unknown>;
+    expect(checks.collectedSum).toBe(35);
+    expect(checks.countedDataRowChunkIds).toEqual(["r1", "r2", "r3"]);
+    expect(checks.countedDataRowChunkIds).not.toContain("st");
+
+    const log = result.evidencePaths[0]?.traversalLog ?? [];
+    const edges = log.flatMap((entry) => entry.to ? [`${entry.from}->${entry.to}`] : []);
+    expect(edges).toEqual(expect.arrayContaining([
+      "r1->r2",
+      "r2->st",
+      "st->r3",
+      "r3->sm",
+    ]));
   });
 
   it("returns structured traversalLog with round, direction, and reason", async () => {

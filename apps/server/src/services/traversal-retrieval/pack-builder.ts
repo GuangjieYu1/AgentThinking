@@ -82,7 +82,11 @@ export function roleInfoForChunk(
   const existing = roleMap.get(chunk.id);
   if (existing) return existing;
   const classified = roleAdapter.classify(chunk);
-  const info = { role: classified.role, confidence: classified.confidence };
+  const info = {
+    role: classified.role,
+    ...(classified.indicator ? { indicator: classified.indicator } : {}),
+    confidence: classified.confidence,
+  };
   roleMap.set(chunk.id, info);
   return info;
 }

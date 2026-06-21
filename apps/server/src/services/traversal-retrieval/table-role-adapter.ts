@@ -1,13 +1,16 @@
-import type { Chunk, TraversalChunkRole } from "@agent-thinking/contracts";
+import type { Chunk, TraversalChunkRole, TraversalSummaryIndicator } from "@agent-thinking/contracts";
 import { hasNumericSignal, normalizeText } from "./utils.js";
 
 export interface TableRoleClassification {
   role: TraversalChunkRole;
+  indicator?: TraversalSummaryIndicator | undefined;
   confidence: number;
   method: "rule";
   reasons: string[];
 }
 
+const subtotalPattern = /(?:小计|subtotal)/i;
+const finalTotalPattern = /(?:合计|总计|总额|总数|总规模|总募集|final\s*total|grand\s*total|total)/i;
 const summaryPattern = /(?:合计|总计|小计|汇总|总额|余额合计|合\s*计|total|subtotal|summary)/i;
 const listPattern = /^\s*(?:[-*+]\s+|\d+[.)、]\s+|[（(]?\d+[）)]\s+|[一二三四五六七八九十]+[、.)]\s+)/;
 const headingPattern = /^(?:第?[一二三四五六七八九十\d]+[章节条部分、.．]\s*)?[^。！？!?]{2,60}$/;
@@ -44,6 +47,13 @@ function looksLikeDataRow(text: string): boolean {
   return /(?:\t| {2,}|，|,).*(?:\d|%|万|亿|元)/.test(normalized) || normalized.length <= 160;
 }
 
+function summaryIndicator(text: string): TraversalSummaryIndicator {
+  const normalized = normalizeText(text);
+  if (subtotalPattern.test(normalized)) return "subtotal";
+  if (finalTotalPattern.test(normalized)) return /(?:最终|最终合计|final\s*total|grand\s*total)/i.test(normalized) ? "final_total" : "total";
+  return "unknown_summary";
+}
+
 export class TableRoleAdapter {
   classify(chunk: Chunk): TableRoleClassification {
     const text = chunk.text;
@@ -56,7 +66,7 @@ export class TableRoleAdapter {
 
     if (summaryPattern.test(normalized) && hasNumericSignal(normalized)) {
       reasons.push("summary keyword with numeric signal");
-      return { role: "summary", confidence: 0.88, method: "rule", reasons };
+      return { role: "summary", indicator: summaryIndicator(normalized), confidence: 0.88, method: "rule", reasons };
     }
 
     if (looksLikeDataRow(text)) {

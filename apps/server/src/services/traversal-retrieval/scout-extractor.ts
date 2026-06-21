@@ -1,9 +1,12 @@
 import type {
   Chunk,
+  TableHarvestPlan,
   TraversalCompletenessType,
   TraversalScoutDeclaration,
   TraversalScoutResult,
 } from "@agent-thinking/contracts";
+import { TableRoleAdapter, type TableRoleClassification } from "./table-role-adapter.js";
+import { byOrdinal } from "./utils.js";
 import { normalizeText, termOverlap, uniqueStrings } from "./utils.js";
 
 export interface ScoutExtractorInput {
@@ -21,6 +24,11 @@ interface NumericMention {
   sourceChunkId: string;
   text: string;
   score: number;
+}
+
+interface ClassifiedChunk {
+  chunk: Chunk;
+  classification: TableRoleClassification;
 }
 
 const numericPattern = /([-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?)(\s*(?:亿元|万元|千元|元|亿|万|%))?/g;
@@ -89,6 +97,96 @@ function numericMentions(question: string, chunks: Chunk[]): NumericMention[] {
   return mentions.sort((left, right) => right.score - left.score || Math.abs(right.value) - Math.abs(left.value));
 }
 
+function mentionForChunk(mentions: NumericMention[], chunkId: string): NumericMention | undefined {
+  return mentions.find((mention) => mention.sourceChunkId === chunkId);
+}
+
+function sameHeadingPath(left: string | null | undefined, right: string | null | undefined): boolean {
+  return normalizeText(left) === normalizeText(right);
+}
+
+function planConfidence(input: {
+  headerChunkId?: string | undefined;
+  dataStartChunkId?: string | undefined;
+  finalSummaryChunkId?: string | undefined;
+  dataRowCount: number;
+  subtotalCount: number;
+  finalMentionScore?: number | undefined;
+}): number {
+  let score = 0;
+  if (input.headerChunkId) score += 0.2;
+  if (input.dataStartChunkId) score += 0.25;
+  if (input.finalSummaryChunkId) score += 0.3;
+  score += Math.min(0.1, input.dataRowCount * 0.03);
+  if (input.subtotalCount > 0) score += 0.1;
+  score += Math.min(0.15, Math.max(0, input.finalMentionScore ?? 0) * 0.15);
+  return Math.min(1, Number(score.toFixed(4)));
+}
+
+function buildTableHarvestPlan(input: {
+  question: string;
+  chunks: Chunk[];
+  mentions: NumericMention[];
+  declared: NumericMention | undefined;
+}): TableHarvestPlan | undefined {
+  const roleAdapter = new TableRoleAdapter();
+  const classified = input.chunks
+    .map((chunk): ClassifiedChunk => ({ chunk, classification: roleAdapter.classify(chunk) }))
+    .sort((left, right) => byOrdinal(left.chunk, right.chunk));
+  const summaryChunks = classified.filter((entry) => entry.classification.role === "summary");
+  const finalSummary = summaryChunks.find((entry) =>
+    (entry.classification.indicator === "total" || entry.classification.indicator === "final_total") &&
+    mentionForChunk(input.mentions, entry.chunk.id)
+  ) ?? summaryChunks.find((entry) => entry.chunk.id === input.declared?.sourceChunkId);
+  const finalMention = finalSummary ? mentionForChunk(input.mentions, finalSummary.chunk.id) : input.declared;
+  if (!finalSummary || !finalMention) return undefined;
+
+  const headingPath = finalSummary?.chunk.headingPath ?? input.chunks.find((chunk) => chunk.id === finalMention.sourceChunkId)?.headingPath ?? null;
+  if (!headingPath) return undefined;
+  const sameSection = classified.filter((entry) => sameHeadingPath(entry.chunk.headingPath, headingPath));
+  const dataRows = sameSection.filter((entry) =>
+    entry.classification.role === "data_row" &&
+    entry.chunk.ordinal < finalSummary.chunk.ordinal
+  );
+  const dataStart = dataRows[0];
+  if (!dataStart) return undefined;
+
+  const header = sameSection
+    .filter((entry) => entry.classification.role === "header" && entry.chunk.ordinal <= dataStart.chunk.ordinal)
+    .sort((left, right) => right.chunk.ordinal - left.chunk.ordinal)[0] ??
+    classified
+      .filter((entry) => entry.classification.role === "header" && entry.chunk.ordinal <= dataStart.chunk.ordinal)
+      .sort((left, right) => right.chunk.ordinal - left.chunk.ordinal)[0];
+  if (!header) return undefined;
+  const subtotalChunkIds = sameSection
+    .filter((entry) =>
+      entry.classification.role === "summary" &&
+      entry.classification.indicator === "subtotal" &&
+      entry.chunk.ordinal > dataStart.chunk.ordinal &&
+      entry.chunk.ordinal < finalSummary.chunk.ordinal
+    )
+    .map((entry) => entry.chunk.id);
+  return {
+    headerChunkId: header.chunk.id,
+    dataStartChunkId: dataStart.chunk.id,
+    dataRowChunkIds: dataRows.map((entry) => entry.chunk.id),
+    subtotalChunkIds,
+    finalSummaryChunkId: finalSummary.chunk.id,
+    declaredValue: finalMention.value,
+    unit: finalMention.unit ?? "",
+    metric: finalMention.metric,
+    headingPath,
+    confidence: planConfidence({
+      headerChunkId: header?.chunk.id,
+      dataStartChunkId: dataStart.chunk.id,
+      finalSummaryChunkId: finalSummary?.chunk.id,
+      dataRowCount: dataRows.length,
+      subtotalCount: subtotalChunkIds.length,
+      finalMentionScore: finalMention.score,
+    }),
+  };
+}
+
 function declarationFromMention(mention: NumericMention, question: string): TraversalScoutDeclaration {
   return {
     value: mention.value,
@@ -123,6 +221,14 @@ export class ScoutExtractor {
           ? ["header", "summary", "rowBoundary"]
           : ["header", "rowBoundary"];
     const mentions = numericMentions(input.question, input.chunks);
+    const tableHarvestPlan = input.completenessType === "sum_alignment"
+      ? buildTableHarvestPlan({
+        question: input.question,
+        chunks: input.chunks,
+        mentions,
+        declared: mentions[0],
+      })
+      : undefined;
 
     if (input.completenessType === "entity_boundary") {
       return {
@@ -135,7 +241,9 @@ export class ScoutExtractor {
       };
     }
 
-    const declared = mentions[0];
+    const declared = tableHarvestPlan?.finalSummaryChunkId
+      ? mentionForChunk(mentions, tableHarvestPlan.finalSummaryChunkId)
+      : mentions[0];
     if (!declared) {
       return {
         phase: "scout",
@@ -159,7 +267,9 @@ export class ScoutExtractor {
       sourceChunkId: declaration.sourceChunkId,
       ...(declaration.bindingColumn ? { bindingColumn: declaration.bindingColumn } : {}),
       confidence: declaration.confidence,
+      ...(tableHarvestPlan ? { tableHarvestPlan } : {}),
       competingDeclarations: mentions
+        .filter((mention) => !(tableHarvestPlan?.subtotalChunkIds.includes(mention.sourceChunkId) ?? false))
         .filter((mention) => mention.sourceChunkId !== declared.sourceChunkId || mention.value !== declared.value)
         .slice(0, 8)
         .map((mention) => declarationFromMention(mention, input.question)),

@@ -1,12 +1,16 @@
 import type {
   Chunk,
+  TableHarvestPlan,
   PulseInputMode,
   PulseStreamEvent,
   TraversalActiveFront,
   TraversalClosureStatus,
   TraversalEvidenceItem,
   TraversalEvidencePath,
+  TraversalLegalMove,
   TraversalRetrievalResult,
+  TraversalScoutResult,
+  TraversalSeedCluster,
   TraversalStopReason,
 } from "@agent-thinking/contracts";
 import type { AgentDatabase } from "../../db.js";
@@ -28,6 +32,7 @@ import {
   evidenceRowsFromChunks,
   hitsFromChunks,
   rowBoundaryChecked,
+  roleInfoForChunk,
   storageEvidencePack,
 } from "./pack-builder.js";
 import { makeSubTask } from "./planner.js";
@@ -37,7 +42,7 @@ import { collectSeedCandidates } from "./seed-provider.js";
 import { SeedArbitrationEngine } from "./seed-arbitration.js";
 import { TableRoleAdapter } from "./table-role-adapter.js";
 import type { ChunkGraphReader } from "./table-skeleton-extractor.js";
-import { uniqueStrings } from "./utils.js";
+import { normalizeText, uniqueStrings } from "./utils.js";
 
 type PulseEventSink = (event: PulseStreamEvent) => void | Promise<void>;
 
@@ -106,6 +111,115 @@ function uniqueChunks(chunks: Chunk[]): Chunk[] {
   return result.sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id));
 }
 
+function sameHeadingPath(left: string | null | undefined, right: string | null | undefined): boolean {
+  return normalizeText(left) === normalizeText(right);
+}
+
+function routeSeedClustersWithTableHarvestPlan(input: {
+  seedClusters: TraversalSeedCluster[];
+  scout: TraversalScoutResult;
+  chunksById: Map<string, Chunk>;
+}): TraversalSeedCluster[] {
+  const plan = input.scout.tableHarvestPlan;
+  if (!plan?.headerChunkId || !input.chunksById.has(plan.headerChunkId)) return input.seedClusters;
+  const planChunkIds = new Set(uniqueStrings([
+    plan.headerChunkId,
+    plan.dataStartChunkId,
+    ...plan.dataRowChunkIds,
+    ...plan.subtotalChunkIds,
+    plan.finalSummaryChunkId,
+  ]));
+  let routed = false;
+  return input.seedClusters.map((cluster) => {
+    if (cluster.decision === "discard") return cluster;
+    const clusterChunkIds = uniqueStrings([cluster.anchorChunkId, ...cluster.chunkIds]);
+    const relevant = clusterChunkIds.some((chunkId) => {
+      if (planChunkIds.has(chunkId)) return true;
+      const chunk = input.chunksById.get(chunkId);
+      return chunk ? sameHeadingPath(chunk.headingPath, plan.headingPath) : false;
+    });
+    if (!relevant) return cluster;
+    if (routed) {
+      return {
+        ...cluster,
+        decision: "discard",
+        llmNote: `${cluster.llmNote ?? ""} Scout-first TableHarvestPlan consolidated this table cluster into ${plan.headerChunkId}.`.trim(),
+      };
+    }
+    routed = true;
+    return {
+      ...cluster,
+      anchorChunkId: plan.headerChunkId,
+      chunkIds: uniqueStrings([
+        plan.headerChunkId,
+        ...cluster.chunkIds,
+        plan.dataStartChunkId,
+        ...plan.dataRowChunkIds,
+        ...plan.subtotalChunkIds,
+        plan.finalSummaryChunkId,
+      ]),
+      llmNote: `${cluster.llmNote ?? ""} Scout-first TableHarvestPlan routed traversal seed to header ${plan.headerChunkId}.`.trim(),
+    };
+  });
+}
+
+function tableHarvestPlanSequence(plan: TableHarvestPlan, chunksById: Map<string, Chunk>): string[] {
+  return uniqueStrings([
+    plan.headerChunkId,
+    plan.dataStartChunkId,
+    ...plan.dataRowChunkIds,
+    ...plan.subtotalChunkIds,
+    plan.finalSummaryChunkId,
+  ]).sort((leftId, rightId) => {
+    const left = chunksById.get(leftId);
+    const right = chunksById.get(rightId);
+    if (left && right) return left.ordinal - right.ordinal || left.id.localeCompare(right.id);
+    if (left) return -1;
+    if (right) return 1;
+    return leftId.localeCompare(rightId);
+  });
+}
+
+function plannedTableHarvestMove(input: {
+  front: TraversalActiveFront;
+  moves: TraversalLegalMove[];
+  scout: TraversalScoutResult;
+  chunksById: Map<string, Chunk>;
+}): TraversalLegalMove | undefined {
+  const plan = input.scout.tableHarvestPlan;
+  if (!plan) return undefined;
+  if (input.front.anchorChunkId === plan.finalSummaryChunkId) return undefined;
+  const sequence = tableHarvestPlanSequence(plan, input.chunksById);
+  const currentIndex = sequence.indexOf(input.front.anchorChunkId);
+  if (currentIndex < 0) return undefined;
+  const nextChunkIds = sequence.slice(currentIndex + 1);
+  for (const chunkId of nextChunkIds) {
+    const move = input.moves.find((candidate) => candidate.target === chunkId);
+    if (move?.target) return move;
+  }
+  return undefined;
+}
+
+function continuationAfterRejectedStop(moves: TraversalLegalMove[]): TraversalLegalMove | undefined {
+  return moves.find((move) => move.move === "sibling_next" && move.target);
+}
+
+function boundaryForEvidence(input: {
+  evidence: TraversalEvidenceItem[];
+  chunksById: Map<string, Chunk>;
+  roleMap: Map<string, ClosureRoleInfo>;
+  sectionChunks: Chunk[];
+  scout: TraversalScoutResult;
+}) {
+  return rowBoundaryChecked({
+    evidence: input.evidence,
+    chunksById: input.chunksById,
+    roleMap: input.roleMap,
+    sectionChunks: input.sectionChunks,
+    headingPath: input.scout.tableHarvestPlan?.headingPath,
+  });
+}
+
 export class TraversalRetrievalEngine {
   private readonly limits: TraversalGraphLimits;
   private readonly reader: ChunkGraphReader;
@@ -165,7 +279,7 @@ export class TraversalRetrievalEngine {
       ...candidateChunks,
       ...this.db.getNeighborChunks(candidateChunks.map((chunk) => chunk.id), this.limits.neighborWindow),
     ]);
-    const seedClusters = this.seeds.arbitrate({
+    const rawSeedClusters = this.seeds.arbitrate({
       question: input.question,
       pattern: subTask.pattern,
       candidates,
@@ -176,9 +290,22 @@ export class TraversalRetrievalEngine {
       chunks: allRelevantChunks,
       completenessType: subTask.completenessType,
     });
-    let fronts = this.graphOps.createInitialFronts(seedClusters);
+    const traversalSubTask = subTask.pattern === "table_horizontal" &&
+      scout.tableHarvestPlan?.headerChunkId &&
+      scout.tableHarvestPlan.dataStartChunkId
+      ? {
+        ...subTask,
+        directionBias: "down_first" as const,
+        rationale: `${subTask.rationale} Scout-first TableHarvestPlan starts from the table header and harvests rows in order.`,
+      }
+      : subTask;
     const chunksById = new Map(allRelevantChunks.map((chunk) => [chunk.id, chunk]));
+    const seedClusters = subTask.pattern === "table_horizontal"
+      ? routeSeedClustersWithTableHarvestPlan({ seedClusters: rawSeedClusters, scout, chunksById })
+      : rawSeedClusters;
+    let fronts = this.graphOps.createInitialFronts(seedClusters);
     const roleMap = new Map<string, ClosureRoleInfo>();
+    const roleAdapter = new TableRoleAdapter();
     const visited = new Set<string>();
     const evidence = new Map<string, TraversalEvidenceItem>();
     const traversalLog: TraversalEvidencePath["traversalLog"] = [];
@@ -192,6 +319,7 @@ export class TraversalRetrievalEngine {
       const chunk = this.reader.getChunk(front.anchorChunkId);
       if (!chunk) continue;
       chunksById.set(chunk.id, chunk);
+      roleInfoForChunk(chunk, roleMap, roleAdapter);
       visited.add(chunk.id);
       evidence.set(chunk.id, buildEvidenceItem(chunk, front));
       state.visitedNodeCount += 1;
@@ -204,7 +332,7 @@ export class TraversalRetrievalEngine {
         reason: "seed cluster promoted into traversal front",
       });
     }
-    addRoleInfos([...chunksById.values()], roleMap, new TableRoleAdapter());
+    addRoleInfos([...chunksById.values()], roleMap, roleAdapter);
     let finalClosure = this.verifier.verify({
       completenessType: subTask.completenessType,
       evidence: [...evidence.values()],
@@ -228,15 +356,34 @@ export class TraversalRetrievalEngine {
       for (const front of fronts.filter((entry) => entry.confidence !== "dead_end")) {
         if (state.visitedNodeCount >= this.limits.maxVisitedNodes || appliedMoveCount >= this.limits.maxRoundNodes) break;
         const moves = this.graphOps.legalMovesForFront(front, visited);
-        const decision = this.policy.choose({
-          subTask,
-          front,
-          moves,
-          scout,
-          evidence: [...evidence.values()],
-        });
+        const plannedMove = subTask.pattern === "table_horizontal"
+          ? plannedTableHarvestMove({ front, moves, scout, chunksById })
+          : undefined;
+        const decision = plannedMove
+          ? {
+            selected: {
+              move: plannedMove.move,
+              ...(plannedMove.target ? { target: plannedMove.target } : {}),
+              reason: `TableHarvestPlan selected next chunk ${plannedMove.target}`,
+              confidence: 0.94,
+            },
+            stopProposal: false,
+          }
+          : this.policy.choose({
+            subTask: traversalSubTask,
+            front,
+            moves,
+            scout,
+            evidence: [...evidence.values()],
+          });
         if (decision.stopProposal || decision.selected.move === "stop_current_front") {
-          const boundary = rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern });
+          const boundary = boundaryForEvidence({
+            evidence: [...evidence.values()],
+            chunksById,
+            roleMap,
+            sectionChunks: allRelevantChunks,
+            scout,
+          });
           finalClosure = this.verifier.verify({
             completenessType: subTask.completenessType,
             evidence: [...evidence.values()],
@@ -257,12 +404,13 @@ export class TraversalRetrievalEngine {
             stoppedReason = "closed";
             break;
           }
-          const fallbackMove = moves.find((move) => move.move !== "stop_current_front" && move.target);
+          const fallbackMove = continuationAfterRejectedStop(moves);
           if (fallbackMove?.target) {
             const next = this.graphOps.applyMove(front, fallbackMove);
             const chunk = this.reader.getChunk(fallbackMove.target);
             if (chunk) {
               chunksById.set(chunk.id, chunk);
+              roleInfoForChunk(chunk, roleMap, roleAdapter);
               visited.add(chunk.id);
               evidence.set(chunk.id, buildEvidenceItem(chunk, next));
               state.visitedNodeCount += 1;
@@ -294,6 +442,7 @@ export class TraversalRetrievalEngine {
           continue;
         }
         chunksById.set(chunk.id, chunk);
+        roleInfoForChunk(chunk, roleMap, roleAdapter);
         visited.add(chunk.id);
         evidence.set(chunk.id, buildEvidenceItem(chunk, next));
         state.visitedNodeCount += 1;
@@ -314,19 +463,26 @@ export class TraversalRetrievalEngine {
     }
 
     if (!shouldStopForClosure(finalClosure.status, stoppedReason)) {
+      const boundary = boundaryForEvidence({
+        evidence: [...evidence.values()],
+        chunksById,
+        roleMap,
+        sectionChunks: allRelevantChunks,
+        scout,
+      });
       finalClosure = this.verifier.verify({
         completenessType: subTask.completenessType,
         evidence: [...evidence.values()],
         scout,
         roleMap,
-        rowBoundaryChecked: rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern }).checked,
-        rowBoundaryEvidence: rowBoundaryChecked({ evidence: [...evidence.values()], chunksById, roleMap, sectionChunks: allRelevantChunks, headingPath: subTask.pattern }).evidence,
+        rowBoundaryChecked: boundary.checked,
+        rowBoundaryEvidence: boundary.evidence,
         exhaustedDirections: [stoppedReason ?? "unknown_stop"],
       });
     }
     const evidenceChunkIds = uniqueStrings([...evidence.keys()]);
     const evidencePaths = evidenceChunkIds.length > 0 ? [evidencePath({
-      subTask,
+      subTask: traversalSubTask,
       chunksById,
       pathChunkIds: evidenceChunkIds,
       log: traversalLog,
@@ -334,7 +490,7 @@ export class TraversalRetrievalEngine {
     })] : [];
     return {
       question: input.question,
-      subTasks: [subTask],
+      subTasks: [traversalSubTask],
       seedClusters,
       scoutResults: { [subTask.id]: scout },
       evidencePaths,

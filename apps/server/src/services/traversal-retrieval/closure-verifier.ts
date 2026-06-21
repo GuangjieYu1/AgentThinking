@@ -3,10 +3,12 @@ import type {
   TraversalClosureVerdict,
   TraversalEvidenceItem,
   TraversalScoutResult,
+  TraversalSummaryIndicator,
 } from "@agent-thinking/contracts";
 
 export interface ClosureRoleInfo {
   role: string;
+  indicator?: TraversalSummaryIndicator | undefined;
   confidence: number;
 }
 
@@ -133,6 +135,7 @@ export class ClosureVerifier {
     const numericSum = typeof gap === "number" && Math.abs(gap) <= 0.01;
     const rowBoundary = input.rowBoundaryChecked === true;
     const rowBoundaryEvidence = input.rowBoundaryEvidence ?? {};
+    const countedDataRowChunkIds = countedEvidence.map((item) => item.chunkId);
 
     if (!input.scout || input.scout.calibrationStatus !== "calibrated" || typeof declared !== "number") {
       return verdict("sum_alignment", "continue", "Declared value is not calibrated yet.", {
@@ -140,6 +143,7 @@ export class ClosureVerifier {
         collectedSum,
         evidenceCount: input.evidence.length,
         countedDataRowCount: countedEvidence.length,
+        countedDataRowChunkIds,
       });
     }
     if (!input.roleMap) {
@@ -149,6 +153,7 @@ export class ClosureVerifier {
         gap,
         roleMapPresent: false,
         evidenceCount: input.evidence.length,
+        countedDataRowChunkIds,
       });
     }
     if (uncountedNumeric.length > 0) {
@@ -157,7 +162,7 @@ export class ClosureVerifier {
         collectedSum,
         gap,
         uncountedNumericChunkIds: uncountedNumeric.map((item) => item.chunkId),
-        countedDataRowChunkIds: countedEvidence.map((item) => item.chunkId),
+        countedDataRowChunkIds,
         rowBoundary,
         rowBoundaryEvidence,
       });
@@ -171,6 +176,7 @@ export class ClosureVerifier {
         metricBinding,
         competingCheck,
         competingConflicts,
+        countedDataRowChunkIds,
         rowBoundary,
         rowBoundaryEvidence,
       });
@@ -183,6 +189,7 @@ export class ClosureVerifier {
         unitConsistency,
         metricBinding,
         competingCheck,
+        countedDataRowChunkIds,
         rowBoundary,
         rowBoundaryEvidence,
       });
@@ -195,6 +202,7 @@ export class ClosureVerifier {
         unitConsistency,
         metricBinding,
         competingCheck,
+        countedDataRowChunkIds,
         rowBoundary,
         rowBoundaryEvidence,
       });
@@ -206,6 +214,7 @@ export class ClosureVerifier {
       unitConsistency,
       metricBinding,
       competingCheck,
+      countedDataRowChunkIds,
       rowBoundary,
       rowBoundaryEvidence,
     });

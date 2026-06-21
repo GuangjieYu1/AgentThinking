@@ -197,7 +197,7 @@ export class SeedArbitrationEngine {
     }
     return clusters.map((cluster, index) => {
       const sortedEntries = cluster.entries.sort((left, right) => right.score.finalScore - left.score.finalScore || left.chunk.ordinal - right.chunk.ordinal);
-      const anchor = sortedEntries[0]!;
+      const anchor = this.anchorEntry(sortedEntries, pattern);
       const score = this.averageScores(sortedEntries.map((entry) => entry.score));
       return {
         id: `seed-cluster-${index + 1}`,
@@ -209,6 +209,24 @@ export class SeedArbitrationEngine {
         llmNote: this.clusterNote(sortedEntries.map((entry) => entry.chunk)),
       };
     });
+  }
+
+  private anchorEntry(
+    sortedEntries: Array<{ candidate: TraversalSeedCandidate; chunk: Chunk; score: TraversalSeedScore }>,
+    pattern: TraversalRetrievalPattern,
+  ): { candidate: TraversalSeedCandidate; chunk: Chunk; score: TraversalSeedScore } {
+    if (pattern === "table_horizontal") {
+      const entriesWithRoles = sortedEntries.map((entry) => ({
+        entry,
+        role: this.roleAdapter.classify(entry.chunk).role,
+      }));
+      const hasDataRow = entriesWithRoles.some(({ role }) => role === "data_row");
+      const header = entriesWithRoles
+        .filter(({ role }) => role === "header")
+        .sort((left, right) => left.entry.chunk.ordinal - right.entry.chunk.ordinal)[0];
+      if (hasDataRow && header) return header.entry;
+    }
+    return sortedEntries[0]!;
   }
 
   private shouldMerge(left: Chunk, right: Chunk, question: string): boolean {

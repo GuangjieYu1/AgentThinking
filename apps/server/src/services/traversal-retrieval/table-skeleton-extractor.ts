@@ -30,9 +30,11 @@ export class TableSkeletonExtractor {
     const parent = this.parentOf(chunk);
     const siblings = this.siblingsOf(chunk, siblingWindow);
     const children = this.childrenOf(chunk, maxChildren);
+    const classification = this.roleAdapter.classify(chunk);
     return {
       id: chunk.id,
-      role: this.roleAdapter.classify(chunk).role,
+      role: classification.role,
+      ...(classification.indicator ? { indicator: classification.indicator } : {}),
       headingPath: chunk.headingPath,
       ordinal: chunk.ordinal,
       hasNumeric: hasNumericSignal(chunk.text),
@@ -46,9 +48,11 @@ export class TableSkeletonExtractor {
   }
 
   private neighborSkeleton(chunk: Chunk): TraversalNeighborSkeleton {
+    const classification = this.roleAdapter.classify(chunk);
     return {
       id: chunk.id,
-      role: this.roleAdapter.classify(chunk).role,
+      role: classification.role,
+      ...(classification.indicator ? { indicator: classification.indicator } : {}),
       preview: previewText(chunk.text),
     };
   }

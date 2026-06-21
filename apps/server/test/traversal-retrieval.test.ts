@@ -168,6 +168,7 @@ describe("traversal retrieval v2 components", () => {
       chunks,
       candidates: [
         { chunkId: "row-a", source: "AORI", score: 0.9, reliability: 0.95, reason: "aori row" },
+        { chunkId: "header", source: "keyword", score: 0.72, reliability: 0.6, reason: "keyword header" },
         { chunkId: "row-b", source: "keyword", score: 0.72, reliability: 0.6, reason: "keyword row" },
         { chunkId: "noise", source: "vector", score: 0.02, reliability: 0.4, reason: "weak vector hit" },
       ],
@@ -176,7 +177,8 @@ describe("traversal retrieval v2 components", () => {
 
     const promoted = clusters.filter((cluster) => cluster.decision !== "discard");
     expect(promoted).toHaveLength(1);
-    expect(promoted[0]?.chunkIds).toEqual(expect.arrayContaining(["row-a", "row-b"]));
+    expect(promoted[0]?.anchorChunkId).toBe("header");
+    expect(promoted[0]?.chunkIds).toEqual(expect.arrayContaining(["header", "row-a", "row-b"]));
     expect(promoted[0]?.arbitrationScores.patternCompatibility).toBeGreaterThan(0.8);
     expect(promoted[0]?.arbitrationScores.sourceReliability).toBeGreaterThan(0.7);
     expect(clusters.find((cluster) => cluster.chunkIds.includes("noise"))?.decision).toBe("discard");

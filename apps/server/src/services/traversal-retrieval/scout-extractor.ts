@@ -46,10 +46,14 @@ function normalizeUnit(unit: string | undefined): string | undefined {
   return value || undefined;
 }
 
-function metricFromText(text: string, question: string): string {
+function metricFromText(text: string, question: string, headingPath?: string | null | undefined): string {
   const normalized = normalizeText(text);
   const metricMatch = normalized.match(metricPattern)?.[1]?.trim();
-  if (metricMatch && metricMatch.length <= 24) return metricMatch;
+  // 排除合计/总计/小计等汇总关键字作为 metric
+  const summaryKeywords = /^(合计|总计|小计|汇总|total|subtotal|summary)$/i;
+  if (metricMatch && metricMatch.length <= 24 && !summaryKeywords.test(metricMatch)) return metricMatch;
+  // 优先使用 headingPath 作为 metric，因为它更语义化
+  if (headingPath) return headingPath;
   const questionTerms = uniqueStrings(question.match(/[\p{Script=Han}A-Za-z0-9]{2,}/gu) ?? []);
   return questionTerms.slice(0, 2).join("/") || "数值指标";
 }
@@ -78,7 +82,7 @@ function numericMentions(question: string, chunks: Chunk[]): NumericMention[] {
       const before = text.slice(Math.max(0, match.index - 36), match.index).trim();
       const after = text.slice((match.index ?? 0) + match[0].length, (match.index ?? 0) + match[0].length + 24).trim();
       const context = `${before} ${match[0]} ${after}`.trim();
-      const metric = metricFromText(`${before} ${after}`, question);
+      const metric = metricFromText(`${before} ${after}`, question, chunk.headingPath);
       const unit = normalizeUnit(match[2]) ?? normalizeUnit(text.match(unitPattern)?.[1]);
       const metricScore = termOverlap(question, `${metric} ${context}`);
       const summaryBoost = /合计|总计|总额|总数|总规模|总募集|总收入/.test(context) ? 0.22 : 0;
@@ -137,7 +141,7 @@ function buildTableHarvestPlan(input: {
   const finalSummary = summaryChunks.find((entry) =>
     (entry.classification.indicator === "total" || entry.classification.indicator === "final_total") &&
     mentionForChunk(input.mentions, entry.chunk.id)
-  ) ?? summaryChunks.find((entry) => entry.chunk.id === input.declared?.sourceChunkId);
+  );
   const finalMention = finalSummary ? mentionForChunk(input.mentions, finalSummary.chunk.id) : input.declared;
   if (!finalSummary || !finalMention) return undefined;
 
@@ -243,7 +247,12 @@ export class ScoutExtractor {
 
     const declared = tableHarvestPlan?.finalSummaryChunkId
       ? mentionForChunk(mentions, tableHarvestPlan.finalSummaryChunkId)
-      : mentions[0];
+      : input.completenessType === "sum_alignment"
+        ? mentions.find((mention) => {
+          const role = new TableRoleAdapter().classify(input.chunks.find((chunk) => chunk.id === mention.sourceChunkId)!);
+          return role.role === "summary" && (role.indicator === "total" || role.indicator === "final_total");
+        })
+        : mentions[0];
     if (!declared) {
       return {
         phase: "scout",

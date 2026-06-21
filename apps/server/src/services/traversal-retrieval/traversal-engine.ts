@@ -35,7 +35,8 @@ import {
   roleInfoForChunk,
   storageEvidencePack,
 } from "./pack-builder.js";
-import { makeSubTask } from "./planner.js";
+import { completenessForPattern, directionBiasForPattern, makeSubTask } from "./planner.js";
+import { PatternValidation } from "./pattern-validation.js";
 import { LocalLLMPolicy } from "./policy.js";
 import { ScoutExtractor } from "./scout-extractor.js";
 import { collectSeedCandidates } from "./seed-provider.js";
@@ -227,6 +228,7 @@ export class TraversalRetrievalEngine {
   private readonly hardStops = new HardStopChecker();
   private readonly seeds = new SeedArbitrationEngine();
   private readonly scout = new ScoutExtractor();
+  private readonly patternValidation = new PatternValidation();
   private readonly verifier = new ClosureVerifier();
   private readonly policy = new LocalLLMPolicy();
 
@@ -279,28 +281,78 @@ export class TraversalRetrievalEngine {
       ...candidateChunks,
       ...this.db.getNeighborChunks(candidateChunks.map((chunk) => chunk.id), this.limits.neighborWindow),
     ]);
-    const rawSeedClusters = this.seeds.arbitrate({
+    let effectiveSubTask = subTask;
+    let rawSeedClusters = this.seeds.arbitrate({
       question: input.question,
       pattern: subTask.pattern,
       candidates,
       chunks: allRelevantChunks,
     });
-    const scout = this.scout.extract({
+    let scout = this.scout.extract({
       question: input.question,
       chunks: allRelevantChunks,
       completenessType: subTask.completenessType,
     });
-    const traversalSubTask = subTask.pattern === "table_horizontal" &&
+    const patternValidation = this.patternValidation.validate({
+      pattern: subTask.pattern,
+      chunks: allRelevantChunks,
+      scout,
+      fallbackPatterns: subTask.fallbackPatterns,
+    });
+    if (patternValidation.status === "invalid") {
+      if (!patternValidation.suggestedFallback) {
+        return {
+          question: input.question,
+          subTasks: [subTask],
+          seedClusters: rawSeedClusters,
+          scoutResults: { [subTask.id]: scout },
+          evidencePaths: [],
+          conflicts: [],
+          stoppedReason: "no_moves",
+          diagnostics: {
+            visitedNodeCount: 0,
+            rounds: 0,
+            injectedTokens: 0,
+            legalMoveSets: [],
+            closureStatus: "continue",
+            patternValidation,
+            degraded: true,
+            degradedReason: "pattern_invalid",
+          },
+        };
+      }
+      effectiveSubTask = {
+        ...subTask,
+        pattern: patternValidation.suggestedFallback,
+        patternConfidence: Math.min(subTask.patternConfidence, 0.35),
+        fallbackPatterns: subTask.fallbackPatterns.filter((pattern) => pattern !== patternValidation.suggestedFallback),
+        completenessType: completenessForPattern(patternValidation.suggestedFallback, input.question),
+        directionBias: directionBiasForPattern(patternValidation.suggestedFallback),
+        rationale: `${subTask.rationale} PatternValidation rejected ${subTask.pattern}; falling back to ${patternValidation.suggestedFallback}.`,
+      };
+      rawSeedClusters = this.seeds.arbitrate({
+        question: input.question,
+        pattern: effectiveSubTask.pattern,
+        candidates,
+        chunks: allRelevantChunks,
+      });
+      scout = this.scout.extract({
+        question: input.question,
+        chunks: allRelevantChunks,
+        completenessType: effectiveSubTask.completenessType,
+      });
+    }
+    const traversalSubTask = effectiveSubTask.pattern === "table_horizontal" &&
       scout.tableHarvestPlan?.headerChunkId &&
       scout.tableHarvestPlan.dataStartChunkId
       ? {
-        ...subTask,
+        ...effectiveSubTask,
         directionBias: "down_first" as const,
-        rationale: `${subTask.rationale} Scout-first TableHarvestPlan starts from the table header and harvests rows in order.`,
+        rationale: `${effectiveSubTask.rationale} Scout-first TableHarvestPlan starts from the table header and harvests rows in order.`,
       }
-      : subTask;
+      : effectiveSubTask;
     const chunksById = new Map(allRelevantChunks.map((chunk) => [chunk.id, chunk]));
-    const seedClusters = subTask.pattern === "table_horizontal"
+    const seedClusters = traversalSubTask.pattern === "table_horizontal"
       ? routeSeedClustersWithTableHarvestPlan({ seedClusters: rawSeedClusters, scout, chunksById })
       : rawSeedClusters;
     let fronts = this.graphOps.createInitialFronts(seedClusters);
@@ -334,7 +386,7 @@ export class TraversalRetrievalEngine {
     }
     addRoleInfos([...chunksById.values()], roleMap, roleAdapter);
     let finalClosure = this.verifier.verify({
-      completenessType: subTask.completenessType,
+      completenessType: traversalSubTask.completenessType,
       evidence: [...evidence.values()],
       scout,
       roleMap,
@@ -356,7 +408,7 @@ export class TraversalRetrievalEngine {
       for (const front of fronts.filter((entry) => entry.confidence !== "dead_end")) {
         if (state.visitedNodeCount >= this.limits.maxVisitedNodes || appliedMoveCount >= this.limits.maxRoundNodes) break;
         const moves = this.graphOps.legalMovesForFront(front, visited);
-        const plannedMove = subTask.pattern === "table_horizontal"
+        const plannedMove = traversalSubTask.pattern === "table_horizontal"
           ? plannedTableHarvestMove({ front, moves, scout, chunksById })
           : undefined;
         const decision = plannedMove
@@ -385,7 +437,7 @@ export class TraversalRetrievalEngine {
             scout,
           });
           finalClosure = this.verifier.verify({
-            completenessType: subTask.completenessType,
+            completenessType: traversalSubTask.completenessType,
             evidence: [...evidence.values()],
             scout,
             roleMap,
@@ -471,7 +523,7 @@ export class TraversalRetrievalEngine {
         scout,
       });
       finalClosure = this.verifier.verify({
-        completenessType: subTask.completenessType,
+        completenessType: traversalSubTask.completenessType,
         evidence: [...evidence.values()],
         scout,
         roleMap,
@@ -492,7 +544,7 @@ export class TraversalRetrievalEngine {
       question: input.question,
       subTasks: [traversalSubTask],
       seedClusters,
-      scoutResults: { [subTask.id]: scout },
+      scoutResults: { [traversalSubTask.id]: scout },
       evidencePaths,
       conflicts: [],
       stoppedReason: stoppedReason ?? (finalClosure.status === "closed" ? "closed" : finalClosure.status === "partial" ? "partial" : "fronts_exhausted"),
@@ -502,6 +554,8 @@ export class TraversalRetrievalEngine {
         injectedTokens: state.injectedTokens,
         legalMoveSets: this.graphOps.legalMoves(fronts, visited),
         closureStatus: finalClosure.status,
+        patternValidation,
+        ...(effectiveSubTask.pattern !== subTask.pattern ? { appliedFallbackPattern: effectiveSubTask.pattern } : {}),
       },
     };
   }

@@ -5,4 +5,8 @@ export * from "./scout-extractor.js";
 export * from "./seed-arbitration.js";
 export * from "./graph-ops.js";
 export * from "./closure-verifier.js";
+export * from "./planner.js";
+export * from "./policy.js";
+export * from "./pack-builder.js";
+export * from "./seed-provider.js";
 export * from "./traversal-engine.js";
